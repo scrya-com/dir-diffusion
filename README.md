@@ -1,6 +1,6 @@
 # lot-diffusion
 
-Level-of-Token Diffusion ([Nakayama et al., arXiv 2610.05816](https://arxiv.org/abs/2610.05816)) for the MiniMax H3 video DiT. Project page: [scrya.com/lot_diffusion](https://scrya.com/lot_diffusion).
+Level-of-Token Diffusion ([Nakayama et al., arXiv 2610.05816](https://arxiv.org/abs/2610.05816)) for the MiniMax H3 video DiT.
 
 > [!WARNING]
 > **Research code and research weights.** LoT output is still visibly worse than dense H3: coarse regions are soft, and faces in talking-head shots distort in fixed layouts. The method needs more training. Results, renders and the help-wanted thread: [johndpope/MiniMax-H3 issue 1](https://github.com/johndpope/MiniMax-H3/issues/1).
