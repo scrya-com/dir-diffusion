@@ -3,7 +3,7 @@
 Level-of-Token Diffusion ([Nakayama et al., arXiv 2610.05816](https://arxiv.org/abs/2610.05816)) for the MiniMax H3 video DiT.
 
 > [!WARNING]
-> **Research code and research weights.** LoT output is still visibly worse than dense H3: coarse regions are soft, and faces in talking-head shots distort in fixed layouts. The method needs more training. Results, renders and the help-wanted thread: [johndpope/MiniMax-H3 issue 1](https://github.com/johndpope/MiniMax-H3/issues/1).
+> **Research code and research weights.** LoT output is still visibly worse than dense H3: coarse regions are soft, and faces in talking-head shots distort in fixed layouts. The method needs more training. Help wanted: [discussion](https://github.com/scrya-com/lot-diffusion/discussions/1). Results and renders: [johndpope/MiniMax-H3 issue 1](https://github.com/johndpope/MiniMax-H3/issues/1).
 
 LoT gives the transformer fewer, larger tokens where detail is low and recovers the full-resolution velocity afterwards (the paper's eq. 9, patch-wise asymmetric flow). The VAE latent stays full size; only the transformer sequence shrinks. One H3 DiT forward on a 24 GB card (RTX PRO 4000 Blackwell, run-4 weights, all blocks resident):
 
