@@ -1,0 +1,18 @@
+lot-diffusion
+Copyright 2026 scrya-com contributors. Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software from musubi-tuner
+(https://github.com/kohya-ss/musubi-tuner), commit f8a1b03794a49239a3539015075f5123d6c07d66
+(2026-09-27), licensed under the Apache License, Version 2.0. Per musubi-tuner's README, its
+code is Apache-2.0 and some of it is copied and modified from Hugging Face Diffusers; the H3
+modules carry their own "Copyright 2025 The MiniMax Team and The HuggingFace Team" headers, and
+modules/convrot_int8_kernels.py is modified from comfy-kitchen (Apache-2.0). The files are in
+third_party/musubi_tuner/, copied without modification; third_party/README.md lists them.
+
+Level-of-Token Diffusion is described in Nakayama et al., arXiv 2610.05816. The eq. 9 velocity
+recovery can optionally use LakonLab (not included; see lot/flow.py).
+
+MiniMax H3 model weights are NOT included. They, and any weights trained from them, are
+governed by the MiniMax H3 Community License Agreement
+(https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE), which excludes use in the
+European Union, the United Kingdom, the Republic of Korea and the United States of America.

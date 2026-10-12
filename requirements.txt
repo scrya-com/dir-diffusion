@@ -1,0 +1,13 @@
+# Tested with torch 2.13 + CUDA on one 24 GB card. Install torch for your CUDA first.
+torch>=2.7
+accelerate>=1.13
+av>=17.0
+transformers>=5.14        # text encoder (build_cache_h3.py text) only
+safetensors>=0.8
+huggingface_hub>=1.27
+numpy
+pillow
+tqdm
+triton                    # fused ConvRot int8 kernels; without it musubi falls back to dequantize-per-forward
+bitsandbytes              # 8-bit AdamW in train_h3.py (falls back to torch AdamW)
+matplotlib                # train_synth.py / infer.py previews only

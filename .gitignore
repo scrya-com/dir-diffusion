@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+runs/
+lot/runs/
+models/
+*.safetensors
+*.pt
