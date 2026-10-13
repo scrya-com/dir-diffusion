@@ -87,6 +87,7 @@ class Run:
         self.gen_net, self.fake_net, self.adapter = gen_net, fake_net, adapter
         self.args, self.device = args, device
         self.iterations = args.iterations
+        self.loss_scale = 1.0       # 1 / --accum while accumulating; backward() scales by it
         self._schedules: dict = {}
 
     def schedule(self, z: torch.Tensor) -> list:
@@ -121,7 +122,14 @@ class Run:
         return estimate
 
     def draw_tau(self) -> float:
-        return float(sample_sigma(self.args.tau_shift, self.device).clamp(TAU_MIN, TAU_MAX))
+        dist = self.args.tau_shift
+        if isinstance(dist, str) and dist.startswith("beta:"):
+            # The paper's importance sampling (Table 4, Algorithm 1): tau ~ Beta(a, 1), density a tau^(a-1).
+            a = float(dist.split(":", 1)[1])
+            tau = torch.distributions.Beta(a, 1.0).sample((1,))
+        else:
+            tau = sample_sigma(dist, self.device)
+        return float(tau.clamp(TAU_MIN, TAU_MAX))
 
     # -------------------------------------------------------------------- generator update
     def generator_update(self, z, text, r, *, backward=True):
@@ -172,7 +180,7 @@ class Run:
                     ot = F.mse_loss(x0_hat_g, z)   # eq. 14: |G(x0_hat[r], z, r) - z|^2 (x - z = the head output)
                     loss = loss + self.args.ot_weight * ot
                 if backward:
-                    loss.backward()
+                    (loss * self.loss_scale).backward()
         stats = {"loss": float(loss.detach()), "dmd": float(dmd.detach()), "tau": tau, "w": float(weight),
                  "fake_real": float((x0_fake - x0_real).abs().mean()), "hat_real": float(gap),
                  "ot": None if ot is None else float(ot.detach()),
@@ -196,7 +204,7 @@ class Run:
             out = fake_velocity(self.dit, self.fake_head, x_tau, tau, r, text)
             loss = F.mse_loss(out, x0_hat - eps)       # H3 head convention: x0 - eps
             if backward:
-                loss.backward()
+                (loss * self.loss_scale).backward()
         return loss, tau
 
 
@@ -332,6 +340,15 @@ def make_optimizer(groups, betas=(0.9, 0.999)):
         return torch.optim.AdamW(groups, weight_decay=0.0, betas=betas), "adamw"
 
 
+def parse_tau(value: str):
+    """``beta:A`` passes through (validated); anything else is ``train_h3.parse_shift``."""
+    if value.startswith("beta:"):
+        if float(value.split(":", 1)[1]) <= 0:
+            raise argparse.ArgumentTypeError("beta:A needs A > 0")
+        return value
+    return train_h3.parse_shift(value)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--cache", type=Path, action="append", default=None,
@@ -350,9 +367,11 @@ def main() -> None:
                         help="fake-model updates per generator update (the paper uses 4)")
     parser.add_argument("--lr", type=float, default=1e-4, help="generator learning rate (LoRA, DirHead, adapter)")
     parser.add_argument("--fake-lr", type=float, default=1e-4)
-    parser.add_argument("--tau-shift", type=train_h3.parse_shift, default=3.0,
-                        help="tau density: float shift (3 ~ the paper's Beta(2.5, 1)), 'sigmoid', or 'lognorm:S'; "
-                             "clamped to [0.02, 0.98]")
+    parser.add_argument("--tau-shift", type=parse_tau, default=3.0,
+                        help="tau density: 'beta:A' (the paper: beta:2.5), float shift (3 ~ Beta(2.5, 1)), "
+                             "'sigmoid', or 'lognorm:S'; clamped to [0.02, 0.98]")
+    parser.add_argument("--accum", type=int, default=1,
+                        help="samples per generator and per fake update (gradient accumulation; the paper's batch is 256)")
     parser.add_argument("--dmd-weight", choices=["norm", "paper"], default="norm",
                         help="norm: grad = (x0_fake - x0_real) / mean|x0_hat - x0_real| (DMD2); "
                              "paper: w(tau) = 1 on the velocity difference, grad = (x0_fake - x0_real) / tau")
@@ -456,7 +475,7 @@ def main() -> None:
           f"schedule={args.schedule} gen_lora_modules={len(gen_net.unet_loras)} fake_lora_modules={len(fake_net.unet_loras)} "
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
-          f"fake_updates={args.fake_updates} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
+          f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
           f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
@@ -471,7 +490,7 @@ def main() -> None:
             "cache": [str(c) for c in (args.cache or [LOT_H3_STILLS_CACHE])], "schedule": args.schedule, "rank": args.rank, "temb_dim": temb_dim,
             "hidden": hidden, "lot": lot, "pairs": None if args.pairs is None else str(args.pairs),
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
-            "fake_updates": args.fake_updates, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
+            "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
             "grad_clip": args.grad_clip, "ema": args.ema}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
@@ -524,32 +543,49 @@ def main() -> None:
     evaluate(0)
     started = time.perf_counter()
     for step in range(1, args.steps + 1):
-        x0, text = train_h3.load_item(rng.choice(train_items), rng, device)
-        z = torch.randn_like(x0)
-        r = rng.randrange(args.iterations)
+        # One generator update = --accum samples (each its own prompt, noise, r and tau), grads
+        # summed with 1/accum so the step matches a batch of that size. Batch 1 is the H3 runtime's limit.
         gen_opt.zero_grad(set_to_none=True)
-        loss, x0_hat, stats = run.generator_update(z, text, r)
+        samples, all_stats = [], []
+        for _ in range(args.accum):
+            x0, text = train_h3.load_item(rng.choice(train_items), rng, device)
+            z = torch.randn_like(x0)
+            r = rng.randrange(args.iterations)
+            run.loss_scale = 1.0 / args.accum
+            _loss, x0_hat, stats = run.generator_update(z, text, r)
+            if not math.isfinite(stats["loss"]):
+                raise RuntimeError(f"step {step}: generator loss {stats['loss']}")
+            samples.append((z, text, r, x0_hat))
+            all_stats.append(stats)
+        run.loss_scale = 1.0
         grad_norm = clip(gen_params, args.grad_clip)
-        if not math.isfinite(stats["loss"]):
-            raise RuntimeError(f"step {step}: generator loss {stats['loss']}")
         gen_opt.step()
         if ema is not None:
             ema.update()
         gen_opt.zero_grad(set_to_none=True)
+        # Fake updates: the first reuses the generator step's detached samples, the rest draw fresh
+        # rollouts (Algorithm 1 draws fresh ones for every update; the reuse saves the rollouts).
         fake_losses = []
         for k in range(args.fake_updates):
             fake_opt.zero_grad(set_to_none=True)
-            if k == 0:
-                floss, _tau = run.fake_update(z, text, r, x0_hat)
-            else:
-                x1, text1 = train_h3.load_item(rng.choice(train_items), rng, device)
-                z1 = torch.randn_like(x1)
-                floss, _tau = run.fake_update(z1, text1, rng.randrange(args.iterations))
-            fake_losses.append(float(floss.detach()))
+            for z, text, r, x0_hat in samples:
+                run.loss_scale = 1.0 / args.accum
+                if k == 0:
+                    floss, _tau = run.fake_update(z, text, r, x0_hat)
+                else:
+                    x1, text1 = train_h3.load_item(rng.choice(train_items), rng, device)
+                    floss, _tau = run.fake_update(torch.randn_like(x1), text1, rng.randrange(args.iterations))
+                fake_losses.append(float(floss.detach()))
+            run.loss_scale = 1.0
             clip(fake_params, args.grad_clip)
             fake_opt.step()
             fake_opt.zero_grad(set_to_none=True)
-        record = {"step": step, "r": r, **stats, "grad_norm": float(grad_norm), "fake_loss": sum(fake_losses) / max(len(fake_losses), 1),
+        stats = {key: (sum(s[key] for s in all_stats) / len(all_stats)
+                       if all(isinstance(s[key], (int, float)) for s in all_stats) else all_stats[-1][key])
+                 for key in all_stats[0]}
+        r = samples[-1][2]
+        record = {"step": step, "r": [s[2] for s in samples], **stats, "grad_norm": float(grad_norm),
+                  "fake_loss": sum(fake_losses) / max(len(fake_losses), 1),
                   "seconds": round(time.perf_counter() - started, 1)}
         log.write(json.dumps(record) + "\n")
         if step % 10 == 0 or step == args.steps:
