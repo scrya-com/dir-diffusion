@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""Data-space iteration (DiR) for H3, trained by DMD. Experimental.
+
+    LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py [--steps 1000] [--swap 4] [--schedule bands,bands,dense,dense --pairs DIR]
+
+Paper: arXiv 2610.12102 (see ``dir_h3.py``). The generator is H3 plus a rank-``--rank`` LoRA
+(``gen``), a zero-initialised projection of the previous estimate, and an embedding of the
+iteration ``r``; it maps noise to a sample in ``R = 4`` iterations from the same noise. Training
+is DMD against the frozen base model:
+
+* real model: the base H3 (every LoRA off), flow time ``tau``;
+* fake model: the base plus a second LoRA (``fake``, zero-up so fake == real at step 0) and its
+  own iteration embedding, trained to denoise the generator's own samples.
+
+Generator update: draw ``r`` from ``0..R-1``, roll ``r`` iterations without grad, then one with
+grad gives ``x0_hat``. Draw ``tau`` and noise, ``x_tau = (1 - tau) x0_hat + tau eps``. Both models
+predict the clean latent from ``x_tau`` (no grad). With ``w = 1 / mean|x0_hat - x0_real|`` (DMD2's
+normaliser, detached):
+
+    grad = (x0_fake - x0_real) * w          loss = 0.5 * mse(x0_hat, (x0_hat - grad).detach())
+
+Sign: the loss' gradient with respect to ``x0_hat`` is ``(x0_hat - target) = grad / N``, so
+descent moves ``x0_hat`` along ``-grad = (x0_real - x0_fake) * w``: toward what the real model
+thinks is clean and away from what the fake model (the generator's own distribution) thinks.
+
+Fake update (``--fake-updates``, the paper does 4 per generator update): flow regression of the
+fake model on ``x_tau`` built from detached generator samples, conditioned on ``r``, in H3's
+``x0 - eps`` head convention. The first one reuses the generator step's sample; the others
+draw fresh rollouts.
+
+Layouts: ``--schedule`` gives one Level-of-Token layout per iteration (``dense``, ``bands``,
+``center``, ``uniform2``, ``uniform4``; one name repeats). Any non-dense entry needs ``--pairs``
+(the frozen bank, as ``train_h3.py``); ``--train-adapter`` also trains the adapter heads.
+
+Data: the text embeddings and latent shapes of H3 cache items (``train_h3.list_items`` /
+``load_item``; no clean latent is used). Torch memory: the grad forward and the no-grad
+forwards are kept apart (see ``generator_update``) because the block-swap offloader switches
+modes between them.
+
+Writes only under ``--out`` (default ``lot/runs/train_dir_h3``, gitignored): ``log.jsonl`` and,
+at ``--save-every`` and the end, ``dir_head.pt``, ``dir_fake_head.pt``, ``lora_gen.safetensors``,
+``lora_fake.safetensors``, ``adapter.pt`` (LoT) and ``config.json``; load with
+``dir_h3.load_dir_run``. Refuses to start unless ``LOT_H3_TRAIN=1`` (``--check`` is allowed).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # before CUDA init
+
+import torch
+import torch.nn.functional as F
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lot_paths import LOT_H3_STILLS_CACHE  # noqa: E402
+
+import train_h3  # noqa: E402
+from dir_h3 import (DEFAULT_R, DirFakeHead, DirHead, fake_velocity, fake_x0, generator_step,  # noqa: E402
+                    parse_layout_schedule, probe_temb_dim, real_x0, save_dir_run, use_networks)
+from h3_musubi import sample_sigma  # noqa: E402
+from h3_splice import LotSplice  # noqa: E402
+
+TAU_MIN, TAU_MAX = 0.02, 0.98
+
+
+# ------------------------------------------------------------------------------- pieces
+
+class Run:
+    """Everything one update needs, so ``--check``, training and eval share the same code."""
+
+    def __init__(self, dit, head, fake_head, gen_net, fake_net, adapter, args, device):
+        self.dit, self.head, self.fake_head = dit, head, fake_head
+        self.gen_net, self.fake_net, self.adapter = gen_net, fake_net, adapter
+        self.args, self.device = args, device
+        self.iterations = args.iterations
+        self._schedules: dict = {}
+
+    def schedule(self, z: torch.Tensor) -> list:
+        """Layouts for ``z``'s token grid (cached per shape)."""
+        key = tuple(z.shape[2:])
+        if key not in self._schedules:
+            t, h, w = key
+            self._schedules[key] = parse_layout_schedule(self.args.schedule, self.iterations, h // 2, w // 2, t)
+        return self._schedules[key]
+
+    def splice(self, layout):
+        return None if layout is None else LotSplice(self.adapter, layout, y_space=True)
+
+    def audio(self, seed):
+        return torch.Generator(self.device).manual_seed(seed)
+
+    def one_step(self, z, estimate, r, text, schedule, audio_seed):
+        audio = torch.Generator(self.device).manual_seed(audio_seed)
+        return generator_step(self.dit, self.head, z, estimate, r, text, splice=self.splice(schedule[r]),
+                              audio_generator=audio)
+
+    @torch.no_grad()
+    def rollout(self, z, r, text, schedule, audio_seed) -> torch.Tensor:
+        """``x0_hat[r]`` (zeros for r = 0), generator on, fake off, no grad."""
+        estimate = torch.zeros_like(z)
+        with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
+            for k in range(r):
+                estimate = self.one_step(z, estimate, k, text, schedule, audio_seed + k)
+        return estimate
+
+    def draw_tau(self) -> float:
+        return float(sample_sigma(self.args.tau_shift, self.device).clamp(TAU_MIN, TAU_MAX))
+
+    # -------------------------------------------------------------------- generator update
+    def generator_update(self, z, text, r, *, backward=True):
+        """One DMD generator step. Returns ``(loss, x0_hat value, r, stats)``.
+
+        Order matters with block swap: the offloader is in forward-only mode under no_grad and
+        in training mode for the grad forward, and switching modes between a grad forward and
+        its backward would reset the block placement the backward hooks rely on. So every
+        no-grad forward (rollout, ``x0_hat`` value, real, fake) runs first, then the grad
+        forward (same audio noise, so the same ``x0_hat``) runs last and is followed straight
+        by its backward. The extra forward costs about one DiT pass.
+        """
+        schedule = self.schedule(z)
+        seed = int(torch.randint(0, 2**31 - 1, (1,)))
+        estimate = self.rollout(z, r, text, schedule, seed)
+        with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
+            x0_hat = self.one_step(z, estimate, r, text, schedule, seed + r)
+        tau = self.draw_tau()
+        eps = torch.randn_like(z)
+        x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
+        with torch.no_grad():
+            with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
+                x0_real = real_x0(self.dit, x_tau, tau, text, audio_generator=self.audio(seed + 99))
+            with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
+                x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, r, text, audio_generator=self.audio(seed + 99))
+            gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
+            weight = 1.0 / gap
+            grad = (x0_fake - x0_real) * weight
+            target = (x0_hat - grad).detach()
+        with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
+            with torch.enable_grad():
+                x0_hat_g = self.one_step(z, estimate, r, text, schedule, seed + r)
+                dmd = 0.5 * F.mse_loss(x0_hat_g, target)
+                loss = dmd
+                ot = None
+                if self.args.ot_weight > 0:
+                    ot = F.mse_loss(x0_hat_g, z)   # eq. 14: |G(x0_hat[r], z, r) - z|^2 (x - z = the head output)
+                    loss = loss + self.args.ot_weight * ot
+                if backward:
+                    loss.backward()
+        stats = {"loss": float(loss.detach()), "dmd": float(dmd.detach()), "tau": tau, "w": float(weight),
+                 "fake_real": float((x0_fake - x0_real).abs().mean()), "hat_real": float(gap),
+                 "ot": None if ot is None else float(ot.detach()),
+                 "hat_rms": float(x0_hat.pow(2).mean().sqrt()),
+                 "match": float((x0_hat_g.detach() - x0_hat).abs().max())}
+        return loss, x0_hat.detach(), stats
+
+    # ------------------------------------------------------------------------ fake update
+    def fake_update(self, z, text, r, x0_hat=None, *, backward=True):
+        """One fake-model flow-regression step on a detached generator sample. Returns ``(loss, tau)``."""
+        if x0_hat is None:
+            schedule = self.schedule(z)
+            seed = int(torch.randint(0, 2**31 - 1, (1,)))
+            with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
+                prev = self.rollout(z, r, text, schedule, seed)
+                x0_hat = self.one_step(z, prev, r, text, schedule, seed + r)
+        tau = self.draw_tau()
+        eps = torch.randn_like(z)
+        x_tau = (1.0 - tau) * x0_hat + tau * eps
+        with use_networks(self.gen_net, self.fake_net, gen=False, fake=True), torch.enable_grad():
+            out = fake_velocity(self.dit, self.fake_head, x_tau, tau, r, text)
+            loss = F.mse_loss(out, x0_hat - eps)       # H3 head convention: x0 - eps
+            if backward:
+                loss.backward()
+        return loss, tau
+
+
+def grad_sum(params) -> float:
+    return sum(float(p.grad.abs().sum()) for p in params if p.grad is not None)
+
+
+def zero_grads(params) -> None:
+    for p in params:
+        p.grad = None
+
+
+def rel(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt().clamp(min=1e-8))
+
+
+# ------------------------------------------------------------------------------- check
+
+def check(run: Run, groups: dict, items, rng, device) -> None:
+    """One generator and one fake update (forward + backward) per distinct schedule entry.
+
+    Prints grad sums per parameter group: the generator step must touch only gen LoRA / DirHead /
+    adapter, the fake step only fake LoRA / fake head. Nothing is stepped or written.
+    """
+    x0, text = train_h3.load_item(rng.choice(items), rng, device)
+    z = torch.randn_like(x0)
+    # Fake == real at init (fake LoRA up and fake r-embed are zero), at a mid tau.
+    with torch.no_grad():
+        tau = 0.5
+        x_tau = (1.0 - tau) * torch.zeros_like(z) + tau * z
+        # The silent-audio rows are random noise per call: reseed so only the LoRA/embedding differs.
+        with use_networks(run.gen_net, run.fake_net, gen=False, fake=False):
+            torch.manual_seed(123)
+            real = real_x0(run.dit, x_tau, tau, text)
+            torch.manual_seed(123)
+            real2 = real_x0(run.dit, x_tau, tau, text)
+        with use_networks(run.gen_net, run.fake_net, gen=False, fake=True):
+            torch.manual_seed(123)
+            fake = fake_x0(run.dit, run.fake_head, x_tau, tau, 0, text)
+    init_gap, floor = rel(fake, real), rel(real2, real)
+    print(f"LOT_H3 kind=dir_check_init fake_vs_real_rel={init_gap:.3g} run_to_run={floor:.3g} shape={tuple(z.shape)} "
+          f"ok={int(init_gap < 1e-2)}", flush=True)
+
+    # At init fake == real, so the DMD gradient is exactly zero. Perturb the fake model (check only,
+    # nothing is saved) so the generator step has a signal to backpropagate.
+    with torch.no_grad():
+        run.fake_head.fake_r_embed.normal_(0.0, 0.05)
+        for module in run.fake_net.unet_loras:
+            module.lora_up.weight.normal_(0.0, 0.02)
+    schedule = run.schedule(z)
+    seen = set()
+    for r, layout in enumerate(schedule):
+        name = "dense" if layout is None else f"lot{layout.count}of{layout.dense_count}"
+        if name in seen:
+            continue
+        seen.add(name)
+        all_params = [p for g in groups.values() for p in g]
+        zero_grads(all_params)
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        loss, x0_hat, stats = run.generator_update(z, text, r)
+        torch.cuda.synchronize()
+        gen_seconds = time.perf_counter() - start
+        gen_peak = torch.cuda.max_memory_allocated() / 2**20
+        sums = {k: grad_sum(v) for k, v in groups.items()}
+        gen_ok = (sums["gen_lora"] > 0 and sums["dir_head"] > 0 and sums["fake_lora"] == 0 and sums["fake_head"] == 0
+                  and (sums["adapter"] > 0 or not run.args.train_adapter or layout is None)
+                  and math.isfinite(stats["loss"]))
+        print(f"LOT_H3 kind=dir_check_gen r={r} layout={name} loss={stats['loss']:.4g} tau={stats['tau']:.3f} "
+              f"w={stats['w']:.3g} fake_real={stats['fake_real']:.3g} hat_real={stats['hat_real']:.3g} "
+              f"regen_maxdiff={stats['match']:.3g} grad_gen_lora={sums['gen_lora']:.3g} grad_dir_head={sums['dir_head']:.3g} "
+              f"grad_adapter={sums['adapter']:.3g} grad_fake_lora={sums['fake_lora']:.3g} "
+              f"grad_fake_head={sums['fake_head']:.3g} seconds={gen_seconds:.2f} peak_mb={gen_peak:.0f} ok={int(gen_ok)}",
+              flush=True)
+        zero_grads(all_params)
+        torch.cuda.reset_peak_memory_stats()
+        start = time.perf_counter()
+        floss, tau = run.fake_update(z, text, r, x0_hat)
+        torch.cuda.synchronize()
+        fake_seconds = time.perf_counter() - start
+        sums = {k: grad_sum(v) for k, v in groups.items()}
+        fake_ok = (sums["fake_lora"] > 0 and sums["fake_head"] > 0 and sums["gen_lora"] == 0 and sums["dir_head"] == 0
+                   and sums["adapter"] == 0 and math.isfinite(float(floss.detach())))
+        print(f"LOT_H3 kind=dir_check_fake r={r} layout={name} loss={float(floss.detach()):.4g} tau={tau:.3f} "
+              f"grad_fake_lora={sums['fake_lora']:.3g} grad_fake_head={sums['fake_head']:.3g} "
+              f"grad_gen_lora={sums['gen_lora']:.3g} grad_dir_head={sums['dir_head']:.3g} "
+              f"grad_adapter={sums['adapter']:.3g} seconds={fake_seconds:.2f} "
+              f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f} ok={int(fake_ok)}", flush=True)
+        zero_grads(all_params)
+
+
+# ------------------------------------------------------------------------------- main
+
+def make_optimizer(groups, name_hint=""):
+    try:
+        import bitsandbytes as bnb
+        return bnb.optim.AdamW8bit(groups, weight_decay=0.0), "adamw8bit"
+    except ImportError:
+        return torch.optim.AdamW(groups, weight_decay=0.0), "adamw"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--cache", type=Path, action="append", default=None,
+                        help=f"H3 cache dir (text + shapes); repeatable (default {LOT_H3_STILLS_CACHE})")
+    parser.add_argument("--schedule", default="dense",
+                        help="layout per iteration, e.g. bands,bands,dense,dense (one name repeats); non-dense needs --pairs")
+    parser.add_argument("--pairs", type=Path, default=None, help="Procrustes pair dir for the frozen bank (LoT schedules)")
+    parser.add_argument("--iterations", type=int, default=DEFAULT_R, help="R, the number of iterations (paper: 4)")
+    parser.add_argument("--init", type=Path, default=None,
+                        help="warm-start the generator LoRA (lora_gen / lora.safetensors) and adapter from a run dir")
+    parser.add_argument("--train-adapter", action="store_true", help="train the LoT adapter heads with the generator")
+    parser.add_argument("--max-latent-hw", type=int, nargs=2, default=None, metavar=("H", "W"),
+                        help="random spatial crop cap in latent pixels (multiples of 8), e.g. 48 48")
+    parser.add_argument("--steps", type=int, default=1000, help="generator updates")
+    parser.add_argument("--fake-updates", type=int, default=2,
+                        help="fake-model updates per generator update (the paper uses 4)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="generator learning rate (LoRA, DirHead, adapter)")
+    parser.add_argument("--fake-lr", type=float, default=1e-4)
+    parser.add_argument("--tau-shift", type=train_h3.parse_shift, default=3.0,
+                        help="tau density: float shift (3 ~ the paper's Beta(2.5, 1)), 'sigmoid', or 'lognorm:S'; "
+                             "clamped to [0.02, 0.98]")
+    parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
+    parser.add_argument("--rank", type=int, default=16)
+    parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
+    parser.add_argument("--holdout", type=int, default=8)
+    parser.add_argument("--eval-every", type=int, default=100)
+    parser.add_argument("--save-every", type=int, default=0, help="0 = save only at the end")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs" / "train_dir_h3")
+    parser.add_argument("--check", action="store_true",
+                        help="one generator + one fake update per distinct schedule entry, grads and memory printed, "
+                             "no optimizer step, writes nothing; allowed without LOT_H3_TRAIN")
+    args = parser.parse_args()
+
+    train_h3.MAX_LATENT_HW = tuple(args.max_latent_hw) if args.max_latent_hw else None
+    if not args.check and os.environ.get("LOT_H3_TRAIN") != "1":
+        raise SystemExit("DiR training is gated: set LOT_H3_TRAIN=1 to train (or --check for a dry pass)")
+    from gpu_guard import refuse_if_busy
+
+    refuse_if_busy("train_dir_h3.py")
+    from h3_musubi import load_dit, make_lora
+
+    names = [n.strip() for n in args.schedule.split(",") if n.strip()]
+    lot = any(n != "dense" for n in names)
+    if lot and args.pairs is None:
+        raise SystemExit("a non-dense --schedule needs --pairs (the frozen bank)")
+
+    device = torch.device("cuda")
+    torch.manual_seed(args.seed)
+    rng = random.Random(args.seed)
+    train_items, held_items = [], []
+    for cache in args.cache or [LOT_H3_STILLS_CACHE]:
+        train_part, held_part = train_h3.list_items(cache, args.holdout)
+        train_items += train_part
+        held_items += held_part
+
+    adapter = None
+    if lot:
+        from h3 import make_h3_adapter
+        from procrustes_h3 import CHECKPOINT, fit_bank, load_pairs, pretrained_maps
+
+        adapter = make_h3_adapter()
+        adapter.init_from_pretrained(*pretrained_maps(CHECKPOINT))
+        fit_bank(adapter, load_pairs(args.pairs))
+        adapter.to(device)
+        adapter.bank.requires_grad_(False)
+
+    dit = load_dit(device=device, swap=args.swap, train=True)
+    hidden, temb_dim = dit.config.hidden_size, probe_temb_dim(dit)
+    gen_net = make_lora(dit, args.rank)          # applied first
+    fake_net = make_lora(dit, args.rank)         # wraps the generator LoRA's forward; .enabled switches each off
+    if args.init is not None:
+        lora_file = next(f for f in (args.init / "lora_gen.safetensors", args.init / "lora.safetensors") if f.is_file())
+        info = gen_net.load_weights(str(lora_file))
+        if info.missing_keys:
+            raise RuntimeError(f"--init LoRA is missing {len(info.missing_keys)} keys")
+        if adapter is not None and ((args.init / "adapter.pt").is_file() or (args.init / "adapter.safetensors").is_file()):
+            adapter.load_state_dict(train_h3.load_adapter_state(args.init))
+        print(f"LOT_H3 kind=dir_init from={args.init}", flush=True)
+    for net in (gen_net, fake_net):
+        net.requires_grad_(True)
+        net.to(device=device, dtype=torch.bfloat16)
+    head = DirHead(hidden, temb_dim, args.iterations).to(device)
+    fake_head = DirFakeHead(temb_dim, args.iterations).to(device)
+    if args.init is not None and (args.init / "dir_head.pt").is_file():
+        head.load_state_dict(torch.load(args.init / "dir_head.pt", map_location=device, weights_only=True))
+
+    gen_lora_groups, _ = gen_net.prepare_optimizer_params(args.lr)
+    fake_lora_groups, _ = fake_net.prepare_optimizer_params(args.fake_lr)
+    adapter_params = []
+    if adapter is not None:
+        adapter_params = [p for n, p in adapter.named_parameters() if not n.startswith("bank.")]
+        for p in adapter_params:
+            p.requires_grad_(args.train_adapter)
+        if not args.train_adapter:
+            adapter_params = []
+    gen_groups = gen_lora_groups + [{"params": list(head.parameters()), "lr": args.lr}]
+    if adapter_params:
+        gen_groups.append({"params": adapter_params, "lr": args.lr})
+    fake_groups = fake_lora_groups + [{"params": list(fake_head.parameters()), "lr": args.fake_lr}]
+    gen_opt, opt_name = make_optimizer(gen_groups)
+    fake_opt, _ = make_optimizer(fake_groups)
+    param_groups = {
+        "gen_lora": [p for g in gen_lora_groups for p in g["params"]],
+        "dir_head": list(head.parameters()),
+        "adapter": adapter_params,
+        "fake_lora": [p for g in fake_lora_groups for p in g["params"]],
+        "fake_head": list(fake_head.parameters()),
+    }
+    gen_params = param_groups["gen_lora"] + param_groups["dir_head"] + adapter_params
+    fake_params = param_groups["fake_lora"] + param_groups["fake_head"]
+    print(f"LOT_H3 kind=dir_start items={len(train_items)} holdout={len(held_items)} iterations={args.iterations} "
+          f"schedule={args.schedule} gen_lora_modules={len(gen_net.unet_loras)} fake_lora_modules={len(fake_net.unet_loras)} "
+          f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
+          f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
+          f"fake_updates={args.fake_updates} tau_shift={args.tau_shift} "
+          f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
+
+    run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
+    if args.check:
+        check(run, param_groups, train_items, rng, device)
+        return
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    log = open(args.out / "log.jsonl", "a")
+    meta = {"iters": args.iterations, "holdout": args.holdout,
+            "cache": [str(c) for c in (args.cache or [LOT_H3_STILLS_CACHE])], "schedule": args.schedule, "rank": args.rank, "temb_dim": temb_dim,
+            "hidden": hidden, "lot": lot, "pairs": None if args.pairs is None else str(args.pairs),
+            "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
+            "fake_updates": args.fake_updates}
+    (args.out / "config.json").write_text(json.dumps(meta, indent=1))
+
+    def save(tag: str) -> None:
+        save_dir_run(args.out, tag, head=head, fake_head=fake_head, gen_network=gen_net, fake_network=fake_net,
+                     adapter=adapter, meta=meta)
+        print(f"LOT_H3 kind=dir_saved tag={tag or 'final'} out={args.out}", flush=True)
+
+    @torch.no_grad()
+    def evaluate(step: int) -> None:
+        """Held-out prompts, fixed seeds. Per iteration: rms change from the previous estimate (does the
+        refinement converge?) and the DMD terms at a fixed tau (|fake - real| mean, the normalised gap)."""
+        head.eval()
+        change = [[] for _ in range(args.iterations)]
+        fake_real = [[] for _ in range(args.iterations)]
+        hat_real = [[] for _ in range(args.iterations)]
+        for index, item in enumerate(held_items):
+            x0, text = train_h3.load_item(item, random.Random(1000 + index), device)
+            gen = torch.Generator(device).manual_seed(index)
+            z = torch.randn(x0.shape, device=device, generator=gen)
+            eps = torch.randn(x0.shape, device=device, generator=gen)
+            schedule = run.schedule(z)
+            estimate = torch.zeros_like(z)
+            for r in range(args.iterations):
+                with use_networks(gen_net, fake_net, gen=True, fake=False):
+                    new = run.one_step(z, estimate, r, text, schedule, 7 * index + r)
+                change[r].append(float((new - estimate).pow(2).mean().sqrt()))
+                tau = 0.6
+                x_tau = (1.0 - tau) * new + tau * eps
+                with use_networks(gen_net, fake_net, gen=False, fake=False):
+                    real = real_x0(dit, x_tau, tau, text, audio_generator=run.audio(3 * index + r))
+                with use_networks(gen_net, fake_net, gen=False, fake=True):
+                    fake = fake_x0(dit, fake_head, x_tau, tau, r, text, audio_generator=run.audio(3 * index + r))
+                fake_real[r].append(float((fake - real).abs().mean()))
+                hat_real[r].append(float((new - real).abs().mean()))
+                estimate = new
+        head.train()
+        mean = lambda xs: round(sum(xs) / max(len(xs), 1), 5)  # noqa: E731
+        record = {"step": step, "eval": {"change": [mean(c) for c in change], "fake_real": [mean(c) for c in fake_real],
+                                          "hat_real": [mean(c) for c in hat_real]}}
+        log.write(json.dumps(record) + "\n")
+        log.flush()
+        print(f"LOT_H3 kind=dir_eval step={step} change={record['eval']['change']} "
+              f"fake_real={record['eval']['fake_real']} hat_real={record['eval']['hat_real']}", flush=True)
+
+    evaluate(0)
+    started = time.perf_counter()
+    for step in range(1, args.steps + 1):
+        x0, text = train_h3.load_item(rng.choice(train_items), rng, device)
+        z = torch.randn_like(x0)
+        r = rng.randrange(args.iterations)
+        gen_opt.zero_grad(set_to_none=True)
+        loss, x0_hat, stats = run.generator_update(z, text, r)
+        grad_norm = torch.nn.utils.clip_grad_norm_(gen_params, 1.0)
+        if not math.isfinite(stats["loss"]):
+            raise RuntimeError(f"step {step}: generator loss {stats['loss']}")
+        gen_opt.step()
+        gen_opt.zero_grad(set_to_none=True)
+        fake_losses = []
+        for k in range(args.fake_updates):
+            fake_opt.zero_grad(set_to_none=True)
+            if k == 0:
+                floss, _tau = run.fake_update(z, text, r, x0_hat)
+            else:
+                x1, text1 = train_h3.load_item(rng.choice(train_items), rng, device)
+                z1 = torch.randn_like(x1)
+                floss, _tau = run.fake_update(z1, text1, rng.randrange(args.iterations))
+            fake_losses.append(float(floss.detach()))
+            torch.nn.utils.clip_grad_norm_(fake_params, 1.0)
+            fake_opt.step()
+            fake_opt.zero_grad(set_to_none=True)
+        record = {"step": step, "r": r, **stats, "grad_norm": float(grad_norm), "fake_loss": sum(fake_losses) / max(len(fake_losses), 1),
+                  "seconds": round(time.perf_counter() - started, 1)}
+        log.write(json.dumps(record) + "\n")
+        if step % 10 == 0 or step == args.steps:
+            log.flush()
+            print(f"LOT_H3 kind=dir step={step} r={r} dmd={stats['dmd']:.4g} fake_loss={record['fake_loss']:.4f} "
+                  f"fake_real={stats['fake_real']:.4f} hat_real={stats['hat_real']:.4f} grad_norm={record['grad_norm']:.3g} "
+                  f"s_per_step={(time.perf_counter() - started) / step:.2f} "
+                  f"peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
+        if args.eval_every and step % args.eval_every == 0:
+            evaluate(step)
+        if args.save_every and step % args.save_every == 0:
+            save(f"_{step}")
+    save("")
+    print(f"LOT_H3 kind=dir_done steps={args.steps} seconds={time.perf_counter() - started:.0f} ok=1", flush=True)
+
+
+if __name__ == "__main__":
+    main()

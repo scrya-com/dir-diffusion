@@ -155,20 +155,25 @@ def generator_step(dit, head: DirHead, z: torch.Tensor, estimate: torch.Tensor, 
 
 # --------------------------------------------------------------------- DMD predictions
 
-def fake_x0(dit, fake_head: DirFakeHead, x_tau: torch.Tensor, tau, r: int, text: torch.Tensor) -> torch.Tensor:
+def fake_x0(dit, fake_head: DirFakeHead, x_tau: torch.Tensor, tau, r: int, text: torch.Tensor,
+            audio_generator: torch.Generator | None = None) -> torch.Tensor:
     """The fake model's clean estimate at noise level ``tau`` (sigma), conditioned on ``r``."""
-    out = forward_video(dit, x_tau, 1.0 - float(tau), text, video_temb_delta=fake_head.fake_r_embed[r]).float()
+    out = forward_video(dit, x_tau, 1.0 - float(tau), text, video_temb_delta=fake_head.fake_r_embed[r],
+                         audio_generator=audio_generator).float()
     return x_tau.float() + float(tau) * out
 
 
-def fake_velocity(dit, fake_head: DirFakeHead, x_tau: torch.Tensor, tau, r: int, text: torch.Tensor) -> torch.Tensor:
+def fake_velocity(dit, fake_head: DirFakeHead, x_tau: torch.Tensor, tau, r: int, text: torch.Tensor,
+                  audio_generator: torch.Generator | None = None) -> torch.Tensor:
     """The fake model's raw head output (``x0 - eps``), for its regression loss."""
-    return forward_video(dit, x_tau, 1.0 - float(tau), text, video_temb_delta=fake_head.fake_r_embed[r]).float()
+    return forward_video(dit, x_tau, 1.0 - float(tau), text, video_temb_delta=fake_head.fake_r_embed[r],
+                         audio_generator=audio_generator).float()
 
 
-def real_x0(dit, x_tau: torch.Tensor, tau, text: torch.Tensor) -> torch.Tensor:
+def real_x0(dit, x_tau: torch.Tensor, tau, text: torch.Tensor,
+            audio_generator: torch.Generator | None = None) -> torch.Tensor:
     """The frozen base model's clean estimate at ``tau`` (call with every LoRA off)."""
-    out = forward_video(dit, x_tau, 1.0 - float(tau), text).float()
+    out = forward_video(dit, x_tau, 1.0 - float(tau), text, audio_generator=audio_generator).float()
     return x_tau.float() + float(tau) * out
 
 
