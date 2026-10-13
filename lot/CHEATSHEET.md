@@ -156,7 +156,7 @@ Inside ComfyUI, a 1×1 `dense` layout reproduces the stock forward exactly (rela
 
 ## Experimental: DiR few-step (no trained weights yet)
 
-DiR iterates the clean estimate (`x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)`, R = 4, same noise, σ pinned to 1) and trains with DMD ([arXiv 2610.12102](https://arxiv.org/abs/2610.12102)). **Untested at scale; every measured number below is TODO.** Details: [README → DiR](README.md#experimental-dir-few-step-generation-dir_h3py).
+DiR iterates the clean estimate (`x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)`, R = 4, same noise, σ pinned to 1) and trains with DMD ([arXiv 2610.12102](https://arxiv.org/abs/2610.12102)). **Smoke-tested only (2-step run, eval, save, render); every measured number is TODO.** Details: [README → DiR](README.md#experimental-dir-few-step-generation-dir_h3py).
 
 ```bash
 python3 lot/parity_dir_h3.py                                     # GPU, must pass first -> ok=1
@@ -174,6 +174,18 @@ python3 lot/render_dir_h3.py --untrained --prompts 1             # smoke: zero h
 | `--steps` | 20 | Dense baseline steps (generator LoRA off). |
 | `--prompts` / `--pick` / `--holdout` / `--prompt-cache` | 3 / none / 24 / `cache_iso3d` | Held-out prompts, as in `render_h3.py`. |
 | `--swap` | 0 | Blocks streamed from CPU. |
+| `--ema` | off | Load the `*_ema` generator files (run trained with `--ema`). |
+
+`--holdout` and `--prompt-cache` default to the run's `config.json` (`holdout`, `cache[0]`) when `--run` is given; `--iters` must be within the trained `iters`.
+
+| `train_dir_h3.py` flag | Default | What it does |
+|---|---|---|
+| `--dmd-weight {norm,paper}` | `norm` | `norm`: DMD2 normaliser 1 over the mean absolute gap of x0_hat to x0_real. `paper`: w(τ) = 1, `grad = (x0_fake - x0_real)/τ`. |
+| `--betas B1 B2` | `0.9 0.999` | AdamW betas, both optimizers (paper: `0.0 0.95`). |
+| `--grad-clip` | `1.0` | Gradient-norm clip, generator and fake; `0` = off (paper: none). |
+| `--ema D` | `0` (off) | EMA of the generator's trainable params; writes `*_ema` files next to the normal ones. |
+
+Paper-style: `--dmd-weight paper --betas 0 0.95 --grad-clip 0 --ema 0.999 --fake-updates 4`.
 
 `meta.json` has DiT ms per sample and `delta[r] = mean |x̂0⁽ʳ⁾ − x̂0⁽ʳ⁻¹⁾|` per prompt.
 

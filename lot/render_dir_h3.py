@@ -17,8 +17,10 @@ Run layout read by ``load_run`` (keep it the one place to adapt to the trainer):
 ``rank``, else ``config.json``), optional ``adapter.pt`` (needed when the schedule has a
 non-dense layout), ``config.json`` with ``schedule``, ``iters``, ``rank``, ``pairs``. The fake
 model's files are not needed to sample. ``--untrained`` is a smoke test, not a quality claim:
-a zero head makes every iteration the one-step base prediction. Weights from this method do
-not exist yet; this script has only been compiled, not run on a GPU.
+a zero head makes every iteration the one-step base prediction (up to bf16 rounding). Smoke-tested
+on the GPU with a 2-step run (``--run``, with and without ``--ema``) and ``--untrained``; no
+trained weights worth judging exist yet. ``--ema`` loads the ``*_ema`` files; ``--holdout`` and
+``--prompt-cache`` default to the run's ``config.json``.
 """
 
 from __future__ import annotations
@@ -50,28 +52,33 @@ def read_config(run: Path | None) -> dict:
     return json.loads(path.read_text()) if path is not None and path.is_file() else {}
 
 
-def load_run(run: Path, dit, config: dict, rank: int | None):
+def load_run(run: Path, dit, config: dict, rank: int | None, ema: bool = False):
     """``(head, gen_network, adapter_state)`` of a trained run. The one function to adapt to the trainer."""
     from safetensors import safe_open
 
     from dir_h3 import DirHead, probe_temb_dim
     from h3_musubi import make_lora
 
-    lora_path = run / "lora_gen.safetensors"
+    sfx = "_ema" if ema else ""
+    lora_path = run / f"lora_gen{sfx}.safetensors"
+    if not lora_path.is_file():
+        raise SystemExit(f"{lora_path} not found" + (" (the run was trained without --ema)" if ema else ""))
     with safe_open(str(lora_path), "pt") as handle:
         meta_rank = (handle.metadata() or {}).get("rank")
     rank = rank or (int(meta_rank) if meta_rank else None) or config.get("rank")
     if not rank:
         raise SystemExit("LoRA rank unknown: no `rank` in the safetensors metadata or config.json; pass --rank")
     head = DirHead(dit.video_patch_proj.out_features, probe_temb_dim(dit), int(config.get("iters", DEFAULT_R)))
-    head.load_state_dict(torch.load(run / "dir_head.pt", map_location="cpu"))
+    head.load_state_dict(torch.load(run / f"dir_head{sfx}.pt", map_location="cpu"))
     network = make_lora(dit, int(rank))
     info = network.load_weights(str(lora_path))
     if info.missing_keys:
         raise RuntimeError(f"LoRA load missed {len(info.missing_keys)} keys")
     network.to(device="cuda", dtype=torch.bfloat16).eval()
     adapter_state = None
-    if (run / "adapter.pt").is_file() or (run / "adapter.safetensors").is_file():
+    if (run / f"adapter{sfx}.pt").is_file():
+        adapter_state = torch.load(run / f"adapter{sfx}.pt", map_location="cpu", weights_only=True)
+    elif not ema and (run / "adapter.safetensors").is_file():
         from train_h3 import load_adapter_state
 
         adapter_state = load_adapter_state(run)
@@ -92,10 +99,12 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path(__file__).resolve().parent / "runs" / "render_dir")
     parser.add_argument("--swap", type=int, default=0, help="blocks streamed from CPU (0 = all resident)")
     parser.add_argument("--rank", type=int, default=None, help="gen LoRA rank if the file and config.json lack it")
-    parser.add_argument("--holdout", type=int, default=24, help="the --holdout the trainer used for that cache")
+    parser.add_argument("--ema", action="store_true", help="load the *_ema generator files (run trained with --ema)")
+    parser.add_argument("--holdout", type=int, default=None,
+                        help="the --holdout the trainer used for that cache (default: config.json holdout, else 24)")
     parser.add_argument("--pick", default=None, help="comma list of held-out indices to render, e.g. 7,3")
     parser.add_argument("--prompt-cache", type=Path, default=None,
-                        help="with --run: held-out prompts from this cache (default train_h3's cache_iso3d)")
+                        help="with --run: held-out prompts from this cache (default: config.json cache[0], else train_h3's cache_iso3d)")
     args = parser.parse_args()
 
     refuse_if_busy("render_dir_h3.py")
@@ -104,16 +113,24 @@ def main() -> None:
     from h3_musubi import load_dit, load_vae, sample
 
     config = read_config(args.run)
-    iters = args.iters or int(config.get("iters", DEFAULT_R))
+    trained_iters = int(config.get("iters", DEFAULT_R))
+    iters = args.iters or trained_iters
+    if args.run is not None and not 1 <= iters <= trained_iters:
+        raise SystemExit(f"--iters {iters} is outside 1..{trained_iters}: the run trained {trained_iters} iteration embeddings")
     spec = args.schedule or config.get("schedule") or "dense"
     schedule = parse_layout_schedule(spec, iters, HEIGHT // 32, WIDTH // 32, 1)
+
+    if args.run is not None and any(n.strip() != "dense" for n in spec.split(",")) \
+            and not ((args.run / "adapter.pt").is_file() or (args.run / "adapter.safetensors").is_file()):
+        print(f"WARNING: LoT schedule {spec!r} but {args.run} has no adapter.pt: the adapter is the untrained "
+              f"mean lift, not what the run trained with", flush=True)
 
     model = load_dit(LOT_H3_CHECKPOINT, swap=args.swap)
     network, adapter, adapter_state = None, None, None
     if args.untrained:
         head = DirHead(model.video_patch_proj.out_features, probe_temb_dim(model), iters).cuda().eval()
     else:
-        head, network, adapter_state = load_run(args.run, model, config, args.rank)
+        head, network, adapter_state = load_run(args.run, model, config, args.rank, args.ema)
     if any(layout is not None for layout in schedule):
         adapter = make_h3_adapter()
         if adapter_state is not None:
@@ -128,7 +145,9 @@ def main() -> None:
     if args.run is not None:
         from train_h3 import CACHE, list_items
 
-        held = [te for _latent, te in list_items(args.prompt_cache or CACHE, args.holdout)[1]]
+        cache = args.prompt_cache or (Path(config["cache"][0]) if config.get("cache") else CACHE)
+        holdout = args.holdout if args.holdout is not None else int(config.get("holdout", 24))
+        held = [te for _latent, te in list_items(cache, holdout)[1]]
         if args.pick:
             held = [held[int(index)] for index in args.pick.split(",")]
     prompts = load_prompts(args.prompts, held)
@@ -183,7 +202,7 @@ def main() -> None:
         f"dir r={r}  ~{dir_med * r / iters:.0f}ms" for r in range(1, iters + 1)]
     grid(rows, labels).save(args.out / "grid.png")
     meta = {
-        "run": None if args.run is None else str(args.run), "untrained": bool(args.untrained),
+        "run": None if args.run is None else str(args.run), "untrained": bool(args.untrained), "ema": bool(args.ema),
         "iters": iters, "schedule": spec, "steps": args.steps, "seed": args.seed, "canvas": f"{WIDTH}x{HEIGHT}",
         "prompts": [text for text, _ in prompts],
         "dit_ms": {"dense": dense_ms, "dir_total": dir_ms, "dense_median": dense_med, "dir_median": dir_med,

@@ -10,8 +10,8 @@ changed minimally:
 
 * ``z`` goes through the original ``video_patch_proj`` (or the LoT extent heads);
 * the previous estimate goes through a NEW zero-initialised linear (``DirHead.x0_proj``)
-  whose output is added to the embedded video rows, so an untrained ``G`` is exactly
-  the one-step base prediction;
+  whose output is added to the embedded video rows, so an untrained ``G`` equals the
+  one-step base prediction up to bf16 rounding (the extra temb row; bounded in ``parity_dir_h3.py``);
 * an embedding of ``r`` (``DirHead.r_embed[r]``) is added to the video's timestep
   embedding, as a separate temb row used by the video rows only (see
   ``h3_musubi.video_modulation_rewrite``);
@@ -230,7 +230,6 @@ def dir_sample(dit, head: DirHead, text: torch.Tensor, *, height: int, width: in
     """
     generator = torch.Generator(device).manual_seed(seed)
     z = torch.randn(1, 24, latent_t, height // 16, width // 16, device=device, generator=generator)
-    audio_generator = torch.Generator(device).manual_seed(seed + 1)
     estimate = torch.zeros_like(z)
     schedule = schedule or [None] * iters
     if len(schedule) < iters:
@@ -243,6 +242,8 @@ def dir_sample(dit, head: DirHead, text: torch.Tensor, *, height: int, width: in
             if adapter is None:
                 raise ValueError("a non-dense layout in the schedule needs an adapter")
             splice = LotSplice(adapter, layout, y_space=True)
+        # same silent-audio noise at every iteration (a fresh generator with one seed), like z
+        audio_generator = torch.Generator(device).manual_seed(seed + 1)
         estimate = generator_step(dit, head, z, estimate, r, text, splice=splice, audio_generator=audio_generator)
         estimates.append(estimate)
     return estimate, estimates
@@ -250,24 +251,28 @@ def dir_sample(dit, head: DirHead, text: torch.Tensor, *, height: int, width: in
 
 # ------------------------------------------------------------------------ run loading
 
-def save_dir_run(run_dir, tag: str, *, head: DirHead, fake_head, gen_network, fake_network, adapter, meta: dict) -> None:
+def save_dir_run(run_dir, tag: str, *, head: DirHead, fake_head, gen_network, fake_network, adapter, meta: dict,
+                 gen_only: bool = False) -> None:
     """Write one checkpoint of a ``train_dir_h3.py`` run: ``dir_head{tag}.pt``, ``dir_fake_head{tag}.pt``,
-    ``lora_gen{tag}.safetensors``, ``lora_fake{tag}.safetensors``, ``adapter{tag}.pt`` (LoT runs) and ``config.json``."""
+    ``lora_gen{tag}.safetensors``, ``lora_fake{tag}.safetensors``, ``adapter{tag}.pt`` (LoT runs) and ``config.json``.
+    ``gen_only`` skips the fake model's files (used for the ``*_ema`` copies, tag ``"{tag}_ema"``)."""
     import json
     from pathlib import Path
 
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     torch.save(head.state_dict(), run_dir / f"dir_head{tag}.pt")
-    torch.save(fake_head.state_dict(), run_dir / f"dir_fake_head{tag}.pt")
+    if not gen_only:
+        torch.save(fake_head.state_dict(), run_dir / f"dir_fake_head{tag}.pt")
     gen_network.save_weights(str(run_dir / f"lora_gen{tag}.safetensors"), torch.bfloat16, {"lot_h3": "dir", "kind": "gen", "rank": str(meta["rank"])})
-    fake_network.save_weights(str(run_dir / f"lora_fake{tag}.safetensors"), torch.bfloat16, {"lot_h3": "dir", "kind": "fake", "rank": str(meta["rank"])})
+    if not gen_only:
+        fake_network.save_weights(str(run_dir / f"lora_fake{tag}.safetensors"), torch.bfloat16, {"lot_h3": "dir", "kind": "fake", "rank": str(meta["rank"])})
     if adapter is not None:
         torch.save(dict(adapter.state_dict()), run_dir / f"adapter{tag}.pt")
     (run_dir / "config.json").write_text(json.dumps(meta, indent=1))
 
 
-def load_dir_run(run_dir, dit, *, tag: str = "", device="cuda", adapter=None):
+def load_dir_run(run_dir, dit, *, tag: str = "", device="cuda", adapter=None, ema: bool = False):
     """Load a generator saved by ``train_dir_h3.py`` onto ``dit``.
 
     Applies the generator LoRA to ``dit`` (rank read from the file) and returns
@@ -275,6 +280,7 @@ def load_dir_run(run_dir, dit, *, tag: str = "", device="cuda", adapter=None):
     it enabled to sample; ``use_networks`` / ``set_lora`` switch it off for the base model), and the
     ``config.json`` dict (``iters``, ``schedule``, ``rank``, ``temb_dim``, ``hidden``, ...).
     ``tag`` picks an intermediate save (``"_3"`` for ``--save-every`` step 3; ``""`` is the final one).
+    ``ema=True`` loads the ``*_ema`` copy (``--ema`` runs; ``tag + "_ema"``).
     If ``adapter`` (a ``LotVisualAdapter``) is given and the run saved ``adapter{tag}.pt``, its state is
     loaded into it; the caller still builds the adapter and fits the bank as ``train_dir_h3.py`` does.
     """
@@ -287,6 +293,8 @@ def load_dir_run(run_dir, dit, *, tag: str = "", device="cuda", adapter=None):
 
     run_dir = Path(run_dir)
     meta = json.loads((run_dir / "config.json").read_text())
+    if ema:
+        tag = f"{tag}_ema"
     lora_file = run_dir / f"lora_gen{tag}.safetensors"
     with safe_open(str(lora_file), "pt") as handle:
         key = next(k for k in handle.keys() if k.endswith("lora_down.weight"))

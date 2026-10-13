@@ -13,11 +13,15 @@ is DMD against the frozen base model:
   own iteration embedding, trained to denoise the generator's own samples.
 
 Generator update: draw ``r`` from ``0..R-1``, roll ``r`` iterations without grad, then one with
-grad gives ``x0_hat``. Draw ``tau`` and noise, ``x_tau = (1 - tau) x0_hat + tau eps``. Both models
+grad gives ``x0_hat``. The silent-audio noise is drawn once per sample and is identical at every
+iteration (like ``z``). Draw ``tau`` and noise, ``x_tau = (1 - tau) x0_hat + tau eps``. Both models
 predict the clean latent from ``x_tau`` (no grad). With ``w = 1 / mean|x0_hat - x0_real|`` (DMD2's
 normaliser, detached):
 
     grad = (x0_fake - x0_real) * w          loss = 0.5 * mse(x0_hat, (x0_hat - grad).detach())
+
+(``--dmd-weight paper`` uses the paper's w(tau) = 1 instead: ``grad = (x0_fake - x0_real) / tau``.
+``--betas``, ``--grad-clip`` and ``--ema`` expose the paper's optimizer settings; see CHEATSHEET.)
 
 Sign: the loss' gradient with respect to ``x0_hat`` is ``(x0_hat - target) = grad / N``, so
 descent moves ``x0_hat`` along ``-grad = (x0_real - x0_fake) * w``: toward what the real model
@@ -39,13 +43,15 @@ modes between them.
 
 Writes only under ``--out`` (default ``lot/runs/train_dir_h3``, gitignored): ``log.jsonl`` and,
 at ``--save-every`` and the end, ``dir_head.pt``, ``dir_fake_head.pt``, ``lora_gen.safetensors``,
-``lora_fake.safetensors``, ``adapter.pt`` (LoT) and ``config.json``; load with
+``lora_fake.safetensors``, ``adapter.pt`` (LoT) and ``config.json`` (plus ``*_ema`` copies of the generator files with
+``--ema``); load with
 ``dir_h3.load_dir_run``. Refuses to start unless ``LOT_H3_TRAIN=1`` (``--check`` is allowed).
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -98,6 +104,9 @@ class Run:
         return torch.Generator(self.device).manual_seed(seed)
 
     def one_step(self, z, estimate, r, text, schedule, audio_seed):
+        """One iteration. The silent-audio noise is part of ``z``'s conditioning, so every call of
+        one sample (all rollout iterations and the grad re-forward) gets a FRESH generator with the
+        SAME ``audio_seed``: identical audio noise at every iteration."""
         audio = torch.Generator(self.device).manual_seed(audio_seed)
         return generator_step(self.dit, self.head, z, estimate, r, text, splice=self.splice(schedule[r]),
                               audio_generator=audio)
@@ -108,7 +117,7 @@ class Run:
         estimate = torch.zeros_like(z)
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             for k in range(r):
-                estimate = self.one_step(z, estimate, k, text, schedule, audio_seed + k)
+                estimate = self.one_step(z, estimate, k, text, schedule, audio_seed)
         return estimate
 
     def draw_tau(self) -> float:
@@ -116,7 +125,7 @@ class Run:
 
     # -------------------------------------------------------------------- generator update
     def generator_update(self, z, text, r, *, backward=True):
-        """One DMD generator step. Returns ``(loss, x0_hat value, r, stats)``.
+        """One DMD generator step. Returns ``(loss, x0_hat value, stats)``.
 
         Order matters with block swap: the offloader is in forward-only mode under no_grad and
         in training mode for the grad forward, and switching modes between a grad forward and
@@ -129,7 +138,7 @@ class Run:
         seed = int(torch.randint(0, 2**31 - 1, (1,)))
         estimate = self.rollout(z, r, text, schedule, seed)
         with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
-            x0_hat = self.one_step(z, estimate, r, text, schedule, seed + r)
+            x0_hat = self.one_step(z, estimate, r, text, schedule, seed)
         tau = self.draw_tau()
         eps = torch.randn_like(z)
         x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
@@ -139,13 +148,24 @@ class Run:
             with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
                 x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, r, text, audio_generator=self.audio(seed + 99))
             gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
-            weight = 1.0 / gap
+            if self.args.dmd_weight == "paper":
+                # Paper eq. 10 / Algorithm 1: L = E w(tau) sg[v_real - v_fake]^T x0_hat, so
+                # dL/dx0_hat = w(tau) (v_real - v_fake), with the paper's v = eps - x0 (target eps - x0_hat).
+                # At a fixed x_tau = (1-tau) x0 + tau eps, x0 = x_tau - tau v, hence
+                # v_real - v_fake = (x0_fake - x0_real) / tau. H3's head predicts x0 - eps = -v, which
+                # is why fake_x0/real_x0 are x_tau + tau * out (the same x0 as x_tau - tau v).
+                # The paper's final setting w(tau) = 1 ("velocity difference applied directly to x0_hat"):
+                #     grad = (x0_fake - x0_real) / tau    (units of x0; descent moves x0_hat along -grad)
+                # The surrogate below has dloss/dx0_hat = grad / N, the same 1/N scale as the paper's
+                # mean(x_hat * direction). tau >= 0.02 here (TAU_MIN), so 1/tau <= 50.
+                weight = 1.0 / tau
+            else:
+                weight = 1.0 / gap          # DMD2's normaliser (detached), the default
             grad = (x0_fake - x0_real) * weight
-            target = (x0_hat - grad).detach()
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             with torch.enable_grad():
-                x0_hat_g = self.one_step(z, estimate, r, text, schedule, seed + r)
-                dmd = 0.5 * F.mse_loss(x0_hat_g, target)
+                x0_hat_g = self.one_step(z, estimate, r, text, schedule, seed)
+                dmd = 0.5 * F.mse_loss(x0_hat_g, (x0_hat_g.detach() - grad))   # d/dx0_hat_g = grad / N
                 loss = dmd
                 ot = None
                 if self.args.ot_weight > 0:
@@ -168,7 +188,7 @@ class Run:
             seed = int(torch.randint(0, 2**31 - 1, (1,)))
             with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
                 prev = self.rollout(z, r, text, schedule, seed)
-                x0_hat = self.one_step(z, prev, r, text, schedule, seed + r)
+                x0_hat = self.one_step(z, prev, r, text, schedule, seed)
         tau = self.draw_tau()
         eps = torch.randn_like(z)
         x_tau = (1.0 - tau) * x0_hat + tau * eps
@@ -178,6 +198,38 @@ class Run:
             if backward:
                 loss.backward()
         return loss, tau
+
+
+class Ema:
+    """fp32 exponential moving average of the generator's trainable parameters (gen LoRA, DirHead, adapter)."""
+
+    def __init__(self, params, decay: float):
+        self.params, self.decay = list(params), float(decay)
+        self.shadow = [p.detach().float().clone() for p in self.params]
+
+    @torch.no_grad()
+    def update(self) -> None:
+        for shadow, p in zip(self.shadow, self.params):
+            shadow.mul_(self.decay).add_(p.detach().float(), alpha=1.0 - self.decay)
+
+    @contextlib.contextmanager
+    def swapped(self):
+        """Temporarily put the averaged values into the live parameters."""
+        saved = [p.detach().clone() for p in self.params]
+        with torch.no_grad():
+            for shadow, p in zip(self.shadow, self.params):
+                p.copy_(shadow.to(p.dtype))
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for old, p in zip(saved, self.params):
+                    p.copy_(old)
+
+
+def clip(params, max_norm: float) -> float:
+    """Clip to ``max_norm`` (0 = off, norm only); returns the pre-clip norm."""
+    return float(torch.nn.utils.clip_grad_norm_(params, max_norm if max_norm > 0 else float("inf")))
 
 
 def grad_sum(params) -> float:
@@ -271,12 +323,13 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
 
 # ------------------------------------------------------------------------------- main
 
-def make_optimizer(groups, name_hint=""):
+def make_optimizer(groups, betas=(0.9, 0.999)):
+    betas = tuple(betas)
     try:
         import bitsandbytes as bnb
-        return bnb.optim.AdamW8bit(groups, weight_decay=0.0), "adamw8bit"
+        return bnb.optim.AdamW8bit(groups, weight_decay=0.0, betas=betas), "adamw8bit"
     except ImportError:
-        return torch.optim.AdamW(groups, weight_decay=0.0), "adamw"
+        return torch.optim.AdamW(groups, weight_decay=0.0, betas=betas), "adamw"
 
 
 def main() -> None:
@@ -300,6 +353,14 @@ def main() -> None:
     parser.add_argument("--tau-shift", type=train_h3.parse_shift, default=3.0,
                         help="tau density: float shift (3 ~ the paper's Beta(2.5, 1)), 'sigmoid', or 'lognorm:S'; "
                              "clamped to [0.02, 0.98]")
+    parser.add_argument("--dmd-weight", choices=["norm", "paper"], default="norm",
+                        help="norm: grad = (x0_fake - x0_real) / mean|x0_hat - x0_real| (DMD2); "
+                             "paper: w(tau) = 1 on the velocity difference, grad = (x0_fake - x0_real) / tau")
+    parser.add_argument("--betas", type=float, nargs=2, default=[0.9, 0.999], metavar=("B1", "B2"),
+                        help="AdamW betas for both optimizers (paper: 0.0 0.95)")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="gradient-norm clip, generator and fake (0 = off; paper: none)")
+    parser.add_argument("--ema", type=float, default=0.0,
+                        help="EMA decay of the generator's trainable params (0 = off); saved as *_ema files")
     parser.add_argument("--ot-weight", type=float, default=0.0, help="paper eq. 14 regulariser weight (0 = off; paper: no gain)")
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
@@ -379,8 +440,8 @@ def main() -> None:
     if adapter_params:
         gen_groups.append({"params": adapter_params, "lr": args.lr})
     fake_groups = fake_lora_groups + [{"params": list(fake_head.parameters()), "lr": args.fake_lr}]
-    gen_opt, opt_name = make_optimizer(gen_groups)
-    fake_opt, _ = make_optimizer(fake_groups)
+    gen_opt, opt_name = make_optimizer(gen_groups, args.betas)
+    fake_opt, _ = make_optimizer(fake_groups, args.betas)
     param_groups = {
         "gen_lora": [p for g in gen_lora_groups for p in g["params"]],
         "dir_head": list(head.parameters()),
@@ -390,11 +451,13 @@ def main() -> None:
     }
     gen_params = param_groups["gen_lora"] + param_groups["dir_head"] + adapter_params
     fake_params = param_groups["fake_lora"] + param_groups["fake_head"]
+    ema = Ema(gen_params, args.ema) if args.ema > 0 else None
     print(f"LOT_H3 kind=dir_start items={len(train_items)} holdout={len(held_items)} iterations={args.iterations} "
           f"schedule={args.schedule} gen_lora_modules={len(gen_net.unet_loras)} fake_lora_modules={len(fake_net.unet_loras)} "
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
-          f"fake_updates={args.fake_updates} tau_shift={args.tau_shift} "
+          f"fake_updates={args.fake_updates} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
+          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
@@ -408,12 +471,17 @@ def main() -> None:
             "cache": [str(c) for c in (args.cache or [LOT_H3_STILLS_CACHE])], "schedule": args.schedule, "rank": args.rank, "temb_dim": temb_dim,
             "hidden": hidden, "lot": lot, "pairs": None if args.pairs is None else str(args.pairs),
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
-            "fake_updates": args.fake_updates}
+            "fake_updates": args.fake_updates, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
+            "grad_clip": args.grad_clip, "ema": args.ema}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:
         save_dir_run(args.out, tag, head=head, fake_head=fake_head, gen_network=gen_net, fake_network=fake_net,
                      adapter=adapter, meta=meta)
+        if ema is not None:
+            with ema.swapped():
+                save_dir_run(args.out, f"{tag}_ema", head=head, fake_head=fake_head, gen_network=gen_net,
+                             fake_network=fake_net, adapter=adapter, meta=meta, gen_only=True)
         print(f"LOT_H3 kind=dir_saved tag={tag or 'final'} out={args.out}", flush=True)
 
     @torch.no_grad()
@@ -433,7 +501,7 @@ def main() -> None:
             estimate = torch.zeros_like(z)
             for r in range(args.iterations):
                 with use_networks(gen_net, fake_net, gen=True, fake=False):
-                    new = run.one_step(z, estimate, r, text, schedule, 7 * index + r)
+                    new = run.one_step(z, estimate, r, text, schedule, 7 * index)
                 change[r].append(float((new - estimate).pow(2).mean().sqrt()))
                 tau = 0.6
                 x_tau = (1.0 - tau) * new + tau * eps
@@ -461,10 +529,12 @@ def main() -> None:
         r = rng.randrange(args.iterations)
         gen_opt.zero_grad(set_to_none=True)
         loss, x0_hat, stats = run.generator_update(z, text, r)
-        grad_norm = torch.nn.utils.clip_grad_norm_(gen_params, 1.0)
+        grad_norm = clip(gen_params, args.grad_clip)
         if not math.isfinite(stats["loss"]):
             raise RuntimeError(f"step {step}: generator loss {stats['loss']}")
         gen_opt.step()
+        if ema is not None:
+            ema.update()
         gen_opt.zero_grad(set_to_none=True)
         fake_losses = []
         for k in range(args.fake_updates):
@@ -476,7 +546,7 @@ def main() -> None:
                 z1 = torch.randn_like(x1)
                 floss, _tau = run.fake_update(z1, text1, rng.randrange(args.iterations))
             fake_losses.append(float(floss.detach()))
-            torch.nn.utils.clip_grad_norm_(fake_params, 1.0)
+            clip(fake_params, args.grad_clip)
             fake_opt.step()
             fake_opt.zero_grad(set_to_none=True)
         record = {"step": step, "r": r, **stats, "grad_norm": float(grad_norm), "fake_loss": sum(fake_losses) / max(len(fake_losses), 1),

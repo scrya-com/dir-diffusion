@@ -759,9 +759,14 @@ def test_dir_layout_schedule():
 
 
 def test_dir_video_modulation_rewrite():
+    from lot_paths import MUSUBI_SRC
+
+    if MUSUBI_SRC not in sys.path:
+        sys.path.insert(0, MUSUBI_SRC)
     try:
         from musubi_tuner.minimax_h3.packing import build_h3_layout, build_timestep_rows
-    except ImportError:
+    except ImportError as error:
+        print(f"SKIPPED test_dir_video_modulation_rewrite: musubi_tuner not importable ({error})", flush=True)
         return
     from h3_musubi import audio_frames, audio_sigma, video_modulation_rewrite
 
