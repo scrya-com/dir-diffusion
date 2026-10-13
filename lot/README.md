@@ -163,3 +163,28 @@ This renders the trainer's held-out prompts as same-seed stills. `dense_lora` sh
 ### What the first run showed
 
 The first run was 2,000 steps on 777 isometric stills, shift 12 everywhere. Held-out loss went dense 0.520 → 0.297, all-2×2 0.270 → 0.194, mosaic 0.387 → 0.262. Most of the dense drop is style learning, since all the data shares one look. In renders, training removed the frozen model's streaks and grid texture, but the coarse regions came out soft (`assets/lot-h3-trained-*.png`). Shift 12 trains at σ > 0.9 for 57% of steps and below 0.3 for only 3.5%, which is where detail forms. Hence `--shift 3` for LoT steps (12.6% below 0.3, 25% above 0.9). Shift alone barely changed the renders; teacher distillation (`--distill 1`, runs 3 and 4) gave the first visible gains. Run history: [CHEATSHEET.md → Runs so far](CHEATSHEET.md#runs-so-far).
+
+## Experimental: DiR few-step generation (`dir_h3.py`)
+
+> **Experimental. Untested at scale, no trained weights exist yet.** The code compiles and the CPU tests pass; the GPU parity check, the trainer and the renderer have not been run end to end. Treat every number here as TODO until a run produces it.
+
+DiR ("data-space iteration", Lin et al., [arXiv 2610.12102](https://arxiv.org/abs/2610.12102)) replaces the noise-schedule walk with a few refinements of the clean estimate: `x̂0⁽⁰⁾ = 0`, `x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)` for `r = 0 .. R-1` (R = 4), with the same noise `z` every time and no renoising. `G` is the H3 DiT with three small additions: a new zero-initialised linear (`DirHead.x0_proj`) embeds the previous estimate and is summed into the video rows, an embedding of `r` is added to the video's timestep embedding, and the flow time is pinned to the noise end (`model_t_video = 0`, σ = 1). An untrained head therefore equals the one-step base prediction. Training is DMD: the frozen base is the real model, a second LoRA (conditioned on `r` through its own embedding) is the fake model, and the generator LoRA plus `DirHead` are the only generator parameters.
+
+**Layout schedule.** Each iteration can use its own LoT layout, e.g. `--schedule bands,bands,dense,dense`: coarse tokens early, dense late. The reason is specific to DiR. LoT sampling relies on eq. 9, which carries detail into a coarse region at low σ. DiR pins σ = 1, so that carry-over never happens, and a coarse region's detail has to come from the extent heads in the iterations that use it. Dense late iterations then have a chance to repair what the coarse ones got wrong. Whether this works is exactly what is untested; start with `dense,dense,dense,dense` as the control.
+
+```bash
+python3 lot/parity_dir_h3.py                              # GPU: forward_video == predict, untrained head == one-step base
+python3 lot/train_dir_h3.py --check --swap 0 ...          # one generator + one fake update per layout kind, writes nothing
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py ... --out lot/runs/dir_a
+python3 lot/render_dir_h3.py --run lot/runs/dir_a --prompts 3      # -> runs/render_dir/grid.png + meta.json
+python3 lot/render_dir_h3.py --untrained --prompts 1               # smoke only: zero head, no LoRA
+```
+
+`render_dir_h3.py` writes one row per held-out prompt: the dense 20-step baseline (generator LoRA off), then DiR after 1 .. R iterations, all from the same seed. `meta.json` has DiT milliseconds per sample and `delta[r] = mean |x̂0⁽ʳ⁾ − x̂0⁽ʳ⁻¹⁾|`, which shows whether the iteration converges. It reads `dir_head.pt`, `lora_gen.safetensors`, optional `adapter.pt` and `config.json` (`schedule`, `iters`, `rank`, `pairs`) from the run dir.
+
+| Measured | Number |
+|---|---|
+| Parity (`parity_dir_h3.py`) | TODO |
+| DiT ms per DiR sample vs dense 20 steps, 768×1152 still | TODO |
+| Held-out DMD loss, `delta[r]` per iteration | TODO |
+| Quality vs dense H3 | TODO |

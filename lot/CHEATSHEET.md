@@ -29,7 +29,7 @@ export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_in
 export LOT_H3_VAE=/path/to/minimax_h3_video_vae_fp16.safetensors
 hf download johndpope/MiniMax-H3-LoT --local-dir runs/lot_hf
 
-python3 lot/test_lot.py                                                   # 1. CPU tests -> ok 28
+python3 lot/test_lot.py                                                   # 1. CPU tests -> ok 32
 python3 lot/parity_h3.py                                                  # 2. GPU: LoT 1x1 == dense -> ok=1
 python3 lot/time_lot_h3.py --shape still --trained runs/lot_hf/run4_nikki_distill            # 3. timing
 python3 lot/time_lot_h3.py --shape clip  --trained runs/lot_hf/run4_nikki_distill            #    all resident, 21 GB
@@ -53,7 +53,7 @@ Both fit fully resident (peak 20.8 / 21.1 GB). With `--swap 4` the same clip onl
 ## 0. Does it work here?
 
 ```bash
-python3 lot/test_lot.py            # CPU, no weights -> "ok 28"
+python3 lot/test_lot.py            # CPU, no weights -> "ok 32"
 python3 lot/parity_h3.py           # GPU: LoT 1x1 == dense H3 -> rel_rms=0 ok=1
 ```
 
@@ -153,6 +153,29 @@ cp /tmp/lot/run4_nikki_distill/lora.safetensors    ComfyUI/models/loras/minimax_
 ```
 
 Inside ComfyUI, a 1×1 `dense` layout reproduces the stock forward exactly (relative error 0 with ComfyUI's bf16 head weights). `center` ran at 5.6 vs 4.1 it/s on a 768×1152 still (1.35×) and **3.45 vs 1.33 it/s on a 22-frame 512×768 clip (2.6×)**. The output is visibly softer than dense: **research weights, more training wanted** ([help-wanted discussion](https://github.com/scrya-com/lot-diffusion/discussions/1)).
+
+## Experimental: DiR few-step (no trained weights yet)
+
+DiR iterates the clean estimate (`x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)`, R = 4, same noise, σ pinned to 1) and trains with DMD ([arXiv 2610.12102](https://arxiv.org/abs/2610.12102)). **Untested at scale; every measured number below is TODO.** Details: [README → DiR](README.md#experimental-dir-few-step-generation-dir_h3py).
+
+```bash
+python3 lot/parity_dir_h3.py                                     # GPU, must pass first -> ok=1
+python3 lot/train_dir_h3.py --check ...                          # no flag needed, writes nothing
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py ... --out lot/runs/dir_a
+python3 lot/render_dir_h3.py --run lot/runs/dir_a --prompts 3    # dense20 | dir r=1..4 -> runs/render_dir/
+python3 lot/render_dir_h3.py --untrained --prompts 1             # smoke: zero head, no LoRA
+```
+
+| `render_dir_h3.py` flag | Default | What it does |
+|---|---|---|
+| `--run DIR` / `--untrained` | required, one of | Trained run dir (`dir_head.pt`, `lora_gen.safetensors`, `adapter.pt`, `config.json`), or a fresh zero head. |
+| `--iters R` | config, else 4 | Iterations rendered (one column each). |
+| `--schedule` | config, else `dense` | Layout per iteration, e.g. `bands,bands,dense,dense`: coarse early, dense late. Needs the run's `adapter.pt`. |
+| `--steps` | 20 | Dense baseline steps (generator LoRA off). |
+| `--prompts` / `--pick` / `--holdout` / `--prompt-cache` | 3 / none / 24 / `cache_iso3d` | Held-out prompts, as in `render_h3.py`. |
+| `--swap` | 0 | Blocks streamed from CPU. |
+
+`meta.json` has DiT ms per sample and `delta[r] = mean |x̂0⁽ʳ⁾ − x̂0⁽ʳ⁻¹⁾|` per prompt.
 
 ## Flags that matter
 

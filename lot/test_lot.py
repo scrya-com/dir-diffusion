@@ -43,6 +43,7 @@ from h3 import (  # noqa: E402
     H3_PATCH,
     H3_TOKEN_DIM,
     gate_frame_layout,
+    grid_layout,
     make_h3_adapter,
     over_wan_frame_budget,
     patchify,
@@ -707,6 +708,102 @@ def test_layout_sources():
     assert to_latent_frames(torch.rand(5, 3, 3), 2).shape == (2, 3, 3)
 
 
+def test_dir_pool_rows_and_head():
+    from dir_h3 import DirHead, estimate_extra, pool_rows
+
+    rows = torch.arange(1 * 8 * 6 * 3, dtype=torch.float32).reshape(1, 48, 3)
+    dense = dense_layout(1, 8, 6)
+    assert pool_rows(rows, dense) is rows            # dense raster layout: identity
+    # a 2x2 rect averages its four dense tokens; rect order follows layout.rects
+    rects = [TokenRect(0, 0, 0, 1, 2, 2)] + [TokenRect(0, u, v, 1, 1, 1)
+                                              for u in range(8) for v in range(6) if not (u < 2 and v < 2)]
+    layout = layout_from_rects(1, 8, 6, rects)
+    pooled = pool_rows(rows, layout)
+    assert pooled.shape == (1, layout.count, 3)
+    grid = rows.reshape(1, 8, 6, 3)
+    assert torch.allclose(pooled[0, 0], grid[0, :2, :2].reshape(4, 3).mean(0))
+    assert torch.equal(pooled[0, 1], grid[0, 0, 2])  # next rect is the 1x1 at (0, 2)
+    assert torch.equal(pooled[0, -1], grid[0, 7, 5])
+    # bands layout: every rect equals the mean of the dense tokens it covers
+    bands = grid_layout("bands", 1, 12, 8)
+    dense_rows = torch.randn(1, 96, 5)
+    out = pool_rows(dense_rows, bands)
+    for index in (0, bands.count // 2, bands.count - 1):
+        rect = bands.rects[index]
+        want = torch.stack([dense_rows[0, rect.u * 8 + rect.v + du * 8 + dv]
+                            for du in range(rect.eh) for dv in range(rect.ew)]).mean(0)
+        assert torch.allclose(out[0, index], want, atol=1e-6)
+    # untrained head: the new projection and r-embedding are exactly zero
+    head = DirHead(hidden=16, temb_dim=8, iterations=4)
+    estimate = torch.randn(1, 24, 1, 16, 12)
+    assert float(estimate_extra(head, estimate, None).abs().max()) == 0.0
+    coarse = grid_layout("uniform4", 1, 8, 6)
+    assert estimate_extra(head, estimate, coarse).shape == (1, coarse.count, 16)
+    assert head.r_embed.shape == (4, 8) and float(head.r_embed.abs().max()) == 0.0
+
+
+def test_dir_layout_schedule():
+    from dir_h3 import parse_layout_schedule
+
+    plan = parse_layout_schedule("bands,bands,dense,dense", 4, 12, 8, 1)
+    assert plan[2] is None and plan[3] is None
+    assert plan[0] is plan[1] and plan[0].count < plan[0].dense_count == 96
+    assert parse_layout_schedule("dense", 4, 12, 8, 1) == [None] * 4      # one name repeats
+    assert all(entry is not None for entry in parse_layout_schedule("center", 3, 12, 8, 2))
+    for bad in ("dense,dense", "bands,nope,dense,dense"):
+        try:
+            parse_layout_schedule(bad, 4, 12, 8, 1)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+
+
+def test_dir_video_modulation_rewrite():
+    try:
+        from musubi_tuner.minimax_h3.packing import build_h3_layout, build_timestep_rows
+    except ImportError:
+        return
+    from h3_musubi import audio_frames, audio_sigma, video_modulation_rewrite
+
+    layout = build_h3_layout(task="t2va", text_length=4, target_video=(1, 8, 8),
+                             target_audio_frames=audio_frames(1), one_frame=True)
+    tags = torch.ones(1, 4, dtype=torch.int64)
+    for t_video in (0.0, 0.6):                       # t = 0: audio shares the video's timestep row
+        rows = build_timestep_rows(layout, text_token_tags=tags, model_t_video=t_video,
+                                   model_t_audio=1.0 - float(audio_sigma(1.0 - t_video)))
+        video = layout.target_video_segment.row_slice
+        original = rows.block_adaln_indices[0]
+        new = len(rows.unique_timesteps)
+        indices, segments = video_modulation_rewrite(original, video, new)
+        outside = torch.ones_like(indices, dtype=torch.bool)
+        outside[video] = False
+        assert torch.equal(indices[outside], original[outside])          # text and audio untouched
+        assert bool((indices[video] == 3 * new).all())                   # video: new row, tag 0
+        assert segments[-1] == (video.start, video.stop, 3 * new)
+        assert segments[0][0] == 0 and segments[-1][1] == layout.row_count
+        assert all(a[1] == b[0] for a, b in zip(segments, segments[1:]))
+        assert int(original[video][0]) == 3 * rows.video_timestep_index
+
+
+def test_dir_use_networks_restores():
+    from dir_h3 import use_networks
+
+    class Module:
+        enabled = True
+
+    class Net:
+        def __init__(self):
+            self.unet_loras = [Module(), Module()]
+
+    gen, fake = Net(), Net()
+    with use_networks(gen, fake, gen=False, fake=True):
+        assert not gen.unet_loras[0].enabled and fake.unet_loras[1].enabled
+        with use_networks(gen, None, gen=True, fake=False):
+            assert gen.unet_loras[1].enabled
+        assert not gen.unet_loras[1].enabled
+    assert all(m.enabled for m in gen.unet_loras + fake.unet_loras)
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -737,6 +834,10 @@ def main():
         test_torch_eq9_matches_lakonlab,
         test_grid_layouts_any_shape,
         test_layout_sources,
+        test_dir_pool_rows_and_head,
+        test_dir_layout_schedule,
+        test_dir_video_modulation_rewrite,
+        test_dir_use_networks_restores,
     ]
     for test in tests:
         test()

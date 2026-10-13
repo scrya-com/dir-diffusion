@@ -184,8 +184,59 @@ def predict(dit, latent: torch.Tensor, t, text: torch.Tensor, *, lot=None,
     return _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video, 1.0 - sigma_a)
 
 
-def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_audio: float) -> torch.Tensor:
-    """``MiniMaxH3Model.forward`` for a T2VA layout, with the target video on ``lot.layout``."""
+def video_modulation_rewrite(block_adaln_indices: torch.Tensor, video_slice: slice, new_timestep_index: int):
+    """Give the target-video rows their own timestep row, leaving every other row's modulation alone.
+
+    ``block_adaln_indices`` is the 1-D per-row ``3 * timestep_index + token_tag`` of
+    ``build_timestep_rows``. Video rows carry tag 0, so they move to
+    ``3 * new_timestep_index``. Text rows (tags 0/1) and audio rows (tag 2) may share
+    the video's old timestep index and keep it. Returns the new indices and the
+    ``(start, stop, index)`` segments the blocks take. Pure: no model, no GPU.
+    """
+    from musubi_tuner.minimax_h3.packing import _build_modulation_segments
+
+    indices = block_adaln_indices.clone()
+    indices[video_slice] = 3 * int(new_timestep_index)
+    return indices, _build_modulation_segments(indices)
+
+
+def forward_video(dit, latent: torch.Tensor, t, text: torch.Tensor, *, lot=None,
+                  video_extra: torch.Tensor | None = None, video_temb_delta: torch.Tensor | None = None,
+                  audio_generator: torch.Generator | None = None) -> torch.Tensor:
+    """``predict`` that always runs the hand-written forward, so the hooks are available.
+
+    Same inputs and output as ``predict``; ``video_extra`` and ``video_temb_delta`` are
+    described on ``_lot_forward``. With neither, and ``lot=None``, it matches the dense
+    ``dit(...)`` call (``parity_dir_h3.py`` checks that on the GPU).
+    """
+    if latent.ndim != 5 or latent.shape[0] != 1:
+        raise ValueError(f"latent must be (1, 24, T, H, W), got {tuple(latent.shape)}")
+    if text.ndim == 2:
+        text = text.unsqueeze(0)
+    _sync_swap(dit)
+    t_video = float(torch.as_tensor(t).reshape(-1)[0])
+    sigma_a = float(audio_sigma(1.0 - t_video))
+    _b, _c, latent_t, lat_h, lat_w = latent.shape
+    layout = _layout(text.shape[1], latent_t, lat_h, lat_w)
+    device = dit.video_patch_proj.weight.device
+    audio = _silence(latent_t, sigma_a, device, audio_generator)
+    tags = torch.ones(1, text.shape[1], dtype=torch.int64)
+    return _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video, 1.0 - sigma_a,
+                        video_extra=video_extra, video_temb_delta=video_temb_delta)
+
+
+def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_audio: float, *,
+                 video_extra: torch.Tensor | None = None,
+                 video_temb_delta: torch.Tensor | None = None) -> torch.Tensor:
+    """``MiniMaxH3Model.forward`` for a T2VA layout, with the target video on ``lot.layout``.
+
+    ``lot=None`` is the dense forward written out (``video_patch_proj`` in,
+    ``video_out`` out). Two optional hooks serve data-space iteration (``dir_h3``):
+    ``video_extra`` ``(1, count, hidden)`` is added to the embedded target-video rows,
+    and ``video_temb_delta`` ``(temb_dim,)`` is added to the video's timestep
+    embedding as a NEW row, used only by the target-video rows and the final layer's
+    video head. Text and audio keep the original row.
+    """
     from musubi_tuner.minimax_h3.packing import (
         H3RowSegment,
         build_position_grid,
@@ -205,22 +256,45 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
     latent_t, lat_h, lat_w = latent.shape[2:]
 
     # 1. Target video: extent heads instead of video_patch_proj.
-    tokens = lot.video_tokens(pack_video_rows(latent.to(device, torch.float32))[0], latent_t, lat_h, lat_w)
-    video = lot.embed_rows(tokens).to(dit.dtype).unsqueeze(0)
+    dense_rows = torch.cat([pack_video_rows(latent.to(device, torch.float32))], dim=1)
+    if lot is None:
+        tokens = dense_rows
+        video = dit.video_patch_proj(dense_rows).to(dit.dtype)
+    else:
+        tokens = lot.video_tokens(dense_rows[0], latent_t, lat_h, lat_w)
+        video = lot.embed_rows(tokens).to(dit.dtype).unsqueeze(0)
     count = video.shape[1]
+    if video_extra is not None:
+        if tuple(video_extra.shape) != tuple(video.shape):
+            raise ValueError(f"video_extra {tuple(video_extra.shape)} != video rows {tuple(video.shape)}")
+        video = video + video_extra.to(device=video.device, dtype=video.dtype)
     segments = layout.segments[:-1] + (H3RowSegment(video_segment.role, video_segment.kind,
                                                     video_segment.start, video_segment.start + count),)
     lot_layout = replace(layout, segments=segments, row_count=video_segment.start + count)
 
-    audio_rows = dit.audio_patch_proj(pack_audio_rows(audio.to(device)).to(torch.float32)).to(dit.dtype)
+    # cat() of one tensor is a contiguous copy, as in the stock forward: fp32 matmul picks a
+    # kernel by layout, and a different kernel flips bf16 roundings the deep stack amplifies.
+    audio_in = torch.cat([pack_audio_rows(audio.to(device))], dim=1).to(torch.float32)
+    audio_rows = dit.audio_patch_proj(audio_in).to(dit.dtype)
     text_rows = dit.token_refiner(dit.condition_proj(text.to(device, dit.dtype)))
     hidden = torch.cat([text_rows, audio_rows, video], dim=1)
 
     # 2. Rotary positions: the dense grid with the video tail replaced by rectangle centres.
-    positions = lot.replace_video_positions(build_position_grid(layout)[0], latent_t, lat_h, lat_w)
+    positions = build_position_grid(layout)[0]
+    if lot is not None:
+        positions = lot.replace_video_positions(positions, latent_t, lat_h, lat_w)
     rotation = dit._rotation_table(positions.unsqueeze(0).to(device), hidden.dtype)
     rows = build_timestep_rows(lot_layout, text_token_tags=tags, model_t_video=t_video, model_t_audio=t_audio)
     temb = dit._timestep_embeddings(rows.unique_timesteps, device)
+    block_segments = rows.block_segments
+    video_index = rows.video_timestep_index
+    if video_temb_delta is not None:
+        new_index = temb.shape[0]
+        extra_row = temb[video_index].float() + video_temb_delta.to(device=temb.device, dtype=torch.float32)
+        temb = torch.cat([temb, extra_row.to(temb.dtype).unsqueeze(0)], dim=0)
+        _indices, block_segments = video_modulation_rewrite(
+            rows.block_adaln_indices[0], lot_layout.target_video_segment.row_slice, new_index)
+        video_index = new_index
 
     for index, block in enumerate(dit.blocks):
         if dit.blocks_to_swap:
@@ -229,10 +303,10 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
             forward = block
             if dit.activation_cpu_offloading:
                 forward = create_cpu_offloading_wrapper(forward, device)
-            hidden = torch.utils.checkpoint.checkpoint(forward, hidden, temb, rows.block_segments, rotation,
+            hidden = torch.utils.checkpoint.checkpoint(forward, hidden, temb, block_segments, rotation,
                                                        use_reentrant=False)
         else:
-            hidden = block(hidden, temb, rows.block_segments, rotation)
+            hidden = block(hidden, temb, block_segments, rotation)
         if dit.blocks_to_swap:
             dit.offloader.submit_move_blocks_forward(dit.blocks, index)
     hidden = hidden.to(device)
@@ -244,10 +318,14 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
     audio_states = final.norm(hidden[:, layout.target_audio_segment.row_slice])
     audio_states = audio_states * (1.0 + scale[audio_index]) + shift[audio_index]
     audio_out = final.audio_out(audio_states.to(torch.float32))
-    modulated = lot.modulate(final, hidden[0, lot_layout.target_video_segment.row_slice], temb,
-                             rows.video_timestep_index)
-    velocity = lot.project_rows(modulated, tokens, max(0.0, min(1.0, 1.0 - t_video)))
-    video_out, _audio = unpack_targets(layout, velocity.unsqueeze(0).to(torch.float32), audio_out)
+    if lot is None:
+        video_states = final.norm(hidden[:, lot_layout.target_video_segment.row_slice])
+        video_states = video_states * (1.0 + scale[video_index]) + shift[video_index]
+        velocity = final.video_out(video_states.to(torch.float32))
+    else:
+        modulated = lot.modulate(final, hidden[0, lot_layout.target_video_segment.row_slice], temb, video_index)
+        velocity = lot.project_rows(modulated, tokens, max(0.0, min(1.0, 1.0 - t_video))).unsqueeze(0)
+    video_out, _audio = unpack_targets(layout, velocity.to(torch.float32), audio_out)
     return video_out.to(latent.dtype)
 
 
