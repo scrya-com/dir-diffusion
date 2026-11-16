@@ -881,6 +881,17 @@ def test_dir_sigma_schedule_is_euler():
             ratio = (sigmas + [0.0])[r + 1] / sigma
             x = ratio * x + (1.0 - ratio) * x0
         assert float((iterated[3] - pinned[3]).abs().max()) > 1e-3     # the schedule changes the result
+        # --mix-state: iteration r sees sigma_r * z + (1 - sigma_r) * x0_hat[r] at flow time sigma_r
+        _, mixed = dir_sample(dit, head, text, height=64, width=96, seed=3, sigmas=sigmas, mix_state=True, device="cpu")
+        estimate = torch.zeros_like(z)
+        for r, sigma in enumerate(sigmas):
+            x = sigma * z + (1.0 - sigma) * estimate
+            out = forward_video(dit, x, 1.0 - sigma, text, audio_generator=torch.Generator("cpu").manual_seed(4)).float()
+            estimate = x + sigma * out
+            assert float((mixed[r] - estimate).abs().max()) < 1e-4, r
+        assert float((mixed[0] - iterated[0]).abs().max()) < 1e-6 and float((mixed[3] - iterated[3]).abs().max()) > 1e-4
+        _, pinned_mix = dir_sample(dit, head, text, height=64, width=96, seed=3, mix_state=True, device="cpu")
+        assert float((pinned_mix[3] - pinned[3]).abs().max()) < 1e-6    # all-ones sigmas: the state is z either way
     for bad in ("0.5,0.4,0.3,0.2", "1,0.5", "1,0.5,0.7,0.2"):
         try:
             parse_sigmas(bad, 4)

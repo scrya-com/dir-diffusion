@@ -115,6 +115,7 @@ class Run:
         self.args, self.device = args, device
         self.iterations = args.iterations
         self.sigmas = parse_sigmas(args.sigmas, args.iterations)
+        self.mix_state = bool(getattr(args, "mix_state", False))
         self.loss_scale = 1.0       # 1 / --accum while accumulating; backward() scales by it
         self._schedules: dict = {}
         # Priming references draw from their own stream so the global torch RNG (z, tau, eps) is
@@ -151,7 +152,7 @@ class Run:
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             for k in range(r):
                 estimate = self.one_step(state, estimate, k, text, schedule, audio_seed)
-                state = next_state(state, estimate, self.sigmas[k], self.sigmas[k + 1])
+                state = next_state(state, estimate, self.sigmas[k], self.sigmas[k + 1], z if self.mix_state else None)
         return state, estimate
 
     def draw_tau(self) -> float:
@@ -489,6 +490,10 @@ def main() -> None:
     parser.add_argument("--sigmas", default="1",
                         help="flow sigma per iteration: 1 (the paper: pinned), grid[:SHIFT] (H3's Euler grid, shift 12; any "
                              "init), turbo[:SHIFT] (shift 6, with a Turbo --init), or R comma values; see dir_h3")
+    parser.add_argument("--mix-state", action="store_true",
+                        help="with --sigmas below 1: iteration r sees sigma_r * z + (1 - sigma_r) * x0_hat[r] (the "
+                             "estimate re-noised with the same z) instead of the Euler state; see dir_h3.next_state. "
+                             "Not in the paper")
     init = parser.add_mutually_exclusive_group()
     init.add_argument("--paper-init", dest="paper_init", action="store_true", default=True,
                       help="(default) the paper's init of the added params: Xavier x0_proj (no bias), r_embed and "
@@ -654,7 +659,7 @@ def main() -> None:
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
           f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
-          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} fake_warmup={args.fake_warmup} dmd_draws={args.dmd_draws} sigmas={args.sigmas} paper_init={int(args.paper_init)} r_schedule={args.r_schedule} head_lr={args.head_lr or args.lr} "
+          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} fake_warmup={args.fake_warmup} dmd_draws={args.dmd_draws} sigmas={args.sigmas} mix_state={int(args.mix_state)} paper_init={int(args.paper_init)} r_schedule={args.r_schedule} head_lr={args.head_lr or args.lr} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
@@ -670,7 +675,7 @@ def main() -> None:
             "train_adapter": args.train_adapter, "tau_shift": str(args.tau_shift),
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
-            "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas,
+            "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas, "mix_state": run.mix_state,
             "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr,
             "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
             "swap": args.swap, "gpu": torch.cuda.get_device_name(device)}
@@ -705,7 +710,7 @@ def main() -> None:
                 with use_networks(gen_net, fake_net, gen=True, fake=False):
                     new = run.one_step(state, estimate, r, text, schedule, 7 * index)
                 if r + 1 < args.iterations:
-                    state = next_state(state, new, run.sigmas[r], run.sigmas[r + 1])
+                    state = next_state(state, new, run.sigmas[r], run.sigmas[r + 1], z if run.mix_state else None)
                 change[r].append(float((new - estimate).pow(2).mean().sqrt()))
                 for tau in taus:
                     x_tau = (1.0 - tau) * new + tau * eps
@@ -734,8 +739,9 @@ def main() -> None:
     def anchors() -> None:
         """Reference rows for ``hat_real``: the same held-out items, noise and metric as ``evaluate``, for
         the base model's own Euler sampler (1, R and 20 steps from the same ``z``) and the real latents.
-        Measured once (2026-11-16, run 1's cache, tau 0.6): a real latent scores about 0.25 and base Euler
-        at 4 and at 20 steps about 0.16-0.17, so the metric is closeness to the teacher's mean, not realism."""
+        Measured once (2026-11-16, run 1's cache, 8 items, tau 0.6): a real latent scores 0.23, base Euler
+        0.37 / 0.15 / 0.155 at 1 / 4 / 20 steps (std about 0.03 across items; the soft 4-step sample scores as
+        well as the sharp 20-step one). The metric is closeness to the teacher's mean, not realism."""
         from h3_musubi import predict, sigma_schedule
 
         taus = [float(t) for t in args.eval_taus]

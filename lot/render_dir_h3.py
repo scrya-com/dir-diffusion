@@ -95,6 +95,8 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=None, help="R (default: config.json iters, else 4)")
     parser.add_argument("--schedule", default=None,
                         help="layout per iteration, e.g. bands,bands,dense,dense (default: config.json, else dense)")
+    parser.add_argument("--mix-state", action="store_true", default=None,
+                        help="same-z re-noised state (dir_h3.next_state); default: the run's config.json mix_state")
     parser.add_argument("--sigmas", default=None,
                         help="flow sigma per iteration: 1, grid[:SHIFT], turbo[:SHIFT] or a comma list (default: config.json sigmas, else 1)")
     parser.add_argument("--dense-from", type=Path, default=None,
@@ -133,6 +135,8 @@ def main() -> None:
     # a run's sigmas cover its trained R; rendering fewer iterations uses the first ones
     sigmas = parse_sigmas(args.sigmas or config.get("sigmas") or "1",
                           trained_iters if args.run is not None else iters)[:iters]
+
+    mix_state = bool(config.get("mix_state", False)) if args.mix_state is None else bool(args.mix_state)
 
     if args.run is not None and any(n.strip() != "dense" for n in spec.split(",")) \
             and not ((args.run / "adapter.pt").is_file() or (args.run / "adapter.safetensors").is_file()):
@@ -193,7 +197,8 @@ def main() -> None:
         start = time.perf_counter()
         with torch.inference_mode(), use_networks(network, None, gen=True, fake=False):
             _final, estimates = dir_sample(model, head, embeds, height=HEIGHT, width=WIDTH, iters=iters,
-                                           seed=seed, schedule=schedule, adapter=adapter, sigmas=sigmas)
+                                           seed=seed, schedule=schedule, adapter=adapter, sigmas=sigmas,
+                                           mix_state=mix_state)
         torch.cuda.synchronize()
         dir_ms.append(1000 * (time.perf_counter() - start))
         previous = torch.zeros_like(estimates[0])
@@ -235,7 +240,7 @@ def main() -> None:
     grid(rows, labels).save(args.out / "grid.png")
     meta = {
         "run": None if args.run is None else str(args.run), "untrained": bool(args.untrained), "ema": bool(args.ema),
-        "iters": iters, "schedule": spec, "sigmas": sigmas, "swap": args.swap, "gpu": gpu_name,
+        "iters": iters, "schedule": spec, "sigmas": sigmas, "mix_state": mix_state, "swap": args.swap, "gpu": gpu_name,
         "tag": args.tag, "rank": lora_rank,
         "dense_from": None if args.dense_from is None else str(args.dense_from), "steps": args.steps, "seed": args.seed, "canvas": f"{WIDTH}x{HEIGHT}",
         "prompts": [text for text, _ in prompts],
