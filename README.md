@@ -7,7 +7,7 @@ Few-step generation by data-space iteration (DiR) with DMD distillation for the 
 **Getting started: [`DIR_CHEATSHEET.md`](DIR_CHEATSHEET.md)** covers preparing samples, caching latents and prompts, training, rendering and streaming. Explainer: [scrya.com/dir_diffusion](https://scrya.com/dir_diffusion).
 
 > [!WARNING]
-> **Experimental.** The paper's form (σ pinned to 1) trains on H3 but its generators ignore the estimate they are fed, so iterations 2–4 do not refine. A variant that is not in the paper (`--sigmas grid:6 --mix-state`) does refine: after 200 steps from base H3, 4 iterations give sharp images where base H3 at 4 steps is blurred, at 4–5× less DiT time than 20 steps. That is one short run on one single-style dataset, judged by eye on 8 held-out prompts. No weights are published. See [Results](#results-2026-11-17-what-works-on-h3-and-what-it-costs).
+> **Experimental.** The paper's form (σ pinned to 1) trains on H3 but its generators ignore the estimate they are fed, so iterations 2–4 do not refine. A variant that is not in the paper (`--sigmas grid:6 --mix-state`) does refine: after 200 steps from base H3, 4 iterations give sharp images where base H3 at 4 steps is blurred, at 4–5× less DiT time than 20 steps. That is one short run on one single-style dataset, judged by eye on 8 held-out prompts. Trained on clip-shaped noise, the same recipe gives moving clips at step 50 (three prompts checked). No weights are published. See [Results](#results-2026-11-17-what-works-on-h3-and-what-it-costs).
 
 Dense H3 walks a 20-step noise schedule. DiR replaces the walk with a few refinements of the clean estimate: `x̂0⁽⁰⁾ = 0`, then `x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)` for `r = 0 .. R−1` (R = 4). The same noise `z` is used at every iteration, there is no renoising and no sigma schedule. `G` is H3 at the noise end with three small additions:
 
@@ -46,7 +46,7 @@ Columns: 20 steps, base 4 steps, then iteration 4 at steps 100, 200 and 300.
 
 What this does not show: the run changes three things at once (`--mix-state`, the fake warm-up, 4 DMD draws) and there is no base-start arm without `--mix-state`; there is no FID, one seed per prompt, and one training style. The same recipe started from the Turbo LoRA refined but did not beat Turbo's own 4-step sampler at step 100, and drifted in content on two prompts.
 
-### Video (untrained for it)
+### Video, part 1: the stills generator on a clip (no video training)
 
 The run above saw stills only. As a first look, the step-200 generator was run unchanged on a 12-frame latent at 768×512 (39 frames, 1.6 s at 24 fps), whole clip at once, three held-out prompts, RTX 5090 with no block swap:
 
@@ -65,7 +65,42 @@ Rows are the first, middle and last frame; columns are 20 steps, base 4 steps, D
 - **The white-background collapse returns** on one of the three prompts (the second clip).
 - **Not the streaming path.** `stream_dir_h3.py` and its trainer do not take `--sigmas` or `--mix-state` yet, and the streaming videos in `assets/` are from the pinned-σ run 1.
 
-A usable video result needs training on clips with this recipe; this only shows the stills generator transfers without breaking.
+This only shows the stills generator transfers without breaking. Part 2 trains on clip shapes.
+
+### Video, part 2: training on clip-shaped noise (`--frames 12`), step 50
+
+Why the stills generator stays still: shown one of its own still clips, base H3 keeps it still at noise levels 0.3, 0.6 and 0.8 and only restores motion at 0.95 (clip-start change 0.03 against 0.11 to 0.13). Motion is decided at very high noise, so a generator that never saw clip shapes has nothing pulling it there.
+
+The trainer never reads a clean latent, only the prompt and the shape. `--frames 12` therefore trains the same recipe on 12-latent-frame noise (H3's chunk layout, 39 pixel frames) and the DMD target becomes H3's distribution over clips. No video data was used: the prompts are the same isometric stills captions. One run, fresh from base H3, stopped at step 50 to free the card:
+
+![20 steps, base 4 steps, DiR iteration 4](assets/dir-clip-step50-p0.gif)
+
+Left to right: base H3 at 20 steps, base H3 at 4 Euler steps, DiR iteration 4 at step 50. Same noise. All six columns: [clip 0](assets/dir-clip-step50-p0.mp4), [clip 1](assets/dir-clip-step50-p1.mp4).
+
+![first, middle and last frame; 20 steps, base 4 steps, DiR r=1..4](assets/dir-clip-step50-p0-sheet.jpg)
+
+![second prompt](assets/dir-clip-step50-p1.gif)
+
+| | H3 20 steps | H3 4 steps | DiR r=4, step 50 |
+|---|---|---|---|
+| Clip 0: mean pixel change per frame / first to last frame | 10.4 / 65.6 | 3.9 / 30.8 | 7.6 / 54.2 |
+| Clip 1 | 1.1 / 3.2 | 1.0 / 2.7 | 4.4 / 31.8 |
+| Clip 2 | 5.8 / 40.1 | 3.0 / 21.1 | 6.0 / 43.4 |
+| Largest single-frame change over the mean (clip 0) | 1.5× | 1.4× | 1.5× |
+
+- **It moves.** Clip 0 has the same camera push as the 20-step clip. Frame-to-frame change is in the teacher's range on two clips, and there is no single-frame jump larger than the teacher's.
+- **It is sharp.** Iteration 4 is clean on all three prompts; base H3 at 4 steps is soft and garbles the people.
+- **Clip 1 moves more than the teacher** (4.4 against 1.1 per frame). Whether that is good motion or drift has not been judged.
+- **Iteration 1 is no longer a picture.** It is a brown blur and iterations 2 to 4 build the clip. In the stills run iteration 1 was a recognisable image.
+- **Held-out motion score** (mean change between VAE clip-start frames, 8 prompts): 0.39 at iteration 4 against 0.23 for H3 at 20 steps and 0.09 at 4 steps. It ranges from 0.03 to 0.62 across prompts for the teacher, so read it as "moving or not", nothing finer.
+- **Cost:** 64 s per training step and 28.2 GB peak on the RTX 5090 at swap 4, at 12 × 32 × 48 latents (512×768).
+
+What this is not: 50 steps, three prompts looked at, frame sheets and pixel statistics only. Nobody has yet watched the clips for flicker or identity drift, there is no later checkpoint, and the stills run was unstable between checkpoints.
+
+### Next: eDMD rules and real clips (added, not yet evaluated)
+
+- `--tau-floor sigma` and `--fake-source final`, after eDMD ([arXiv 2611.17194](https://arxiv.org/abs/2611.17194), an image-only paper): iterations before the last are trained only at noise levels at or above the one their estimate is re-noised to, and the fake model is trained on the final output only. The link to motion is our inference from the 0.95 test above, not the paper's claim. Their calibrated noise levels, precise-teacher walk and teacher guidance are not ported. A run with both flags is in progress; no result yet.
+- `lot/build_clip_cache_h3.py` turns existing clip latents (`z.pt` plus a `meta.json` prompt) into a training cache without re-encoding. With a clip cache, `--frames` cuts real windows aligned to VAE clip starts, the eval scores real clips, and `--priming-weight` has real motion to use. Built once (1,377 clips, 894 prompts); not trained on yet.
 
 ### Speed and memory
 
@@ -159,6 +194,7 @@ Building a cache from your own clips, and every path variable, are covered in [`
 | [`lot/render_dir_h3.py`](lot/render_dir_h3.py) | Dense 20-step vs DiR after 1..R iterations on held-out prompts, VAE decode, grid and timings |
 | [`lot/parity_dir_h3.py`](lot/parity_dir_h3.py) | GPU parity for the DiR forward |
 | [`lot/probe_dir_h3.py`](lot/probe_dir_h3.py) | Does a generator refine, and does it read its estimate: rollout and controlled-feed distances on held-out prompts, picture grid |
+| [`lot/build_clip_cache_h3.py`](lot/build_clip_cache_h3.py) | A training cache from clip latents that already exist (`z.pt` + `meta.json` prompt), text-encoded once per distinct prompt |
 | [`lot/bench_dir_h3.py`](lot/bench_dir_h3.py) | Time and peak memory of DiR sampling against the dense sampler, per canvas |
 | [`lot/stream_dir_h3.py`](lot/stream_dir_h3.py) | Streaming DiR: sliding 5n+2 window, per-frame `r`, FL2VA first-frame hand-off, coarse memory keyframes |
 | [`lot/train_stream_dir_h3.py`](lot/train_stream_dir_h3.py) / [`lot/render_stream_h3.py`](lot/render_stream_h3.py) / [`lot/parity_stream_h3.py`](lot/parity_stream_h3.py) | Streaming DMD trainer, mp4 renderer, GPU parity and timing |

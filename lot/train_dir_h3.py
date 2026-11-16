@@ -155,7 +155,25 @@ class Run:
                 state = next_state(state, estimate, self.sigmas[k], self.sigmas[k + 1], z if self.mix_state else None)
         return state, estimate
 
-    def draw_tau(self) -> float:
+    def fake_index(self, r: int) -> int:
+        """The fake model's iteration embedding for a read at iteration ``r``. ``--fake-source final``: the fake
+        model is trained on final outputs only (eDMD's endpoint critic, arXiv 2611.17194), so every read uses
+        the last index and intermediate estimates are judged against the delivered distribution."""
+        return len(self.sigmas) - 1 if getattr(self.args, "fake_source", "iteration") == "final" else r
+
+    def draw_tau(self, r: int | None = None) -> float:
+        """A DMD noise level. ``--tau-floor sigma``: iteration ``r`` before the last is only ever consumed
+        re-noised at ``sigmas[r + 1]``, so its estimate is queried (and its fake model trained) at
+        ``tau >= sigmas[r + 1]`` only, the base distribution squeezed into ``[sigmas[r + 1], 1)``. The last
+        iteration keeps the whole range. After eDMD (arXiv 2611.17194, eq. 11-12: step k queried at
+        ``tau >= sigma_{k+1}``); without it every intermediate estimate is asked to be a finished sample."""
+        tau = self._base_tau()
+        if r is not None and getattr(self.args, "tau_floor", "none") == "sigma" and r + 1 < len(self.sigmas):
+            floor = float(self.sigmas[r + 1])
+            tau = min(floor + (1.0 - floor) * tau, TAU_MAX)
+        return tau
+
+    def _base_tau(self) -> float:
         dist = self.args.tau_shift
         if isinstance(dist, str) and dist.startswith("beta:"):
             # The paper's importance sampling (Table 4, Algorithm 1): tau ~ Beta(a, 1), density a tau^(a-1).
@@ -225,13 +243,14 @@ class Run:
     @torch.no_grad()
     def dmd_direction(self, x0_hat, r, text, seed):
         """One (tau, eps) draw: ``(grad, tau, weight, gap, mean|fake - real|)`` for a detached ``x0_hat``."""
-        tau = self.draw_tau()
+        tau = self.draw_tau(r)
         eps = torch.randn_like(x0_hat)
         x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
             x0_real = real_x0(self.dit, x_tau, tau, text, audio_generator=self.audio(seed + 99))
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
-            x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, r, text, audio_generator=self.audio(seed + 99))
+            x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, self.fake_index(r), text,
+                              audio_generator=self.audio(seed + 99))
         gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
         if self.args.dmd_weight == "paper":
             # Paper eq. 10 / Algorithm 1: L = E w(tau) sg[v_real - v_fake]^T x0_hat, so
@@ -279,13 +298,16 @@ class Run:
     # ------------------------------------------------------------------------ fake update
     def fake_update(self, z, text, r, x0_hat=None, *, backward=True):
         """One fake-model flow-regression step on a detached generator sample. Returns ``(loss, tau)``."""
+        final = getattr(self.args, "fake_source", "iteration") == "final"
+        if final and r != len(self.sigmas) - 1:
+            r, x0_hat = len(self.sigmas) - 1, None       # train on the delivered sample, whatever r was drawn
         if x0_hat is None:
             schedule = self.schedule(z)
             seed = int(torch.randint(0, 2**31 - 1, (1,)))
             with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
                 state, prev = self.rollout(z, r, text, schedule, seed)
                 x0_hat = self.one_step(state, prev, r, text, schedule, seed)
-        tau = self.draw_tau()
+        tau = self.draw_tau(None if final else r)      # the endpoint critic covers every noise level
         eps = torch.randn_like(z)
         x_tau = (1.0 - tau) * x0_hat + tau * eps
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=True), torch.enable_grad():
@@ -352,13 +374,47 @@ def rel(a: torch.Tensor, b: torch.Tensor) -> float:
 
 # ------------------------------------------------------------------------------- check
 
+FRAMES = 1        # --frames: latent frames of every training sample (1 = a still)
+EVAL_FRAMES = 1   # --eval-frames: latent frames of the held-out eval and anchors
+
+
+def load_item(item, rng, device, frames: int | None = None):
+    """``train_h3.load_item``, with the latent stretched to ``frames`` latent frames (default ``FRAMES``).
+
+    A cached clip with enough frames gives a real window of that length. A still (or a shorter clip) is
+    repeated over time: the DMD trainer never reads the clean latent's values (only ``--priming-weight``
+    and the ``real_latent`` anchor do), so there it is only a shape donor for clip-shaped noise, and the
+    teacher's score at that shape is the temporal target.
+    """
+    x0, text = train_h3.load_item(item, rng, device)
+    frames = FRAMES if frames is None else frames
+    if frames > 1 and x0.shape[2] >= frames:
+        # a cached clip: a window starting on a VAE clip start (latent frame 5k is one pixel frame, like frame 0)
+        start = 5 * rng.randrange((x0.shape[2] - frames) // 5 + 1)
+        x0 = x0[:, :, start:start + frames].contiguous()
+    elif frames > 1:
+        x0 = x0[:, :, :1].expand(-1, -1, frames, -1, -1).contiguous()
+    return x0, text
+
+
+def motion(x: torch.Tensor) -> float | None:
+    """Mean |difference| between consecutive VAE clip-start frames (latent frames 5k, each the latent of one
+    pixel frame, 17 pixel frames apart). Pairs from frame 5 on when there are any: frame 0 differs from the
+    others by more than motion (a held still scores about 0.1 on (0, 5) and 0.03 on (5, 10))."""
+    starts = list(range(0, x.shape[2], 5))
+    pairs = list(zip(starts[1:-1], starts[2:])) or list(zip(starts[:-1], starts[1:]))
+    if not pairs:
+        return None
+    return sum(float((x[:, :, b] - x[:, :, a]).abs().mean()) for a, b in pairs) / len(pairs)
+
+
 def check(run: Run, groups: dict, items, rng, device) -> None:
     """One generator and one fake update (forward + backward) per distinct schedule entry.
 
     Prints grad sums per parameter group: the generator step must touch only gen LoRA / DirHead /
     adapter, the fake step only fake LoRA / fake head. Nothing is stepped or written.
     """
-    x0, text = train_h3.load_item(rng.choice(items), rng, device)
+    x0, text = load_item(rng.choice(items), rng, device)
     z = torch.randn_like(x0)
     # Fake == real at init (fake LoRA up and fake r-embed are zero), at a mid tau.
     saved_fake_r = run.fake_head.fake_r_embed.detach().clone()      # --paper-init: compare the LoRA alone
@@ -525,6 +581,23 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=16, help="generator LoRA rank (and the fake's, unless --fake-rank)")
     parser.add_argument("--fake-rank", type=int, default=None, help="fake-model LoRA rank (default: --rank)")
     parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
+    parser.add_argument("--fake-source", choices=["iteration", "final"], default="iteration",
+                        help="iteration (default, the paper): the fake model is conditioned on r and trained on that "
+                             "iteration's estimate. final: trained on the last iteration's output only and read with the "
+                             "last index at every r (eDMD's endpoint critic, arXiv 2611.17194); each fake update then "
+                             "costs a full rollout. Not in the DiR paper")
+    parser.add_argument("--tau-floor", choices=["none", "sigma"], default="none",
+                        help="sigma: with a --sigmas grid, iterations before the last get DMD noise levels at or above "
+                             "the sigma their estimate is re-noised to (after eDMD, arXiv 2611.17194). Not in the DiR paper")
+    parser.add_argument("--frames", type=int, default=1,
+                        help="latent frames per training sample: 1 (default) trains on stills; 5n+2 (7, 12, ...) "
+                             "trains on clip-shaped noise, H3's chunk layout, so the DMD target is the teacher's "
+                             "distribution over clips. A clip cache gives real windows (and motion prompts); a "
+                             "stills cache only gives text and shape, so do not use --priming-weight with it. "
+                             "Not in the paper (image-only). Dense schedule only")
+    parser.add_argument("--eval-frames", type=int, default=None,
+                        help="latent frames of the held-out eval (default: --frames). 12 or more gives the motion "
+                             "metric a clip-start pair that does not involve frame 0")
     parser.add_argument("--holdout", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=0, help="0 = save only at the end")
@@ -550,6 +623,13 @@ def main() -> None:
     lot = any(n != "dense" for n in names)
     if lot and args.pairs is None:
         raise SystemExit("a non-dense --schedule needs --pairs (the frozen bank)")
+    global FRAMES, EVAL_FRAMES
+    FRAMES, EVAL_FRAMES = args.frames, args.eval_frames or args.frames
+    for count in {FRAMES, EVAL_FRAMES} - {1}:
+        if count < 7 or (count - 2) % 5:
+            raise SystemExit(f"--frames / --eval-frames must be 1 or 5n+2 latent frames (7, 12, ...), got {count}")
+        if lot:
+            raise SystemExit("clips (--frames above 1) need the dense --schedule")
     if not lot:
         train_h3.CROP_MULTIPLE = 2   # no LoT super-cells: keep the whole latent (H3's 768×1344 is 48×84)
 
@@ -663,6 +743,8 @@ def main() -> None:
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
+    if args.tau_floor == "sigma" and min(run.sigmas) >= 1.0:
+        raise SystemExit("--tau-floor sigma needs a --sigmas grid below 1 (with sigma pinned at 1 the floor is 1)")
     if args.check:
         check(run, param_groups, train_items, rng, device)
         return
@@ -677,7 +759,7 @@ def main() -> None:
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
             "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas, "mix_state": run.mix_state,
             "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr,
-            "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
+            "tau_floor": args.tau_floor, "fake_source": args.fake_source, "frames": FRAMES, "eval_frames": EVAL_FRAMES, "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
             "swap": args.swap, "gpu": torch.cuda.get_device_name(device)}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
@@ -699,8 +781,9 @@ def main() -> None:
         change = [[] for _ in range(args.iterations)]
         fake_real = {t: [[] for _ in range(args.iterations)] for t in taus}
         hat_real = {t: [[] for _ in range(args.iterations)] for t in taus}
+        moving = [[] for _ in range(args.iterations)]
         for index, item in enumerate(held_items):
-            x0, text = train_h3.load_item(item, random.Random(1000 + index), device)
+            x0, text = load_item(item, random.Random(1000 + index), device, EVAL_FRAMES)
             gen = torch.Generator(device).manual_seed(index)
             z = torch.randn(x0.shape, device=device, generator=gen)
             eps = torch.randn(x0.shape, device=device, generator=gen)
@@ -712,12 +795,15 @@ def main() -> None:
                 if r + 1 < args.iterations:
                     state = next_state(state, new, run.sigmas[r], run.sigmas[r + 1], z if run.mix_state else None)
                 change[r].append(float((new - estimate).pow(2).mean().sqrt()))
+                if EVAL_FRAMES > 1:
+                    moving[r].append(motion(new))
                 for tau in taus:
                     x_tau = (1.0 - tau) * new + tau * eps
                     with use_networks(gen_net, fake_net, gen=False, fake=False):
                         real = real_x0(dit, x_tau, tau, text, audio_generator=run.audio(3 * index + r))
                     with use_networks(gen_net, fake_net, gen=False, fake=True):
-                        fake = fake_x0(dit, fake_head, x_tau, tau, r, text, audio_generator=run.audio(3 * index + r))
+                        fake = fake_x0(dit, fake_head, x_tau, tau, run.fake_index(r), text,
+                                       audio_generator=run.audio(3 * index + r))
                     fake_real[tau][r].append(float((fake - real).abs().mean()))
                     hat_real[tau][r].append(float((new - real).abs().mean()))
                 estimate = new
@@ -727,13 +813,16 @@ def main() -> None:
         record = {"step": step, "eval": {"change": [mean(c) for c in change],
                                           "fake_real": [mean(c) for c in fake_real[first]],
                                           "hat_real": [mean(c) for c in hat_real[first]]}}
+        if EVAL_FRAMES > 1:
+            record["eval"]["motion"] = [mean(c) for c in moving]
         if len(taus) > 1:
             record["eval"]["hat_real_by_tau"] = {str(t): [mean(c) for c in hat_real[t]] for t in taus}
             record["eval"]["fake_real_by_tau"] = {str(t): [mean(c) for c in fake_real[t]] for t in taus}
         log.write(json.dumps(record) + "\n")
         log.flush()
         print(f"LOT_H3 kind=dir_eval step={step} change={record['eval']['change']} "
-              f"fake_real={record['eval']['fake_real']} hat_real={record['eval']['hat_real']}", flush=True)
+              f"fake_real={record['eval']['fake_real']} hat_real={record['eval']['hat_real']}"
+              + (f" motion={record['eval']['motion']}" if EVAL_FRAMES > 1 else ""), flush=True)
 
     @torch.no_grad()
     def anchors() -> None:
@@ -747,20 +836,25 @@ def main() -> None:
         taus = [float(t) for t in args.eval_taus]
         names = ["real_latent"] + [f"base_euler{n}" for n in dict.fromkeys((1, args.iterations, 20))]
         rows = {t: {name: [] for name in names} for t in taus}
+        moving = {name: [] for name in names}
         for index, item in enumerate(held_items):
-            x0, text = train_h3.load_item(item, random.Random(1000 + index), device)
+            x0, text = load_item(item, random.Random(1000 + index), device, EVAL_FRAMES)
             gen = torch.Generator(device).manual_seed(index)
             z = torch.randn(x0.shape, device=device, generator=gen)
             eps = torch.randn(x0.shape, device=device, generator=gen)
-            samples = {"real_latent": x0.float()}
+            samples = {"real_latent": x0.float()}    # with --frames on a stills cache: a repeated still, motion 0
+            if EVAL_FRAMES > 1:
+                moving["real_latent"].append(motion(x0.float()))
             with use_networks(gen_net, fake_net, gen=False, fake=False):
-                for name in names[1:]:
+                for name in (n for n in names if n != "real_latent"):
                     sigmas = [float(s) for s in sigma_schedule(int(name[len("base_euler"):]))]
                     x, audio = z.clone(), run.audio(7 * index)
                     for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
                         x0_step = x.float() + sigma * predict(dit, x, 1.0 - sigma, text, audio_generator=audio).float()
                         x = next_state(x, x0_step, sigma, sigma_next) if sigma_next > 0 else x0_step
                     samples[name] = x.float()
+                    if EVAL_FRAMES > 1:
+                        moving[name].append(motion(x.float()))
                 for tau in taus:
                     for name, sample_x in samples.items():
                         x_tau = (1.0 - tau) * sample_x + tau * eps
@@ -768,6 +862,8 @@ def main() -> None:
                         rows[tau][name].append(float((sample_x - real).abs().mean()))
         mean = lambda xs: round(sum(xs) / max(len(xs), 1), 5)  # noqa: E731
         record = {"step": 0, "anchors": {str(t): {name: mean(v) for name, v in rows[t].items()} for t in taus}}
+        if EVAL_FRAMES > 1:
+            record["anchors"]["motion"] = {name: mean(v) for name, v in moving.items()}
         log.write(json.dumps(record) + "\n")
         log.flush()
         print(f"LOT_H3 kind=dir_anchors {json.dumps(record['anchors'])}", flush=True)
@@ -788,7 +884,7 @@ def main() -> None:
             run.loss_scale = 1.0 / args.accum
             losses = []
             for _ in range(args.accum):
-                x1, text1 = train_h3.load_item(warm_rng.choice(train_items), warm_rng, device)
+                x1, text1 = load_item(warm_rng.choice(train_items), warm_rng, device)
                 r1 = w % args.iterations if args.r_schedule == "mod" else warm_rng.randrange(args.iterations)
                 floss, _tau = run.fake_update(torch.randn_like(x1), text1, r1)
                 losses.append(float(floss.detach()))
@@ -811,7 +907,7 @@ def main() -> None:
         gen_opt.zero_grad(set_to_none=True)
         samples, all_stats = [], []
         for _ in range(args.accum):
-            x0, text = train_h3.load_item(rng.choice(train_items), rng, device)
+            x0, text = load_item(rng.choice(train_items), rng, device)
             z = torch.randn_like(x0)
             r = (step - 1) % args.iterations if args.r_schedule == "mod" else rng.randrange(args.iterations)
             run.loss_scale = 1.0 / args.accum
@@ -836,7 +932,7 @@ def main() -> None:
                 if k == 0:
                     floss, _tau = run.fake_update(z, text, r, x0_hat)
                 else:
-                    x1, text1 = train_h3.load_item(rng.choice(train_items), rng, device)
+                    x1, text1 = load_item(rng.choice(train_items), rng, device)
                     r1 = (step - 1) % args.iterations if args.r_schedule == "mod" else rng.randrange(args.iterations)
                     floss, _tau = run.fake_update(torch.randn_like(x1), text1, r1)
                 fake_losses.append(float(floss.detach()))

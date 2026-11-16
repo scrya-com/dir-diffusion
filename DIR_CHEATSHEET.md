@@ -190,6 +190,21 @@ python3 lot/probe_dir_h3.py --out lot/runs/probe --decode step200
 python3 lot/bench_dir_h3.py --run lot/runs/dir_mix --swap 0 --canvas 768x768 --canvas 1344x768
 ```
 
+**Clips: `--frames 12`.** The same recipe on clip-shaped noise (5n+2 latent frames; 12 is 39 pixel frames). Needs a 32 GB card: 28.2 GB peak and 64 s per step at `--max-latent-hw 32 48`. `--eval-frames` sets the eval's clip length, and the eval logs a `motion` score next to the 20-step anchor.
+
+```bash
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --frames 12 --rank 128 --fake-rank 64 --zero-init --sigmas grid:6 --mix-state \
+  --max-latent-hw 32 48 --swap 4 --dmd-draws 4 --fake-warmup 100 --ema 0 --accum 2 \
+  --steps 250 --eval-every 25 --save-every 50 --eval-anchors --out lot/runs/dir_clip
+python3 lot/probe_dir_h3.py --out lot/runs/probe_clip --frames 12 --max-latent-hw 32 48 --items 3 --name ref --reference
+python3 lot/probe_dir_h3.py --out lot/runs/probe_clip --frames 12 --max-latent-hw 32 48 --items 3 --name s50 --run lot/runs/dir_clip --tag 50
+python3 lot/probe_dir_h3.py --out lot/runs/probe_clip --decode s50          # side-by-side mp4s and frame sheets
+# a cache from clip latents you already have (z.pt + meta.json with a prompt), then --cache it
+python3 lot/build_clip_cache_h3.py --src /path/to/clips --out /path/to/cache_clips
+```
+
+`--tau-floor sigma` and `--fake-source final` (after eDMD, arXiv 2611.17194) are available and untested; see the README.
+
 Trained result (one run, 300 steps): iteration 4 is sharp on all 8 held-out prompts where base H3 at 4 steps is blurred, and the generator still follows a fed estimate. Checkpoints differ a lot (step 100 collapsed three prompts to a cutaway on white, step 200 did not), so save often and pick by the probe grid. Tables and pictures are in the [README](README.md#results-2026-11-17-what-works-on-h3-and-what-it-costs).
 
 - **Step-0 result** (Turbo init, untrained): the held-out gap goes 0.217, 0.193, 0.175, 0.160 across r = 1 to 4. With pinned σ it's 0.217 at every r. The untrained r = 4 already beats every trained pinned-σ run, and it has Turbo's wide framing.
