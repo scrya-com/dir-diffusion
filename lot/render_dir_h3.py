@@ -18,8 +18,7 @@ Run layout read by ``load_run`` (keep it the one place to adapt to the trainer):
 non-dense layout), ``config.json`` with ``schedule``, ``iters``, ``rank``, ``pairs``. The fake
 model's files are not needed to sample. ``--untrained`` is a smoke test, not a quality claim:
 a zero head makes every iteration the one-step base prediction (up to bf16 rounding). Smoke-tested
-on the GPU with a 2-step run (``--run``, with and without ``--ema``) and ``--untrained``; no
-trained weights worth judging exist yet. ``--ema`` loads the ``*_ema`` files; ``--holdout`` and
+on the GPU with a 2-step run (``--run``, with and without ``--ema``) and ``--untrained``. ``--ema`` loads the ``*_ema`` files; ``--holdout`` and
 ``--prompt-cache`` default to the run's ``config.json``.
 """
 
@@ -207,6 +206,8 @@ def main() -> None:
         print(f"LOT_H3 kind=render_dir prompt={index} dense_ms={dense_ms[-1]:.0f} dir_ms={dir_ms[-1]:.0f} "
               f"delta={','.join(f'{d:.4f}' for d in row)} "
               f"finite={int(all(bool(torch.isfinite(estimate).all()) for estimate in estimates))}", flush=True)
+    lora_rank = None if network is None else int(network.unet_loras[0].lora_dim)
+    gpu_name = torch.cuda.get_device_name(0)
     del model, head, network, adapter
     gc.collect()
     torch.cuda.synchronize()
@@ -234,7 +235,8 @@ def main() -> None:
     grid(rows, labels).save(args.out / "grid.png")
     meta = {
         "run": None if args.run is None else str(args.run), "untrained": bool(args.untrained), "ema": bool(args.ema),
-        "iters": iters, "schedule": spec, "sigmas": sigmas,
+        "iters": iters, "schedule": spec, "sigmas": sigmas, "swap": args.swap, "gpu": gpu_name,
+        "tag": args.tag, "rank": lora_rank,
         "dense_from": None if args.dense_from is None else str(args.dense_from), "steps": args.steps, "seed": args.seed, "canvas": f"{WIDTH}x{HEIGHT}",
         "prompts": [text for text, _ in prompts],
         "dit_ms": {"dense": dense_ms, "dir_total": dir_ms, "dense_median": dense_med, "dir_median": dir_med,

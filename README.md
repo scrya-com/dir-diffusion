@@ -54,7 +54,7 @@ export LOT_H3_CHECKPOINT=$PWD/models/diffusion_models/minimax_h3_fl2va_pruned_in
 export LOT_H3_VAE=/path/to/minimax_h3_video_vae_fp16.safetensors
 export LOT_H3_STILLS_CACHE=/path/to/h3_cache          # *_minimaxh3.safetensors + *_minimaxh3_te.safetensors
 
-python3 lot/test_lot.py                                # CPU -> ok 32
+python3 lot/test_lot.py                                # CPU -> last line "ok N"
 python3 lot/parity_h3.py                               # GPU -> ok=1
 python3 lot/parity_dir_h3.py                           # GPU -> ok=1
 python3 lot/render_dir_h3.py --untrained --prompts 1 --swap 4         # smoke: dense 20-step vs untrained DiR
@@ -62,8 +62,7 @@ python3 lot/render_dir_h3.py --untrained --prompts 1 --swap 4         # smoke: d
 # dry pass, then the paper's recipe (Table 4), batch 1 with 2-sample accumulation
 python3 lot/train_dir_h3.py --check --swap 4 --max-latent-hw 48 48
 LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --swap 4 --max-latent-hw 48 48 \
-  --dmd-weight paper --betas 0 0.95 --grad-clip 0 --fake-updates 4 --tau-shift beta:2.5 \
-  --accum 2 --ema 0.999 --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_a
+  --accum 2 --steps 1000 --eval-every 50 --save-every 100 --eval-anchors --out lot/runs/dir_a   # defaults = the paper's recipe
 
 python3 lot/render_dir_h3.py --run lot/runs/dir_a --ema --prompts 3 --swap 4   # -> grid.png + meta.json
 ```
@@ -86,7 +85,7 @@ Building a cache from your own clips, and every path variable, are covered in [`
 | [`third_party/musubi_tuner/`](third_party) | The unmodified subset of [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) that runs H3 (Apache-2.0; see [`NOTICE`](NOTICE)) |
 | [`comfyui/`](comfyui) | LoT ComfyUI workflows (DiR has no ComfyUI node yet) |
 
-Differences from the paper, on purpose: batch 1 with `--accum` instead of batch 256; zero-initialised `x̂0` projection and `r` embeddings (the paper uses random init) so the untrained generator equals the base one-step prediction; EMA 0.999 instead of 0.9999 at our step counts; no CFG on the real model yet (the paper's best uses 1.1 over τ ≤ 0.6), because H3 needs a cached empty-prompt embedding for it.
+Differences from the paper: batch 1 with `--accum` instead of batch 256 (about 2,000 samples in run 1 against the paper's roughly 50 million); rank-16 to 128 LoRAs for the generator and the fake model instead of full fine-tunes; text-to-image on H3 where the paper tests class-conditional ImageNet 256 only; no CFG on the real model yet (the paper's best uses 1.1 over τ ≤ 0.6), because H3 needs a cached empty-prompt embedding for it. Run 1 and the Turbo arms A–C also used zero init, random `r` and EMA 0.999; the defaults are now the paper's.
 
 ## Weights and license
 
