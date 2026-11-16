@@ -176,6 +176,8 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 12
   --max-latent-hw 48 48 --accum 2 --sigmas turbo --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo_sig
 ```
 
+**`--mix-state` (experimental, not in the paper).** With `--sigmas` below 1, iteration r sees `sigma_r * z + (1 - sigma_r) * x0_hat[r]`: the newest estimate re-noised with the same `z`, in place of the Euler state. The iteration is then a function of `(x0_hat[r], z, r)` only, which is DiR's form, and the estimate reaches the model through its pretrained input path. An inference-only test on runs 1 and E showed the trained generators ignore an estimate fed through `x0_proj`; untrained base H3 follows one fed this way. `render_dir_h3.py` reads the setting from the run's `config.json`. No trained result yet.
+
 - **Step-0 result** (Turbo init, untrained): the held-out gap goes 0.217, 0.193, 0.175, 0.160 across r = 1 to 4. With pinned σ it's 0.217 at every r. The untrained r = 4 already beats every trained pinned-σ run, and it has Turbo's wide framing.
 - **The run records it:** `config.json` stores `sigmas`, and `render_dir_h3.py` reads it, so renders use the run's schedule unless `--sigmas` overrides it.
 - **Dense layouts only:** a LoT `--schedule` needs `--sigmas 1`.

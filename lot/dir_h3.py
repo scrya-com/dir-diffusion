@@ -188,8 +188,15 @@ def parse_sigmas(spec, iters: int) -> list[float]:
     return values
 
 
-def next_state(state: torch.Tensor, clean: torch.Tensor, sigma: float, sigma_next: float) -> torch.Tensor:
-    """Deterministic Euler step of the iteration state (``state`` unchanged when both sigmas are 1)."""
+def next_state(state: torch.Tensor, clean: torch.Tensor, sigma: float, sigma_next: float,
+               z: torch.Tensor | None = None) -> torch.Tensor:
+    """The next iteration's state. Default: a deterministic Euler step (``state`` unchanged when both
+    sigmas are 1). With ``z`` (the sample's noise; ``--mix-state``): ``sigma_next * z + (1 - sigma_next)
+    * clean``, the newest estimate re-noised with the SAME ``z``. Then iteration ``r`` is a function of
+    ``(x0_hat[r], z, r)`` only, DiR's form, and the estimate reaches the model through its own
+    pretrained input path rather than through ``x0_proj`` (all-ones sigmas give ``z`` either way)."""
+    if z is not None:
+        return sigma_next * z + (1.0 - sigma_next) * clean.to(z.dtype)
     if sigma_next == sigma:
         return state
     ratio = sigma_next / sigma
@@ -286,12 +293,13 @@ def parse_layout_schedule(spec: str, iterations: int, token_h: int, token_w: int
 @torch.no_grad()
 def dir_sample(dit, head: DirHead, text: torch.Tensor, *, height: int, width: int, latent_t: int = 1,
                iters: int = DEFAULT_R, seed: int = 0, schedule: list | None = None, adapter=None,
-               sigmas: list | None = None, device="cuda") -> tuple[torch.Tensor, list[torch.Tensor]]:
+               sigmas: list | None = None, mix_state: bool = False,
+               device="cuda") -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Run ``iters`` iterations from the same noise. Returns the final x-space latent and every ``x0_hat``.
 
     ``schedule`` is the list from ``parse_layout_schedule`` (``None`` or entries ``None``: dense).
     A non-dense entry needs ``adapter`` (a ``LotVisualAdapter``). ``sigmas`` from ``parse_sigmas``
-    (default: all 1).
+    (default: all 1). ``mix_state``: see ``next_state``.
     """
     sigmas = sigmas or [1.0] * iters
     generator = torch.Generator(device).manual_seed(seed)
@@ -315,7 +323,7 @@ def dir_sample(dit, head: DirHead, text: torch.Tensor, *, height: int, width: in
                                   audio_generator=audio_generator)
         estimates.append(estimate)
         if r + 1 < iters:
-            state = next_state(state, estimate, sigmas[r], sigmas[r + 1])
+            state = next_state(state, estimate, sigmas[r], sigmas[r + 1], z if mix_state else None)
     return estimate, estimates
 
 
