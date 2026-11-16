@@ -35,9 +35,9 @@ One run from base H3, no Turbo LoRA: rank-128 generator, rank-64 fake model, `--
 
 Step 200, 8 held-out prompts, same noise per row. Columns: base H3 at 20 steps, base H3 at 4 Euler steps, then the trained generator after 1, 2, 3, 4 iterations.
 
-- **It refines.** Iteration 1 is a soft but recognisable image and iterations 2–4 add detail. Iteration 4 is sharp on all 8 prompts; base H3 at 4 steps is blurred and ghosted on all 8.
+- **It refines.** Iteration 1 is a soft but recognisable image and iterations 2–4 add detail. Iteration 4 is sharp on all 8 prompts; base H3 at 4 steps is blurred or ghosted on 7 of them (the plain standing figure is the exception).
 - **It still reads its estimate after training.** Fed the 20-step latent, iteration 4 lands 0.19 from it; fed zeros, 0.88; fed another prompt's latent, 1.01.
-- **It is not the 20-step image.** For the same noise the composition differs (0.63 from the 20-step latent; base H3 at 4 steps is 0.45 from it). It is a different sample of the same prompt.
+- **It is not the 20-step image.** For the same noise the composition differs (0.63 from the 20-step latent; base H3 at 4 Euler steps is 0.37 from it). It is a different sample of the same prompt.
 - **It is unstable across checkpoints.** At step 100, three prompts collapsed to an isometric cutaway on a white background. At step 200 that is gone. At step 300 one prompt changes rendering style and the concert loses its sign. EMA was off; the held-out score swings by 0.03–0.06 between adjacent evals. Step 200 was chosen by eye.
 
 ![iteration 4 at steps 100, 200, 300](assets/dir-mix-base-checkpoints.jpg)
@@ -48,7 +48,7 @@ What this does not show: the run changes three things at once (`--mix-state`, th
 
 ### Speed and memory
 
-`lot/bench_dir_h3.py`, rank-128 LoRA, stills, DiT only (text encoder, VAE and the CUDA context are excluded), nothing else running on the card. Peak is `torch.cuda.max_memory_allocated`.
+`lot/bench_dir_h3.py`, rank-128 LoRA, stills, DiT only (text encoder, VAE and the CUDA context are excluded), no other compute job on the card (the PRO 4000 also drives a desktop holding about 5 GB). Peak is `torch.cuda.max_memory_allocated`.
 
 | Card | Block swap | Canvas | One forward | Dense 20 steps | DiR 4 iterations | Ratio | Peak |
 |---|---|---|---|---|---|---|---|
@@ -74,12 +74,12 @@ Training, same run, RTX 5090, swap 4:
 | One step (2 accumulated samples, 4 DMD draws, 4 fake-model updates) | 21.5 s median |
 | Fake-model warm-up | 100 updates at about 10 s |
 | Held-out eval (8 prompts, 4 iterations) | about 27 s, every 20 steps |
-| 300 steps including warm-up, evals and saves | 2 h 18 min |
+| Whole run, wall clock | 2 h 49 min: 31 min of loading, anchors and warm-up, then 2 h 18 min for 300 steps. About 110 of those steps ran slower because renders on the second card competed for CPU; undisturbed the total would be about 2 h 25 min |
 | Peak memory | 24.9 GB: does not fit a 24 GB card at swap 4 |
 
 ## Status
 
-The rows below are the earlier pinned-σ runs. Read them with the finding above: their iterations do not refine.
+The rows below are the earlier pinned-σ runs. Read them with the finding above: their iterations do not refine. Their swap-4 timings on a 24 GB card are from run 1's rank-16 LoRA; the table above uses a rank-128 LoRA on a card whose desktop holds 5 GB, where swap 8 no longer fits.
 
 | What | Result |
 |---|---|
