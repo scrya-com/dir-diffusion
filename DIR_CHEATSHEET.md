@@ -115,7 +115,7 @@ Not paper settings, chosen for H3 on one card:
 
 **Resuming or reproducing an older run:** pass its old settings explicitly (from its `config.json`), e.g. run 1 used `--zero-init --r-schedule random --betas 0.9 0.95 --ema 0.999`. `--resume-step` loads the saved head, so the init flag doesn't matter there.
 
-**Cost:** about 65 s per step on the 24 GB card, so 1,000 steps take about 18 h.
+**Cost:** about 68 s per step at rank 16 with `--swap 4` on the 24 GB card (1,000 steps in about 19 h). The rank-128 Turbo arms with `--swap 12` logged about 240 s per step at 48×48 and about 410 s at 1344×768.
 
 **Watch:**
 
@@ -244,4 +244,4 @@ LOT_H3_TRAIN=1 python3 lot/train_stream_dir_h3.py --init lot/runs/my_dir --init-
 - **Wait on a PID, not a pattern.** A `while pgrep -f X` loop matches its own command line and never ends. `kill` by PID.
 - **Only one GPU job at a time.** Rendering needs the GPU, so pause training first.
 - **No LPIPS or GAN loss is used**, on purpose. The paper uses exactly two losses: DMD and the fake model's flow loss.
-- **Differences from the paper:** rank-16 LoRAs instead of a full fine-tune, batch 2 instead of 256, zero init (so step 0 equals H3), and `r` drawn at random rather than step mod R. Details: [issue #3](https://github.com/johndpope/MiniMax-H3/issues/3).
+- **Differences from the paper:** rank-16 LoRAs instead of a full fine-tune, batch 2 instead of 256, and text-to-image instead of class-conditional ImageNet. Runs before 2026-10-16 also used zero init and a random `r`. Details: [issue #3](https://github.com/johndpope/MiniMax-H3/issues/3).

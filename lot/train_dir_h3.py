@@ -197,34 +197,60 @@ class Run:
         state, estimate = self.rollout(z, r, text, schedule, seed)
         with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             x0_hat = self.one_step(state, estimate, r, text, schedule, seed)
-        tau = self.draw_tau()
-        eps = torch.randn_like(z)
-        x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
+        # --dmd-draws K: the direction is averaged over K independent (tau, eps) draws for this one
+        # generated sample (2 no-grad forwards each), a cheaper variance cut than a larger --accum.
+        # K = 1 is the paper's single draw and consumes the RNG exactly as before.
+        draws = []
+        for _draw in range(max(1, int(getattr(self.args, "dmd_draws", 1)))):
+            draws.append(self.dmd_direction(x0_hat, r, text, seed))
+        grad = sum(d[0] for d in draws) / len(draws)
+        tau, weight, gap = draws[-1][1], draws[-1][2], draws[-1][3]
+        fake_real = sum(d[4] for d in draws) / len(draws)
+        draw_cos = None
+        if len(draws) > 1:      # mean pairwise cosine of the per-draw directions: ~0 means noise
+            flat = torch.stack([d[0].flatten() for d in draws])
+            flat = flat / flat.norm(dim=1, keepdim=True).clamp(min=1e-12)
+            cos = flat @ flat.T
+            draw_cos = float((cos.sum() - cos.diag().sum()) / (len(draws) * (len(draws) - 1)))
         with torch.no_grad():
-            with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
-                x0_real = real_x0(self.dit, x_tau, tau, text, audio_generator=self.audio(seed + 99))
-            with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
-                x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, r, text, audio_generator=self.audio(seed + 99))
-            gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
-            if self.args.dmd_weight == "paper":
-                # Paper eq. 10 / Algorithm 1: L = E w(tau) sg[v_real - v_fake]^T x0_hat, so
-                # dL/dx0_hat = w(tau) (v_real - v_fake), with the paper's v = eps - x0 (target eps - x0_hat).
-                # At a fixed x_tau = (1-tau) x0 + tau eps, x0 = x_tau - tau v, hence
-                # v_real - v_fake = (x0_fake - x0_real) / tau. H3's head predicts x0 - eps = -v, which
-                # is why fake_x0/real_x0 are x_tau + tau * out (the same x0 as x_tau - tau v).
-                # The paper's final setting w(tau) = 1 ("velocity difference applied directly to x0_hat"):
-                #     grad = (x0_fake - x0_real) / tau    (units of x0; descent moves x0_hat along -grad)
-                # The surrogate below has dloss/dx0_hat = grad / N, the same 1/N scale as the paper's
-                # mean(x_hat * direction). tau >= 0.02 here (TAU_MIN), so 1/tau <= 50.
-                weight = 1.0 / tau
-            else:
-                weight = 1.0 / gap          # DMD2's normaliser (detached), the default
-            grad = (x0_fake - x0_real) * weight
             grad_prime, prime_stats = None, {}
             if self.args.priming_weight > 0:
                 if real is None:
                     raise ValueError("--priming-weight needs the item's real latent")
                 grad_prime, prime_stats = self.priming_grad(x0_hat, real, r, text, schedule)
+        return self._generator_backward(state, estimate, r, text, schedule, seed, z, x0_hat, grad, grad_prime,
+                                        prime_stats, tau, weight, gap, fake_real, draw_cos, backward)
+
+    @torch.no_grad()
+    def dmd_direction(self, x0_hat, r, text, seed):
+        """One (tau, eps) draw: ``(grad, tau, weight, gap, mean|fake - real|)`` for a detached ``x0_hat``."""
+        tau = self.draw_tau()
+        eps = torch.randn_like(x0_hat)
+        x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
+        with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
+            x0_real = real_x0(self.dit, x_tau, tau, text, audio_generator=self.audio(seed + 99))
+        with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
+            x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, r, text, audio_generator=self.audio(seed + 99))
+        gap = (x0_hat - x0_real).abs().mean().clamp(min=1e-6)
+        if self.args.dmd_weight == "paper":
+            # Paper eq. 10 / Algorithm 1: L = E w(tau) sg[v_real - v_fake]^T x0_hat, so
+            # dL/dx0_hat = w(tau) (v_real - v_fake), with the paper's v = eps - x0 (target eps - x0_hat).
+            # At a fixed x_tau = (1-tau) x0 + tau eps, x0 = x_tau - tau v, hence
+            # v_real - v_fake = (x0_fake - x0_real) / tau. H3's head predicts x0 - eps = -v, which
+            # is why fake_x0/real_x0 are x_tau + tau * out (the same x0 as x_tau - tau v).
+            # The paper's final setting w(tau) = 1 ("velocity difference applied directly to x0_hat"):
+            #     grad = (x0_fake - x0_real) / tau    (units of x0; descent moves x0_hat along -grad)
+            # The surrogate below has dloss/dx0_hat = grad / N, the same 1/N scale as the paper's
+            # mean(x_hat * direction). tau >= 0.02 here (TAU_MIN), so 1/tau <= 50.
+            weight = 1.0 / tau
+        else:
+            weight = 1.0 / gap          # DMD2's normaliser (detached), the default
+        grad = (x0_fake - x0_real) * weight
+        return grad, tau, weight, gap, float((x0_fake - x0_real).abs().mean())
+
+    def _generator_backward(self, state, estimate, r, text, schedule, seed, z, x0_hat, grad, grad_prime, prime_stats,
+                            tau, weight, gap, fake_real, draw_cos, backward):
+        """The grad forward of ``generator_update`` (kept last, see there) and its backward."""
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             with torch.enable_grad():
                 x0_hat_g = self.one_step(state, estimate, r, text, schedule, seed)
@@ -240,7 +266,7 @@ class Run:
                 if backward:
                     (loss * self.loss_scale).backward()
         stats = {"loss": float(loss.detach()), "dmd": float(dmd.detach()), "tau": tau, "w": float(weight),
-                 "fake_real": float((x0_fake - x0_real).abs().mean()), "hat_real": float(gap),
+                 "fake_real": fake_real, "hat_real": float(gap), "draw_cos": draw_cos,
                  "ot": None if ot is None else float(ot.detach()),
                  "grad_rms": float(grad.pow(2).mean().sqrt()),
                  "prime_rms": None if grad_prime is None else float(grad_prime.pow(2).mean().sqrt()),
@@ -478,6 +504,19 @@ def main() -> None:
                         help="Priming Models' real-data term in latent space (arXiv 2610.20331; 0 = off), see docstring")
     parser.add_argument("--priming-refs", type=int, default=1,
                         help="no-grad reference rollouts per sample for --priming-weight (each costs r + 1 forwards)")
+    parser.add_argument("--fake-warmup", type=int, default=0,
+                        help="fake-only updates before the first generator update (0 = off). The fake model starts as "
+                             "the teacher, so until it has learned the generator's distribution the DMD direction is "
+                             "noise; needed most with a warm start (--init, --sigmas grid). The paper warms up 100 "
+                             "iterations when it uses CFG. Uses its own RNG stream: later draws are unchanged")
+    parser.add_argument("--dmd-draws", type=int, default=1,
+                        help="(tau, eps) draws averaged into each sample's DMD direction (default 1, the paper). Each "
+                             "extra draw is 2 no-grad forwards; logs draw_cos, the mean pairwise cosine of the draws")
+    parser.add_argument("--eval-taus", type=float, nargs="+", default=[0.6],
+                        help="noise levels of the held-out eval (default 0.6; the first one fills the old keys)")
+    parser.add_argument("--eval-anchors", action="store_true",
+                        help="log reference rows once before training, on the same items/noise/metric: base H3 Euler "
+                             "at 1, R and 20 steps, and the items' real latents. Without them hat_real has no scale")
     parser.add_argument("--rank", type=int, default=16, help="generator LoRA rank (and the fake's, unless --fake-rank)")
     parser.add_argument("--fake-rank", type=int, default=None, help="fake-model LoRA rank (default: --rank)")
     parser.add_argument("--swap", type=int, default=4, help="blocks streamed from CPU; >0 turns on checkpointing")
@@ -615,7 +654,7 @@ def main() -> None:
           f"gen_trainable={sum(p.numel() for p in gen_params)} fake_trainable={sum(p.numel() for p in fake_params)} "
           f"optimizer={opt_name} swap={args.swap} temb_dim={temb_dim} hidden={hidden} "
           f"fake_updates={args.fake_updates} accum={args.accum} tau_shift={args.tau_shift} dmd_weight={args.dmd_weight} "
-          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} sigmas={args.sigmas} paper_init={int(args.paper_init)} r_schedule={args.r_schedule} head_lr={args.head_lr or args.lr} "
+          f"betas={tuple(args.betas)} grad_clip={args.grad_clip} ema={args.ema} priming={args.priming_weight}x{args.priming_refs} fake_warmup={args.fake_warmup} dmd_draws={args.dmd_draws} sigmas={args.sigmas} paper_init={int(args.paper_init)} r_schedule={args.r_schedule} head_lr={args.head_lr or args.lr} "
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
@@ -632,7 +671,9 @@ def main() -> None:
             "fake_updates": args.fake_updates, "accum": args.accum, "dmd_weight": args.dmd_weight, "betas": list(args.betas),
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
             "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas,
-            "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr}
+            "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr,
+            "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
+            "swap": args.swap, "gpu": torch.cuda.get_device_name(device)}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:
@@ -649,9 +690,10 @@ def main() -> None:
         """Held-out prompts, fixed seeds. Per iteration: rms change from the previous estimate (does the
         refinement converge?) and the DMD terms at a fixed tau (|fake - real| mean, the normalised gap)."""
         head.eval()
+        taus = [float(t) for t in args.eval_taus]
         change = [[] for _ in range(args.iterations)]
-        fake_real = [[] for _ in range(args.iterations)]
-        hat_real = [[] for _ in range(args.iterations)]
+        fake_real = {t: [[] for _ in range(args.iterations)] for t in taus}
+        hat_real = {t: [[] for _ in range(args.iterations)] for t in taus}
         for index, item in enumerate(held_items):
             x0, text = train_h3.load_item(item, random.Random(1000 + index), device)
             gen = torch.Generator(device).manual_seed(index)
@@ -665,26 +707,97 @@ def main() -> None:
                 if r + 1 < args.iterations:
                     state = next_state(state, new, run.sigmas[r], run.sigmas[r + 1])
                 change[r].append(float((new - estimate).pow(2).mean().sqrt()))
-                tau = 0.6
-                x_tau = (1.0 - tau) * new + tau * eps
-                with use_networks(gen_net, fake_net, gen=False, fake=False):
-                    real = real_x0(dit, x_tau, tau, text, audio_generator=run.audio(3 * index + r))
-                with use_networks(gen_net, fake_net, gen=False, fake=True):
-                    fake = fake_x0(dit, fake_head, x_tau, tau, r, text, audio_generator=run.audio(3 * index + r))
-                fake_real[r].append(float((fake - real).abs().mean()))
-                hat_real[r].append(float((new - real).abs().mean()))
+                for tau in taus:
+                    x_tau = (1.0 - tau) * new + tau * eps
+                    with use_networks(gen_net, fake_net, gen=False, fake=False):
+                        real = real_x0(dit, x_tau, tau, text, audio_generator=run.audio(3 * index + r))
+                    with use_networks(gen_net, fake_net, gen=False, fake=True):
+                        fake = fake_x0(dit, fake_head, x_tau, tau, r, text, audio_generator=run.audio(3 * index + r))
+                    fake_real[tau][r].append(float((fake - real).abs().mean()))
+                    hat_real[tau][r].append(float((new - real).abs().mean()))
                 estimate = new
         head.train()
         mean = lambda xs: round(sum(xs) / max(len(xs), 1), 5)  # noqa: E731
-        record = {"step": step, "eval": {"change": [mean(c) for c in change], "fake_real": [mean(c) for c in fake_real],
-                                          "hat_real": [mean(c) for c in hat_real]}}
+        first = taus[0]
+        record = {"step": step, "eval": {"change": [mean(c) for c in change],
+                                          "fake_real": [mean(c) for c in fake_real[first]],
+                                          "hat_real": [mean(c) for c in hat_real[first]]}}
+        if len(taus) > 1:
+            record["eval"]["hat_real_by_tau"] = {str(t): [mean(c) for c in hat_real[t]] for t in taus}
+            record["eval"]["fake_real_by_tau"] = {str(t): [mean(c) for c in fake_real[t]] for t in taus}
         log.write(json.dumps(record) + "\n")
         log.flush()
         print(f"LOT_H3 kind=dir_eval step={step} change={record['eval']['change']} "
               f"fake_real={record['eval']['fake_real']} hat_real={record['eval']['hat_real']}", flush=True)
 
+    @torch.no_grad()
+    def anchors() -> None:
+        """Reference rows for ``hat_real``: the same held-out items, noise and metric as ``evaluate``, for
+        the base model's own Euler sampler (1, R and 20 steps from the same ``z``) and the real latents.
+        Measured once (2026-11-16, run 1's cache, tau 0.6): a real latent scores about 0.25 and base Euler
+        at 4 and at 20 steps about 0.16-0.17, so the metric is closeness to the teacher's mean, not realism."""
+        from h3_musubi import predict, sigma_schedule
+
+        taus = [float(t) for t in args.eval_taus]
+        names = ["real_latent"] + [f"base_euler{n}" for n in dict.fromkeys((1, args.iterations, 20))]
+        rows = {t: {name: [] for name in names} for t in taus}
+        for index, item in enumerate(held_items):
+            x0, text = train_h3.load_item(item, random.Random(1000 + index), device)
+            gen = torch.Generator(device).manual_seed(index)
+            z = torch.randn(x0.shape, device=device, generator=gen)
+            eps = torch.randn(x0.shape, device=device, generator=gen)
+            samples = {"real_latent": x0.float()}
+            with use_networks(gen_net, fake_net, gen=False, fake=False):
+                for name in names[1:]:
+                    sigmas = [float(s) for s in sigma_schedule(int(name[len("base_euler"):]))]
+                    x, audio = z.clone(), run.audio(7 * index)
+                    for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:]):
+                        x0_step = x.float() + sigma * predict(dit, x, 1.0 - sigma, text, audio_generator=audio).float()
+                        x = next_state(x, x0_step, sigma, sigma_next) if sigma_next > 0 else x0_step
+                    samples[name] = x.float()
+                for tau in taus:
+                    for name, sample_x in samples.items():
+                        x_tau = (1.0 - tau) * sample_x + tau * eps
+                        real = real_x0(dit, x_tau, tau, text, audio_generator=run.audio(3 * index))
+                        rows[tau][name].append(float((sample_x - real).abs().mean()))
+        mean = lambda xs: round(sum(xs) / max(len(xs), 1), 5)  # noqa: E731
+        record = {"step": 0, "anchors": {str(t): {name: mean(v) for name, v in rows[t].items()} for t in taus}}
+        log.write(json.dumps(record) + "\n")
+        log.flush()
+        print(f"LOT_H3 kind=dir_anchors {json.dumps(record['anchors'])}", flush=True)
+
     if not args.resume_step:
+        if args.eval_anchors:
+            anchors()
         evaluate(0)
+    if args.fake_warmup and not args.resume_step:
+        # Fake-only updates on fresh rollouts of the (still untouched) generator. Own Python RNG, and the
+        # torch RNG states are restored afterwards, so the main loop draws exactly what a run without
+        # warm-up draws: a paired A/B.
+        warm_rng = random.Random(args.seed + 101)
+        cpu_state, cuda_state = torch.get_rng_state(), torch.cuda.get_rng_state(device)
+        warm_start = time.perf_counter()
+        for w in range(args.fake_warmup):
+            fake_opt.zero_grad(set_to_none=True)
+            run.loss_scale = 1.0 / args.accum
+            losses = []
+            for _ in range(args.accum):
+                x1, text1 = train_h3.load_item(warm_rng.choice(train_items), warm_rng, device)
+                r1 = w % args.iterations if args.r_schedule == "mod" else warm_rng.randrange(args.iterations)
+                floss, _tau = run.fake_update(torch.randn_like(x1), text1, r1)
+                losses.append(float(floss.detach()))
+            run.loss_scale = 1.0
+            clip(fake_params, args.grad_clip)
+            fake_opt.step()
+            log.write(json.dumps({"fake_warmup": w + 1, "fake_loss": sum(losses) / len(losses)}) + "\n")
+            if (w + 1) % 10 == 0 or w + 1 == args.fake_warmup:
+                log.flush()
+                print(f"LOT_H3 kind=dir_fake_warmup step={w + 1}/{args.fake_warmup} fake_loss={sum(losses) / len(losses):.4f} "
+                      f"s_per_step={(time.perf_counter() - warm_start) / (w + 1):.2f}", flush=True)
+        fake_opt.zero_grad(set_to_none=True)
+        torch.set_rng_state(cpu_state)
+        torch.cuda.set_rng_state(cuda_state, device)
+        evaluate(0)      # fake_real is now the warmed fake's view of the untouched generator
     started = time.perf_counter()
     for step in range(args.resume_step + 1, args.steps + 1):
         # One generator update = --accum samples (each its own prompt, noise, r and tau), grads

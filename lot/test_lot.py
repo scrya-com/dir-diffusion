@@ -1140,6 +1140,51 @@ def test_stream_trainer_updates_on_cpu():
         assert head.x0_proj.weight.grad is None
 
 
+def test_dir_trainer_draws_on_cpu():
+    """The still DMD generator update on the toy H3: one draw reproduces the single-draw direction, K draws
+    average K independent (tau, eps) directions, and grads reach only the generator's head."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_dir_trainer_draws_on_cpu: musubi_tuner not importable", flush=True)
+        return
+    import argparse
+
+    from dir_h3 import DirFakeHead, DirHead, probe_temb_dim
+    from train_dir_h3 import Run
+
+    temb = probe_temb_dim(dit)
+    head = DirHead(dit.config.hidden_size, temb, 2).paper_init(torch.Generator().manual_seed(1))
+    fake_head = DirFakeHead(temb, 2)
+    with torch.no_grad():
+        fake_head.fake_r_embed.normal_(0.0, 0.3)          # fake != real, so the DMD gradient is non-zero
+    args = argparse.Namespace(iterations=2, sigmas="1", seed=0, schedule="dense", tau_shift="beta:2.5",
+                              dmd_weight="paper", priming_weight=0.0, priming_refs=1, ot_weight=0.0, dmd_draws=1)
+    run = Run(dit, head, fake_head, None, None, None, args, "cpu")
+    z, text = torch.randn(1, 24, 1, 4, 6), torch.randn(1, 5, 16)
+
+    torch.manual_seed(5)
+    _loss, x0_hat, one = run.generator_update(z, text, 1)
+    assert one["draw_cos"] is None and one["match"] < 1e-5 and math.isfinite(one["loss"]), one
+    grad_one = head.x0_proj.weight.grad.clone()
+    assert float(grad_one.abs().sum()) > 0 and fake_head.fake_r_embed.grad is None
+    # the helper alone, from the same RNG point, gives the direction that update used
+    torch.manual_seed(5)
+    seed = int(torch.randint(0, 2**31 - 1, (1,)))
+    direction, tau, _w, _gap, _fr = run.dmd_direction(x0_hat, 1, text, seed)
+    assert tau == one["tau"] and abs(float(direction.pow(2).mean().sqrt()) - one["grad_rms"]) < 1e-6
+
+    head.zero_grad(set_to_none=True)
+    args.dmd_draws = 3
+    torch.manual_seed(5)
+    _loss, x0_hat3, many = run.generator_update(z, text, 1)
+    assert torch.equal(x0_hat3, x0_hat) and -1.0 <= many["draw_cos"] <= 1.0 and many["match"] < 1e-5
+    torch.manual_seed(5)
+    seed = int(torch.randint(0, 2**31 - 1, (1,)))
+    mean = sum(run.dmd_direction(x0_hat, 1, text, seed)[0] for _ in range(3)) / 3
+    assert abs(float(mean.pow(2).mean().sqrt()) - many["grad_rms"]) < 1e-6
+    assert float(head.x0_proj.weight.grad.abs().sum()) > 0 and fake_head.fake_r_embed.grad is None
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -1177,6 +1222,7 @@ def main():
         test_dir_ema_warmup,
         test_dir_paper_init,
         test_dir_sigma_schedule_is_euler,
+        test_dir_trainer_draws_on_cpu,
         test_stream_layout_and_positions_match_stock,
         test_stream_frame_modulation_rewrite,
         test_stream_forward_matches_stock_h3,
