@@ -46,6 +46,27 @@ Columns: 20 steps, base 4 steps, then iteration 4 at steps 100, 200 and 300.
 
 What this does not show: the run changes three things at once (`--mix-state`, the fake warm-up, 4 DMD draws) and there is no base-start arm without `--mix-state`; there is no FID, one seed per prompt, and one training style. The same recipe started from the Turbo LoRA refined but did not beat Turbo's own 4-step sampler at step 100, and drifted in content on two prompts.
 
+### Video (untrained for it)
+
+The run above saw stills only. As a first look, the step-200 generator was run unchanged on a 12-frame latent at 768×512 (39 frames, 1.6 s at 24 fps), whole clip at once, three held-out prompts, RTX 5090 with no block swap:
+
+| | Time (DiT only) | Peak |
+|---|---|---|
+| Base H3, 20 steps | 14.8 s | 22.0 GB |
+| Base H3, 4 Euler steps | 2.96 s | |
+| DiR, 4 iterations | 3.6 s (4.1× against 20 steps) | 22.6 GB |
+
+![frames 0, 19 and 38: 20 steps, base 4 steps, DiR r=1, DiR r=4](assets/dir-mix-video-p1-sheet.jpg)
+
+Rows are the first, middle and last frame; columns are 20 steps, base 4 steps, DiR iteration 1 and DiR iteration 4. Clips: [prompt 1](assets/dir-mix-video-p1.mp4), [prompt 3](assets/dir-mix-video-p3.mp4).
+
+- **Sharp and temporally stable.** Iteration 4 gives a clean, consistent clip where base H3 at 4 steps is blurred.
+- **Little motion.** In two of three clips it is close to a held still: mean pixel change between consecutive frames is 0.83 against 3.26 for the 20-step clip on the prompt shown. A generator distilled on stills has no reason to keep H3's motion.
+- **The white-background collapse returns** on one of the three prompts (the second clip).
+- **Not the streaming path.** `stream_dir_h3.py` and its trainer do not take `--sigmas` or `--mix-state` yet, and the streaming videos in `assets/` are from the pinned-σ run 1.
+
+A usable video result needs training on clips with this recipe; this only shows the stills generator transfers without breaking.
+
 ### Speed and memory
 
 `lot/bench_dir_h3.py`, rank-128 LoRA, stills, DiT only (text encoder, VAE and the CUDA context are excluded), no other compute job on the card (the PRO 4000 also drives a desktop holding about 5 GB). Peak is `torch.cuda.max_memory_allocated`.
