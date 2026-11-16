@@ -734,8 +734,9 @@ def main() -> None:
     def anchors() -> None:
         """Reference rows for ``hat_real``: the same held-out items, noise and metric as ``evaluate``, for
         the base model's own Euler sampler (1, R and 20 steps from the same ``z``) and the real latents.
-        Measured once (2026-11-16, run 1's cache, tau 0.6): a real latent scores about 0.25 and base Euler
-        at 4 and at 20 steps about 0.16-0.17, so the metric is closeness to the teacher's mean, not realism."""
+        Measured once (2026-11-16, run 1's cache, 8 items, tau 0.6): a real latent scores 0.23, base Euler
+        0.37 / 0.15 / 0.155 at 1 / 4 / 20 steps (std about 0.03 across items; the soft 4-step sample scores as
+        well as the sharp 20-step one). The metric is closeness to the teacher's mean, not realism."""
         from h3_musubi import predict, sigma_schedule
 
         taus = [float(t) for t in args.eval_taus]

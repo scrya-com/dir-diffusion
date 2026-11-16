@@ -115,7 +115,7 @@ Not paper settings, chosen for H3 on one card:
 
 **Resuming or reproducing an older run:** pass its old settings explicitly (from its `config.json`), e.g. run 1 used `--zero-init --r-schedule random --betas 0.9 0.95 --ema 0.999`. `--resume-step` loads the saved head, so the init flag doesn't matter there.
 
-**Cost:** about 68 s per step at rank 16 with `--swap 4` on the 24 GB card (1,000 steps in about 19 h). The rank-128 Turbo arms with `--swap 12` logged about 240 s per step at 48×48 and about 410 s at 1344×768.
+**Cost:** about 68 s per step at rank 16 with `--swap 4` on the 24 GB card (1,000 steps in about 19 h). The rank-128 Turbo arms logged about 240 s per step at 48×48 and about 410 s at 1344×768 (their swap setting was not recorded; `config.json` records it now).
 
 **Watch:**
 
