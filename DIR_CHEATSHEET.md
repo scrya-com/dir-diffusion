@@ -176,7 +176,21 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 12
   --max-latent-hw 48 48 --accum 2 --sigmas turbo --steps 1000 --eval-every 50 --save-every 100 --out lot/runs/dir_turbo_sig
 ```
 
-**`--mix-state` (experimental, not in the paper).** With `--sigmas` below 1, iteration r sees `sigma_r * z + (1 - sigma_r) * x0_hat[r]`: the newest estimate re-noised with the same `z`, in place of the Euler state. The iteration is then a function of `(x0_hat[r], z, r)` only, which is DiR's form, and the estimate reaches the model through its pretrained input path. An inference-only test on runs 1 and E showed the trained generators ignore an estimate fed through `x0_proj`; untrained base H3 follows one fed this way. `render_dir_h3.py` reads the setting from the run's `config.json`. No trained result yet.
+**`--mix-state` (experimental, not in the paper).** With `--sigmas` below 1, iteration r sees `sigma_r * z + (1 - sigma_r) * x0_hat[r]`: the newest estimate re-noised with the same `z`, in place of the Euler state. The iteration is then a function of `(x0_hat[r], z, r)` only, which is DiR's form, and the estimate reaches the model through its pretrained input path. An inference-only test on runs 1 and E showed the trained generators ignore an estimate fed through `x0_proj`; untrained base H3 follows one fed this way. `render_dir_h3.py` reads the setting from the run's `config.json`.
+
+```bash
+# the one run that refines so far: base H3 start, 32 GB card (24.9 GB peak), 21.5 s per step
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --rank 128 --fake-rank 64 --zero-init --sigmas grid:6 --mix-state \
+  --max-latent-hw 48 48 --swap 4 --dmd-draws 4 --fake-warmup 100 --ema 0 --accum 2 \
+  --steps 300 --eval-every 20 --save-every 100 --eval-anchors --out lot/runs/dir_mix
+# check it: references once, then a checkpoint, then the picture grid
+python3 lot/probe_dir_h3.py --out lot/runs/probe --name ref --reference
+python3 lot/probe_dir_h3.py --out lot/runs/probe --name step200 --run lot/runs/dir_mix --tag 200
+python3 lot/probe_dir_h3.py --out lot/runs/probe --decode step200
+python3 lot/bench_dir_h3.py --run lot/runs/dir_mix --swap 0 --canvas 768x768 --canvas 1344x768
+```
+
+Trained result (one run, 300 steps): iteration 4 is sharp on all 8 held-out prompts where base H3 at 4 steps is blurred, and the generator still follows a fed estimate. Checkpoints differ a lot (step 100 collapsed three prompts to a cutaway on white, step 200 did not), so save often and pick by the probe grid. Tables and pictures are in the [README](README.md#results-2026-11-17-what-works-on-h3-and-what-it-costs).
 
 - **Step-0 result** (Turbo init, untrained): the held-out gap goes 0.217, 0.193, 0.175, 0.160 across r = 1 to 4. With pinned σ it's 0.217 at every r. The untrained r = 4 already beats every trained pinned-σ run, and it has Turbo's wide framing.
 - **The run records it:** `config.json` stores `sigmas`, and `render_dir_h3.py` reads it, so renders use the run's schedule unless `--sigmas` overrides it.
