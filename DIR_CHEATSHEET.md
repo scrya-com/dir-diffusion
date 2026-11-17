@@ -144,6 +144,98 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --rank 12
 - **What is dropped:** the 2 token-refiner blocks.
 - **Memory:** rank 128 on a 24 GB card needs `--swap 12` and `--ema 0`. The `--check` peak is about 20.5 GB before optimizer state. `--fake-rank` keeps the fake model smaller.
 
+### Clip run from Turbo on a 48 GB card (RTX 6000 class): prerequisites and commands
+
+**Status (2026-11-17): no run from Turbo has beaten Turbo yet.** Four 50–125 step runs on a 32 GB card at 2 samples per update are in the README ("Video, part 4"). This section is the recipe those runs point to, at a batch a larger card allows. **None of it has been run on a 48 GB or 96 GB card**: measure first (step 3), and report what you get in [issue #4](https://github.com/scrya-com/dir-diffusion/issues/4).
+
+**1. Prerequisites**
+
+| What | Where it comes from | Needed for |
+|---|---|---|
+| H3 DiT, pruned int8 (`LOT_H3_CHECKPOINT`) | `hf download Comfy-Org/MiniMax-H3 diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | everything |
+| Turbo 4-step LoRA | `hf download lightx2v/Minimax-h3-Turbo minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors` | the start point |
+| A prompt cache (`--cache`, or `LOT_H3_STILLS_CACHE`) | sections 2–3; the runs here used 801 stills with long captions | training and the 8 held-out prompts |
+| H3 text encoder (`LOT_H3_TEXT_ENCODER`) | only to build the cache (about 9.5 s per caption) | caching |
+| H3 video VAE (`LOT_H3_VAE`) | `hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_video_vae_fp16.safetensors` | renders only; training and the yardstick never decode |
+
+Training reads prompts and latent shapes only, so a stills cache is enough for clip-shaped runs (`--frames 12`).
+
+**2. Convert Turbo into a start point** (CPU, a few seconds):
+
+```bash
+python3 lot/turbo_lora.py turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
+  --rank 128 --out lot/runs/turbo4_init --run-dir
+```
+
+`--run-dir` adds a zero `dir_head.pt` and a `config.json` with Turbo's sigmas, so the directory is also an untrained run: Turbo's own 4-step sampler, for the yardstick and the renders.
+
+**3. Measure the card before the long run** (about 10 minutes):
+
+```bash
+C=(--init lot/runs/turbo4_init --sigmas turbo --zero-init --frames 12 --rank 128 --fake-rank 64 --max-latent-hw 32 48)
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py $C --swap 0 --check                  # prints the peak; ok=1
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py $C --swap 0 --fake-warmup 0 --accum 2 --dmd-draws 2 \
+  --steps 5 --eval-every 0 --save-every 0 --out lot/runs/timing                 # s_per_step and peak_mb
+```
+
+- `--swap 0` keeps all 50 blocks on the card and turns gradient checkpointing off. On a 32 GB card the same shapes peak at 29.8 GB with `--swap 6` (checkpointing on). If `--swap 0` runs out of memory, use `--swap 1`: checkpointing comes back and one block streams from CPU.
+- Streaming is what makes a 32 GB card slow: one forward is 0.08 s at `--swap 0` and 0.35 s at `--swap 4`. A step there is 72 s for 2 samples.
+- Pick `--accum` from the timing: samples per update = `--accum`. eDMD uses 16, DiR 256; the runs so far used 2.
+
+**4. The run**
+
+```bash
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py $C --swap 0 \
+  --fake-source iteration --tau-max 0.9 --dmd-weight norm --dmd-draws 2 \
+  --lr 6e-6 --lr-warmup 100 --grad-clip 3.0 --fake-lr 2e-5 --fake-grad-clip 1.0 --weight-decay 0.01 --ema 0.999 \
+  --fake-warmup 100 --accum 8 --steps 400 --eval-every 25 --save-every 50 --eval-anchors --holdout 8 --seed 0 \
+  --out lot/runs/dir_turbo_clip
+```
+
+Why each choice (measurements in the README, part 4):
+
+- `--fake-source iteration`: the DiR paper's fake model, conditioned on the iteration. eDMD's endpoint fake model (`final`) never sees a first-iteration estimate and inflated the first iteration in two runs.
+- `--tau-max 0.9`: H3 is CFG-distilled, and above about 0.9 its one-call answer is dominated by the baked guidance. eDMD's read levels (`--tau-floor`) sit in that range and pushed every run off.
+- `--lr 6e-6 --lr-warmup 100 --grad-clip 3.0`, `--fake-lr 2e-5 --fake-grad-clip 1.0`, `--weight-decay 0.01`, `--ema 0.999`: eDMD's optimizer settings. **Untested here**: the runs so far used `--lr 2e-5 --grad-clip 1.0 --ema 0.99`.
+- `--accum 8`: the one thing the 32 GB runs could not afford. Raise it if the timing allows.
+
+**5. Watch it.** `kind=dir_eval` prints every 25 steps; `log.jsonl` has one line per step (written in batches of ten).
+
+- Stop if the first iteration inflates: eval `hat_real[0]` at 0.21 or more (0.166 at step 0), or `hat_rms` on `r = 0` steps trending above 1.12.
+- `motion` in the eval should fall from 0.44 (final iteration) toward the 20-step sampler's 0.23. In the latest run it reached 0.34 at step 50 and 0.23 at step 75. A falling score is not proof: check the renders for blur and stills.
+
+**6. Score it.** The same-noise distance to a 20-step clip falls whenever an output shrinks, so use the seed-spread yardstick (8 held-out prompts × 4 seeds, latent only):
+
+```bash
+Y=(--out lot/runs/yardstick --swap 0)
+python3 lot/yardstick_dir_h3.py $Y --name dense --dense
+python3 lot/yardstick_dir_h3.py $Y --name turbo --run lot/runs/turbo4_init
+python3 lot/yardstick_dir_h3.py $Y --name s200 --run lot/runs/dir_turbo_clip --tag 200 --ema
+python3 lot/yardstick_dir_h3.py --out lot/runs/yardstick --report dense turbo s200
+```
+
+| 32 GB card, 12-frame 32×48 latents | Motion | Detail | Size (rms) |
+|---|---|---|---|
+| H3, 20 steps | 0.25 | 0.35 | 1.08 |
+| Turbo 4-step | 0.47 | 0.43 | 1.04 |
+
+**Score every name on the same card with the same `--swap`.** The same noise gives visibly different clips on two cards (one prompt's Turbo motion: 0.06 on the 5090 at `--swap 4`, 0.50 on a PRO 4000 at `--swap 18`), so paired differences across cards are not paired.
+
+A run is worth publishing when motion is below Turbo's by more than two standard errors, detail and size have not moved further from the 20-step row, and the renders (`probe_dir_h3.py`, commands above) are as sharp and on-prompt as Turbo's by eye. No run meets all three yet.
+
+**Reproduce the latest run exactly** (`dir_turbo_clip_iter`, 2026-11-17, RTX 5090 32 GB, 72 s per step, 29.8 GB peak):
+
+```bash
+LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --sigmas turbo --zero-init --frames 12 \
+  --fake-source iteration --tau-max 0.9 --dmd-weight norm --grad-clip 1.0 --ema 0.99 --lr 2e-5 \
+  --rank 128 --fake-rank 64 --max-latent-hw 32 48 --swap 6 --dmd-draws 4 --fake-warmup 100 --accum 2 \
+  --steps 100 --eval-every 25 --save-every 25 --eval-anchors --holdout 8 --seed 0 --out lot/runs/dir_turbo_clip_iter
+```
+
+Held-out eval of that run, final iteration: motion 0.44 → 0.37 → 0.34 → 0.23 at steps 0 / 25 / 50 / 75 (20-step H3: 0.23), gap to the teacher's answer 0.117 → 0.129 → 0.133 → 0.133. Its step-50 renders are sharp but busier than Turbo's, with no less pixel motion on three clips; steps 75 and 100 are not yet rendered, and the same-card yardstick for all four checkpoints is pending. Its weights are not published; with the same cache, seed and commit the command above retrains them in about 2.5 hours.
+
+**A 96 GB card** (RTX PRO 6000) runs the same commands. Use the headroom for `--max-latent-hw 48 48` or a larger `--accum`, not a larger rank.
+
 ### Why the paper's init matters (r = 4 ≈ r = 1 before)
 
 In every run before run D, r = 4 looked like r = 1 ([dir-diffusion#2](https://github.com/scrya-com/dir-diffusion/issues/2)). The main cause was ours, not the paper's: we initialised the added parameters at **zero** (now `--zero-init`), so that step 0 equals H3 exactly. The previous estimate's only path, `DirHead.x0_proj`, then starts dead and grows at most about one learning rate per Adam step. The paper initialises it like SiT's input projection (Xavier, no bias) and the r embeddings from N(0, 0.02). That's now the default (`--paper-init`), together with the paper's `--r-schedule mod` and `--betas 0 0.95`. The table in section 4 lists every default.

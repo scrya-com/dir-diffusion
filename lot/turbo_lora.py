@@ -14,7 +14,8 @@ truncated SVD of its delta, and the energy kept per block is reported (about 0.9
 Every output module has ``alpha = rank`` (scale 1) with the Turbo scale folded into the weights,
 so ``make_lora(dit, rank)`` loads it unchanged. The output dir holds only ``lora_gen.safetensors``
 (no ``dir_head.pt``): the DiR head starts at zero, so at step 0 the generator is Turbo's own first
-step at sigma = 1 at every iteration.
+step at sigma = 1 at every iteration. ``--run-dir`` adds a zero ``dir_head.pt`` and a ``config.json`` with
+Turbo's sigmas, which makes the directory an untrained run: Turbo's 4-step sampler.
 """
 
 from __future__ import annotations
@@ -76,6 +77,9 @@ def main() -> None:
     parser.add_argument("lora", type=Path, help="Turbo ComfyUI LoRA (.safetensors)")
     parser.add_argument("--rank", type=int, default=128)
     parser.add_argument("--out", type=Path, required=True, help="directory for lora_gen.safetensors")
+    parser.add_argument("--run-dir", action="store_true",
+                        help="also write a zero dir_head.pt and a config.json (sigmas 'turbo'), so the directory "
+                             "loads as an untrained run in probe_dir_h3.py, yardstick_dir_h3.py and render_dir_h3.py")
     args = parser.parse_args()
     from safetensors.torch import save_file
 
@@ -86,6 +90,18 @@ def main() -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     save_file(weights, str(args.out / "lora_gen.safetensors"),
               {"rank": str(args.rank), "source": args.lora.name, "lot_h3": "turbo_init"})
+    if args.run_dir:
+        import json
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from dir_h3 import DirHead
+
+        hidden, temb_dim, iters = 5376, 8, 4            # H3's width, the trainer's iteration-embedding width, R
+        torch.save(DirHead(hidden, temb_dim, iters).state_dict(), args.out / "dir_head.pt")
+        (args.out / "config.json").write_text(json.dumps(
+            {"iters": iters, "schedule": "dense", "rank": args.rank, "temb_dim": temb_dim, "hidden": hidden,
+             "sigmas": "turbo", "mix_state": False, "source": args.lora.name}, indent=1))
     energies = sorted(report["energy"].values())
     print(f"LOT_H3 kind=turbo_convert modules={modules} rank={args.rank} dropped={len(report['dropped'])} "
           f"qkv_energy_min={energies[0]:.3f} median={energies[len(energies) // 2]:.3f} out={args.out} ok=1", flush=True)
