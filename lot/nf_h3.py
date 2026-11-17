@@ -530,6 +530,27 @@ def _segments(codes: list[tuple[int, int]]):
     return _packing()._build_modulation_segments(indices)
 
 
+def _delta_row(temb: torch.Tensor, codes: dict, video_index: int, delta: torch.Tensor | None):
+    """DiR's iteration embedding (``h3_musubi._lot_forward``'s ``video_temb_delta``): a NEW timestep row
+    ``temb[video] + delta`` used by the target-video rows and the final layer's video head only. Text,
+    reference and audio rows keep their rows."""
+    if delta is None:
+        return temb, codes, video_index
+    new_index = temb.shape[0]
+    row = temb[video_index].float() + delta.to(device=temb.device, dtype=torch.float32)
+    temb = torch.cat([temb, row.to(temb.dtype).unsqueeze(0)], dim=0)
+    return temb, {**codes, "video": 3 * new_index}, new_index
+
+
+def _add_extra(video_rows: torch.Tensor, extra: torch.Tensor | None) -> torch.Tensor:
+    """DiR's previous-estimate embedding, added to the embedded target-video rows (``video_extra``)."""
+    if extra is None:
+        return video_rows
+    if tuple(extra.shape) != tuple(video_rows.shape):
+        raise ValueError(f"video_extra {tuple(extra.shape)} != video rows {tuple(video_rows.shape)}")
+    return video_rows + extra.to(device=video_rows.device, dtype=video_rows.dtype)
+
+
 def silence(count: int, sigma_a: float, device, generator=None) -> torch.Tensor:
     """``(1, 32, 2, count)`` silent audio noised to ``sigma_a`` (``h3_musubi._silence`` for any count)."""
     return sigma_a * torch.randn(1, AUDIO_CHANNELS, 2, count, device=device, generator=generator)
@@ -539,7 +560,8 @@ def silence(count: int, sigma_a: float, device, generator=None) -> torch.Tensor:
 
 def nf_forward(dit, latent: torch.Tensor, t, text: torch.Tensor, *, config: NFConfig = DENSE,
                convkv: ConvKV | None = None, first: torch.Tensor | None = None, audio: torch.Tensor | None = None,
-               audio_t: float | None = None, audio_generator: torch.Generator | None = None) -> torch.Tensor:
+               audio_t: float | None = None, audio_generator: torch.Generator | None = None,
+               video_extra: torch.Tensor | None = None, video_temb_delta: torch.Tensor | None = None) -> torch.Tensor:
     """H3's velocity (``x0 - eps``) for a whole clip ``(1, 24, T, H, W)`` at cleanness ``t`` (eq. 4).
 
     Every frame of ``latent`` is at the same step; ``config`` says what each block reads. With
@@ -549,6 +571,9 @@ def nf_forward(dit, latent: torch.Tensor, t, text: torch.Tensor, *, config: NFCo
     Driving audio (``c_audio`` of eq. 1): pass the clean H3 audio latent as ``audio`` with
     ``audio_t=AUDIO_CLEAN``; the audio rows then carry the clean-condition timestep instead of the
     video's noise level, and each block reads the audio of its own time span.
+    ``video_extra`` ``(1, T * rows, hidden)`` and ``video_temb_delta`` ``(temb_dim,)`` are the two hooks of
+    ``h3_musubi.forward_video`` (DiR's previous estimate and iteration embedding); with ``config=DENSE``
+    and no ``first`` this is ``forward_video`` with the same hooks.
     """
     if latent.ndim != 5 or latent.shape[0] != 1:
         raise ValueError(f"latent must be (1, 24, T, H, W), got {tuple(latent.shape)}")
@@ -566,10 +591,10 @@ def nf_forward(dit, latent: torch.Tensor, t, text: torch.Tensor, *, config: NFCo
     if audio.shape[-1] != total_audio:
         raise ValueError(f"audio has {audio.shape[-1]} frames, expected {total_audio}")
     prefix, audio_rows, video_rows = _embed(dit, text, first, audio, latent)
-    hidden = torch.cat([prefix, audio_rows, video_rows], dim=1)
+    hidden = torch.cat([prefix, audio_rows, _add_extra(video_rows, video_extra)], dim=1)
     unique, codes, video_index, _audio_index = timestep_table(
         t_video, 1.0 - sigma_a if audio_t is None else float(audio_t), first is not None)
-    temb = dit._timestep_embeddings(unique, device)
+    temb, codes, video_index = _delta_row(dit._timestep_embeddings(unique, device), codes, video_index, video_temb_delta)
     rows_per_frame = geometry.frame_rows
     segments = _segments([(geometry.text_length, codes["text"]), (rows_per_frame if first is not None else 0, codes.get("first", 0)),
                           (2 * total_audio, codes["audio"]), (latent_t * rows_per_frame, codes["video"])])
@@ -631,7 +656,8 @@ class NFStream:
 
     @torch.no_grad()
     def velocity(self, index: int, step: int, x: torch.Tensor, t, text: torch.Tensor, audio: torch.Tensor,
-                 audio_t: float | None = None) -> torch.Tensor:
+                 audio_t: float | None = None, video_extra: torch.Tensor | None = None,
+                 video_temb_delta: torch.Tensor | None = None) -> torch.Tensor:
         dit, config = self.dit, self.config
         if text.ndim == 2:
             text = text.unsqueeze(0)
@@ -650,10 +676,11 @@ class NFStream:
         fresh = self._text[step] is not text
         self._text[step] = text
         prefix, audio_rows, video_rows = _embed(dit, text if fresh else None, self.first if fresh else None, audio, x)
-        hidden = torch.cat(([prefix] if fresh else []) + [audio_rows, video_rows], dim=1)
+        hidden = torch.cat(([prefix] if fresh else []) + [audio_rows, _add_extra(video_rows, video_extra)], dim=1)
         unique, codes, video_index, _audio_index = timestep_table(
             t_video, 1.0 - sigma_a if audio_t is None else float(audio_t), self.first is not None)
-        temb = dit._timestep_embeddings(unique, device)
+        temb, codes, video_index = _delta_row(dit._timestep_embeddings(unique, device), codes, video_index,
+                                              video_temb_delta)
         rows_per_frame = geometry.frame_rows
         count = geometry.prefix_rows if fresh else 0
         layout = [(2 * (a1 - a0), codes["audio"]), ((stop - start) * rows_per_frame, codes["video"])]
@@ -718,8 +745,10 @@ def nf_stream_sample(dit, text, blocks: int, *, lat_h: int, lat_w: int, config: 
     ``audio`` ``(1, 32, 2, A)`` is clean driving audio covering every block (default: silent noise).
     """
     steps = len(sigmas) - 1
+    # A stream of a known number of blocks is a clip of known length: its last block takes what is left of
+    # H3's audio length for that clip (for 2 or 5 blocks that is one audio frame fewer than its time span).
     stream = NFStream(dit, lat_h=lat_h, lat_w=lat_w, steps=steps, config=config, convkv=convkv, first=first,
-                      cache_device=cache_device, total_frames=total_frames)
+                      cache_device=cache_device, total_frames=total_frames or config.frames(blocks))
     out = []
     for index in range(blocks):
         start, stop = config.span(index)
@@ -779,10 +808,85 @@ def nf_parallel_sample(dit, text, latent_t: int, *, lat_h: int, lat_w: int, conf
     return x
 
 
+# ------------------------------------------------- DiR under Neighbor Forcing (not in the paper)
+
+def dir_step(dit, head, state: torch.Tensor, estimate: torch.Tensor, r: int, text, sigma: float, *,
+             config: NFConfig, convkv: ConvKV | None = None, first: torch.Tensor | None = None,
+             audio: torch.Tensor | None = None, audio_generator=None) -> torch.Tensor:
+    """One DiR iteration ``x0_hat[r+1] = G(x0_hat[r], z, r)`` on a whole clip under ``config``:
+    ``dir_h3.generator_step`` (dense) with the block-causal reads. Every block is at iteration ``r``."""
+    from dir_h3 import estimate_extra
+
+    out = nf_forward(dit, state, 1.0 - sigma, text, config=config, convkv=convkv, first=first, audio=audio,
+                     audio_generator=audio_generator, video_extra=estimate_extra(head, estimate, None),
+                     video_temb_delta=head.r_embed[r])
+    return state.float() + sigma * out.float()
+
+
+def _dir_audio(noise: NoiseBank, config: NFConfig, latent_t: int, sigma: float, lat_h: int, lat_w: int) -> torch.Tensor:
+    """DiR draws the silent-audio noise once per sample and rescales it per iteration."""
+    return float(audio_sigma(sigma)) * parallel_noise(noise, config, latent_t, 0, lat_h, lat_w)[1]
+
+
+def nf_dir_parallel_sample(dit, head, text, latent_t: int, *, lat_h: int, lat_w: int, config: NFConfig, sigmas,
+                           noise: NoiseBank, mix_state: bool = False, convkv: ConvKV | None = None,
+                           first: torch.Tensor | None = None, stop_iter: int | None = None):
+    """``R = len(sigmas)`` DiR iterations of a whole clip, one masked pass each (``dir_h3.dir_sample`` with
+    the causal reads). Returns the final estimate, or with ``stop_iter=r`` what enters iteration ``r``:
+    ``(state, estimate, audio)``. ``mix_state``: the DiR run's state law (see ``dir_h3.next_state``)."""
+    from dir_h3 import next_state
+
+    z = parallel_noise(noise, config, latent_t, 0, lat_h, lat_w)[0]
+    state, estimate = z, torch.zeros_like(z)
+    for r, sigma in enumerate(float(s) for s in sigmas):
+        audio = _dir_audio(noise, config, latent_t, sigma, lat_h, lat_w)
+        if stop_iter is not None and r == stop_iter:
+            return state, estimate, audio
+        estimate = dir_step(dit, head, state, estimate, r, text, sigma, config=config, convkv=convkv, first=first,
+                            audio=audio)
+        if r + 1 < len(sigmas):
+            state = next_state(state, estimate, sigma, float(sigmas[r + 1]), z if mix_state else None)
+    return estimate
+
+
+@torch.no_grad()
+def nf_dir_stream_sample(dit, head, text, blocks: int, *, lat_h: int, lat_w: int, config: NFConfig, sigmas,
+                         noise: NoiseBank, mix_state: bool = False, convkv: ConvKV | None = None,
+                         first: torch.Tensor | None = None, cache_device=None, total_frames: int | None = None,
+                         on_block=None) -> torch.Tensor:
+    """A streamed DiR generator: each block runs its ``R`` iterations from its own noise, and at iteration
+    ``r`` reads the keys and values earlier blocks wrote at iteration ``r`` (Neighbor Forcing's same-step
+    rule with "step" = DiR iteration; one cache per iteration), with the ConvKV window from block 2 on."""
+    from dir_h3 import estimate_extra, next_state
+
+    stream = NFStream(dit, lat_h=lat_h, lat_w=lat_w, steps=len(sigmas), config=config, convkv=convkv, first=first,
+                      cache_device=cache_device, total_frames=total_frames or config.frames(blocks))
+    out = []
+    for index in range(blocks):
+        start, stop = config.span(index)
+        a0, a1 = stream.audio_span(index)
+        prompt = text(index) if callable(text) else text
+        z = noise.video(index, 0, stop - start, lat_h, lat_w)
+        unit = noise.audio(index, 0, a1 - a0)
+        state, estimate = z, torch.zeros_like(z)
+        for r, sigma in enumerate(float(s) for s in sigmas):
+            velocity = stream.velocity(index, r, state, 1.0 - sigma, prompt, float(audio_sigma(sigma)) * unit,
+                                       video_extra=estimate_extra(head, estimate, None), video_temb_delta=head.r_embed[r])
+            estimate = state.float() + sigma * velocity.float()
+            if r + 1 < len(sigmas):
+                state = next_state(state, estimate, sigma, float(sigmas[r + 1]), z if mix_state else None)
+        out.append(estimate)
+        if on_block is not None:
+            on_block(index, estimate)
+    return torch.cat(out, dim=2)
+
+
 # --------------------------------------------------------------------------------- saving
 
-def save_nf_run(run_dir, tag: str, *, gen_network, fake_network, convkv: ConvKV | None, meta: dict) -> None:
-    """``lora_gen{tag}.safetensors``, ``lora_fake{tag}.safetensors`` (Stage 2), ``convkv{tag}.pt`` and ``config.json``."""
+def save_nf_run(run_dir, tag: str, *, gen_network, fake_network, convkv: ConvKV | None, meta: dict,
+                head=None, fake_head=None) -> None:
+    """``lora_gen{tag}.safetensors``, ``lora_fake{tag}.safetensors`` (Stage 2), ``convkv{tag}.pt`` and ``config.json``;
+    for a DiR run also ``dir_head{tag}.pt`` and ``dir_fake_head{tag}.pt``."""
     import json
     from pathlib import Path
 
@@ -793,9 +897,13 @@ def save_nf_run(run_dir, tag: str, *, gen_network, fake_network, convkv: ConvKV 
                                  {"lot_h3": "nf", "kind": "gen", "rank": str(meta["rank"])})
     if fake_network is not None:
         fake_network.save_weights(str(run_dir / f"lora_fake{tag}.safetensors"), torch.bfloat16,
-                                  {"lot_h3": "nf", "kind": "fake", "rank": str(meta["rank"])})
+                                  {"lot_h3": "nf", "kind": "fake", "rank": str(meta.get("fake_rank", meta["rank"]))})
     if convkv is not None:
         torch.save(convkv.state_dict(), run_dir / f"convkv{tag}.pt")
+    if head is not None:
+        torch.save(head.state_dict(), run_dir / f"dir_head{tag}.pt")
+    if fake_head is not None:
+        torch.save(fake_head.state_dict(), run_dir / f"dir_fake_head{tag}.pt")
     (run_dir / "config.json").write_text(json.dumps(meta, indent=1))
 
 
@@ -826,3 +934,14 @@ def load_nf_run(run_dir, dit, *, tag: str = "", device="cuda"):
         convkv.load_state_dict(torch.load(conv_file, map_location="cpu", weights_only=True))
         convkv.to(device).eval()
     return network, convkv, meta
+
+
+def load_nf_dir_head(run_dir, meta: dict, *, tag: str = "", device="cuda"):
+    """The ``DirHead`` of a DiR-under-Neighbor-Forcing run (``meta["dir"]``), in eval mode."""
+    from pathlib import Path
+
+    from dir_h3 import DirHead
+
+    head = DirHead(int(meta["hidden"]), int(meta["temb_dim"]), int(meta["iters"]))
+    head.load_state_dict(torch.load(Path(run_dir) / f"dir_head{tag}.pt", map_location="cpu", weights_only=True))
+    return head.to(device).eval().requires_grad_(False)

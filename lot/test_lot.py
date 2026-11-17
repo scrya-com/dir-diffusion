@@ -1631,6 +1631,276 @@ def test_nf_trainer_updates_on_cpu():
         assert grad_sum(gen_params) == 0.0 and grad_sum(list(convkv.parameters())) == 0.0
 
 
+def test_nf_memory_independent_reference():
+    """The reviewer's independent re-derivation of the ConvKV forward (stock layout and position grid, own
+    index arithmetic, einsum instead of Conv1d, the release's recursive fold) against ``nf_forward``, 8 blocks."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_memory_independent_reference: musubi_tuner not importable", flush=True)
+        return
+    import torch.nn.functional as F
+    from h3_musubi import _silence, audio_frames, pixel_frames
+    from musubi_tuner.minimax_h3 import model as h3_model
+    from musubi_tuner.minimax_h3.packing import build_position_grid
+    from nf_h3 import ConvKV, NFConfig, nf_forward
+
+    torch.manual_seed(1)
+    T, H, W, FR = 62, 4, 6, 6          # 6 + 8 * 7 = 5 * 12 + 2: the stock layout accepts it
+    z, text = torch.randn(1, 24, T, H, W), torch.randn(1, 5, 16)
+    audio = _silence(T, 0.7, "cpu", torch.Generator().manual_seed(3))
+    A = audio_frames(T)
+    convkv = ConvKV.for_dit(dit)
+    with torch.no_grad():
+        for layer in convkv.layers:
+            layer.memory_proj_k.weight.normal_(0.2, 0.2)
+    spans = [(0, 6)] + [(6 + 8 * i, 14 + 8 * i) for i in range(7)]
+    for first in (None, torch.randn(1, 24, 1, H, W)):
+        P = 5 + (FR if first is not None else 0)
+        vb = P + 2 * A
+        with torch.no_grad():
+            _out, layout = _nf_stock(dit, z, 0.4, text, first, audio)
+        pos = build_position_grid(layout)[0].double()
+        ftime = [float(pos[vb + f * FR, 0] - pos[vb, 0]) for f in range(T)]
+
+        def rot(x, p):
+            return h3_model._apply_rope_split_half(x, dit._rotation_table(p.unsqueeze(0), x.dtype))
+
+        def att(q, k, v):
+            o = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+            return o.transpose(1, 2).reshape(1, q.shape[1], -1)
+
+        def make(attn, w):
+            shape = (attn.num_heads, attn.head_dim)
+
+            def conv5(x):      # (5 frames * FR rows, heads, dim) frame-major -> (FR, heads, dim)
+                return torch.einsum("fpc,cf->pc", x.reshape(5, FR, -1), w[:, 0, :]).reshape(FR, *shape)
+
+            def vid(f0, f1):
+                return slice(vb + f0 * FR, vb + f1 * FR)
+
+            def frame_pos(f, shift=0.0):
+                return torch.cat([pos[vid(f, f + 1), :1] - shift, pos[vid(f, f + 1), 1:]], dim=1)
+
+            def forward(hidden, rotation=None):
+                n = hidden.shape[1]
+                q, k, v = attn.qkv_proj(hidden).split(attn.inner_dim, dim=-1)
+                q = attn.q_norm(q.reshape(1, n, *shape))
+                k = attn.k_norm(k.reshape(1, n, *shape))
+                v = v.reshape(1, n, *shape)
+                out = torch.zeros(1, n, attn.inner_dim)
+                pk = rot(k[:, :P], pos[:P])
+                out[:, :P] = att(rot(q[:, :P], pos[:P]), pk, v[:, :P])
+                longs = None
+                for b, (s, e) in enumerate(spans):
+                    a0 = -(-5 * pixel_frames(s) // 3)
+                    a1 = A if e >= T else -(-5 * pixel_frames(e) // 3)
+                    rows = torch.cat([torch.arange(P + a0, P + a1), torch.arange(P + A + a0, P + A + a1),
+                                      torch.arange(vb + s * FR, vb + e * FR)])
+                    shift = 0.0 if b < 2 else ftime[s - 2] - ftime[4]
+                    own = pos[rows].clone()
+                    own[:, 0] -= shift
+                    keys, vals = [pk], [v[:, :P]]
+                    if b == 1:
+                        keys.append(rot(k[:, vid(0, 6)], pos[vid(0, 6)]))
+                        vals.append(v[:, vid(0, 6)])
+                    if b >= 2:
+                        if b == 2:      # raw frames 2..11 -> two slots
+                            src_k, src_v = k[0, vid(2, 12)], v[0, vid(2, 12)]
+                        else:           # [L0 L1 S0 S1 C0..C5] of the previous window
+                            ps = spans[b - 1][0]
+                            src_k = torch.cat([longs[0], longs[2], k[0, vid(ps - 2, ps + 6)]])
+                            src_v = torch.cat([longs[1], longs[3], v[0, vid(ps - 2, ps + 6)]])
+                        longs = (conv5(src_k[:5 * FR]), conv5(src_v[:5 * FR]), conv5(src_k[5 * FR:]), conv5(src_v[5 * FR:]))
+                        ck = torch.cat([k[0, vid(0, 2)], longs[0], longs[2], k[0, vid(s - 2, s)]])[None]
+                        cv = torch.cat([v[0, vid(0, 2)], longs[1], longs[3], v[0, vid(s - 2, s)]])[None]
+                        cp = torch.cat([frame_pos(0), frame_pos(1), frame_pos(2), frame_pos(3),
+                                        frame_pos(s - 2, shift), frame_pos(s - 1, shift)])
+                        keys.append(rot(ck, cp))
+                        vals.append(cv)
+                    keys.append(rot(k[:, rows], own))
+                    vals.append(v[:, rows])
+                    out[:, rows] = att(rot(q[:, rows], own), torch.cat(keys, 1), torch.cat(vals, 1))
+                return attn.out_proj(out)
+            return forward
+
+        config = NFConfig(memory=True)
+        with torch.no_grad():
+            got = nf_forward(dit, z, 0.4, text, config=config, convkv=convkv, first=first, audio=audio)
+            for layer, conv in zip(dit.blocks, convkv.layers):
+                layer.attn.forward = make(layer.attn, conv.memory_proj_k.weight)
+            try:
+                reference, _layout = _nf_stock(dit, z, 0.4, text, first, audio)
+            finally:
+                for layer in dit.blocks:
+                    del layer.attn.forward
+            assert float((got - reference).abs().max()) < 1e-4 * max(1.0, float(got.abs().mean())), first is None
+            for s, e in spans[2::3]:        # no future leak in memory mode
+                moved = z.clone()
+                moved[:, :, s:e] += torch.randn(1, 24, e - s, H, W)
+                out = nf_forward(dit, moved, 0.4, text, config=config, convkv=convkv, first=first, audio=audio)
+                assert torch.equal(out[:, :, :s], got[:, :, :s])
+
+
+def _dir_head(dit, iterations=4, seed=0):
+    from dir_h3 import DirHead, probe_temb_dim
+
+    return DirHead(dit.config.hidden_size, probe_temb_dim(dit), iterations).paper_init(torch.Generator().manual_seed(seed))
+
+
+def test_nf_dir_hooks_and_samplers():
+    """DiR under Neighbor Forcing (not in the paper): the hooked forward with every row visible is
+    ``dir_h3``'s generator / fake forward; the streamed DiR sampler (one cache per iteration) equals the one-pass
+    sampler with and without ConvKV and for both state laws; later blocks never reach earlier ones."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_dir_hooks_and_samplers: musubi_tuner not importable", flush=True)
+        return
+    from dir_h3 import DirFakeHead, estimate_extra, fake_x0, generator_step, probe_temb_dim
+    from h3_musubi import audio_frames
+    from nf_h3 import (DENSE, ConvKV, Geometry, NFConfig, NoiseBank, dir_step, nf_dir_parallel_sample,
+                       nf_dir_stream_sample, nf_forward, nf_stream_sample, NFStream)
+
+    head = _dir_head(dit)
+    text = torch.randn(1, 5, 16)
+    z, estimate = torch.randn(1, 24, 22, 4, 6), torch.randn(1, 24, 22, 4, 6)
+    sigmas = [1.0, 0.947, 0.857, 0.667]
+    with torch.no_grad():
+        # (a) dense + hooks == dir_h3
+        for r, sigma in enumerate(sigmas):
+            stock = generator_step(dit, head, z, estimate, r, text, sigma=sigma, audio_generator=torch.Generator().manual_seed(3))
+            mine = dir_step(dit, head, z, estimate, r, text, sigma, config=DENSE, audio_generator=torch.Generator().manual_seed(3))
+            assert float((mine - stock).abs().max()) < 1e-6, r
+        fake_head = DirFakeHead(probe_temb_dim(dit), 4).paper_init(torch.Generator().manual_seed(1))
+        stock = fake_x0(dit, fake_head, z, 0.6, 3, text, audio_generator=torch.Generator().manual_seed(3))
+        mine = z + 0.6 * nf_forward(dit, z, 0.4, text, audio_generator=torch.Generator().manual_seed(3),
+                                    video_temb_delta=fake_head.fake_r_embed[3])
+        assert float((mine - stock).abs().max()) < 1e-6
+        # the hooks do something, and only to the video rows' path
+        plain = nf_forward(dit, z, 0.4, text, config=NFConfig(), audio_generator=torch.Generator().manual_seed(3))
+        hooked = nf_forward(dit, z, 0.4, text, config=NFConfig(), audio_generator=torch.Generator().manual_seed(3),
+                            video_extra=estimate_extra(head, estimate, None), video_temb_delta=head.r_embed[1])
+        assert float((hooked - plain).abs().max()) > 1e-3
+        # (c) with the hooks on, a later block's state and estimate cannot reach an earlier block
+        config = NFConfig(memory=True)
+        convkv = ConvKV.for_dit(dit)
+        for layer in convkv.layers:
+            layer.memory_proj_k.weight.normal_(0.2, 0.2)
+        audio = torch.randn(1, 32, 2, audio_frames(22)) * 0.1
+        base = dir_step(dit, head, z, estimate, 2, text, sigmas[2], config=config, convkv=convkv, audio=audio)
+        for start, stop in config.spans(22)[1:]:
+            z2, e2 = z.clone(), estimate.clone()
+            z2[:, :, start:stop] += torch.randn(1, 24, stop - start, 4, 6)
+            e2[:, :, start:stop] += torch.randn(1, 24, stop - start, 4, 6)
+            out = dir_step(dit, head, z2, e2, 2, text, sigmas[2], config=config, convkv=convkv, audio=audio)
+            assert torch.equal(out[:, :, :start], base[:, :, :start])
+            assert float((out[:, :, start:stop] - base[:, :, start:stop]).abs().max()) > 1e-3
+        e2 = estimate.clone()
+        e2[:, :, 14:] += 1.0            # the estimate alone, through x0_proj
+        out = dir_step(dit, head, z, e2, 2, text, sigmas[2], config=config, convkv=convkv, audio=audio)
+        assert torch.equal(out[:, :, :14], base[:, :, :14]) and not torch.equal(out[:, :, 14:], base[:, :, 14:])
+    # (b) stream == one-pass, 4 blocks
+    frames = NFConfig().frames(4)
+    for memory in (False, True):
+        config = NFConfig(memory=memory)
+        for mix_state in (False, True):
+            kwargs = dict(lat_h=4, lat_w=6, config=config, sigmas=sigmas, noise=NoiseBank(3, "cpu"), mix_state=mix_state,
+                          convkv=convkv if memory else None)
+            with torch.no_grad():
+                parallel = nf_dir_parallel_sample(dit, head, text, frames, **kwargs)
+                state, estimate_in, _audio = nf_dir_parallel_sample(dit, head, text, frames, stop_iter=2, **kwargs)
+            streamed = nf_dir_stream_sample(dit, head, text, 4, **kwargs)
+            assert streamed.shape == (1, 24, frames, 4, 6) and bool(torch.isfinite(streamed).all())
+            assert float((streamed - parallel).abs().max()) < 1e-4, (memory, mix_state)
+            assert state.shape == estimate_in.shape == streamed.shape and float(estimate_in.abs().max()) > 0
+        other = nf_dir_stream_sample(dit, head, text, 4, **{**kwargs, "mix_state": False})
+        assert float((other - streamed).abs().max()) > 1e-4      # the state law matters
+    # a stream of N blocks is a clip of known length: its audio is H3's for that length (2 and 5 blocks used to
+    # get one audio frame too many)
+    for blocks in (2, 3, 5):
+        total = NFConfig().frames(blocks)
+        stream = NFStream(dit, lat_h=4, lat_w=6, steps=1, config=NFConfig(), total_frames=total)
+        assert stream.audio_span(blocks - 1)[1] == audio_frames(total)
+        out = nf_stream_sample(dit, text, blocks, lat_h=4, lat_w=6, config=NFConfig(), sigmas=[1.0, 0.5, 0.0],
+                               noise=NoiseBank(0, "cpu"))
+        assert out.shape[2] == total
+    assert Geometry.audio_span(6, 14)[1] == audio_frames(14) + 1
+
+
+def test_nf_dir_trainer_on_cpu():
+    """The DiR-generator Stage 2 update on the toy H3: gradient reaches the generator LoRA, the DirHead and
+    ConvKV and not the fake side; the fake update the reverse; and the DMD target points toward the real model
+    (this fails if the sign is flipped, which the loss value alone cannot show)."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_dir_trainer_on_cpu: musubi_tuner not importable", flush=True)
+        return
+    import argparse
+
+    import train_nf_h3
+    from dir_h3 import DirFakeHead, probe_temb_dim
+    from h3_musubi import make_lora
+    from nf_h3 import ConvKV
+    from train_nf_h3 import NFRun, dmd_target, grad_sum, zero_grads
+
+    # the sign, on numbers: real says "up", fake says "down" -> the target is above the sample
+    sample, real, fake = torch.zeros(4), torch.ones(4), -torch.ones(4)
+    assert bool((dmd_target(sample, real, fake) > sample).all()) and bool((dmd_target(sample, fake, real) < sample).all())
+    assert torch.allclose(dmd_target(sample, real, fake), torch.full((4,), 2.0))      # (real - fake) / mean|x - real|
+
+    gen_net, fake_net = make_lora(dit, 2), make_lora(dit, 2)
+    for net in (gen_net, fake_net):
+        net.requires_grad_(True)
+    with torch.no_grad():
+        for module in gen_net.unet_loras + fake_net.unet_loras:
+            module.lora_up.weight.normal_(0.0, 0.05)        # a trained generator and a fake that differs from the base
+    head = _dir_head(dit)
+    fake_head = DirFakeHead(probe_temb_dim(dit), 4).paper_init(torch.Generator().manual_seed(1))
+    convkv = ConvKV.for_dit(dit)
+    lora_params, fake_params = list(gen_net.parameters()), list(fake_net.parameters()) + list(fake_head.parameters())
+    head_params, conv_params = [p for p in head.parameters() if p.requires_grad], list(convkv.parameters())
+    x0, text = torch.randn(1, 24, 22, 4, 6), torch.randn(1, 5, 16)
+    recorded = []
+    original = train_nf_h3.dmd_target
+
+    def recording(x0_hat, real, fake):
+        target = original(x0_hat, real, fake)
+        recorded.append((x0_hat, real, fake, target))
+        return target
+
+    train_nf_h3.dmd_target = recording
+    try:
+        for fake_source, mix_state, ref in (("final", False, "none"), ("iteration", True, "first")):
+            args = argparse.Namespace(stage=2, blocks=[6, 8], ref=ref, sigmas="1,0.75,0.5", sampler_shift=12.0,
+                                      sampler="renoise", sigma_shift=1.0, tau_shift="beta:2.5", audio="silent")
+            meta = {"sigmas": [1.0, 0.947, 0.857, 0.667], "mix_state": mix_state, "fake_source": fake_source}
+            run = NFRun(dit, gen_net, fake_net, convkv, args, "cpu", head=head, fake_head=fake_head, dir_meta=meta)
+            assert all(0.02 <= run.draw_tau() <= 0.98 for _ in range(20))
+            for r in (0, 3):
+                zero_grads(lora_params + fake_params + head_params + conv_params)
+                loss, sample, stats = run.dir_generator_update(x0, text, r)
+                assert math.isfinite(stats["loss"]) and stats["match"] < 1e-5 and stats["gap"] > 0 and stats["r"] == r
+                assert grad_sum(lora_params) > 0 and grad_sum(conv_params) > 0 and grad_sum(fake_params) == 0.0
+                assert grad_sum(head_params) > 0
+                x0_hat, real, fake, target = recorded[-1]
+                assert float(((target - x0_hat) * (real - fake)).sum()) > 0          # toward real, away from fake
+                assert abs(stats["loss"] - 0.5 * float((x0_hat - target).pow(2).mean())) < 1e-6
+                zero_grads(lora_params + head_params + conv_params)
+                floss, tau = run.dir_fake_update(sample)
+                assert math.isfinite(float(floss)) and grad_sum(fake_params) > 0 and 0.02 <= tau <= 0.98
+                assert grad_sum(lora_params) == 0.0 and grad_sum(head_params) == 0.0 and grad_sum(conv_params) == 0.0
+            result = run.dir_eval([], 22)
+            assert result["real_gap"] == 0 and len(result["real_gap_blocks"]) == 3
+        # the paper-form Stage 2 update goes through the same target
+        count = len(recorded)
+        args.ref = "first"
+        plain = NFRun(dit, gen_net, fake_net, convkv, args, "cpu")
+        plain.generator_update(x0, text, exit_step=2)
+        x0_hat, real, fake, target = recorded[-1]
+        assert len(recorded) == count + 1 and float(((target - x0_hat) * (real - fake)).sum()) > 0
+    finally:
+        train_nf_h3.dmd_target = original
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -1682,6 +1952,9 @@ def main():
         test_nf_convkv_memory,
         test_nf_stream_equals_parallel,
         test_nf_trainer_updates_on_cpu,
+        test_nf_memory_independent_reference,
+        test_nf_dir_hooks_and_samplers,
+        test_nf_dir_trainer_on_cpu,
     ]
     for test in tests:
         test()

@@ -15,6 +15,9 @@ GPU script is alive):
 (e) the same with the ConvKV context (mean-initialised and a perturbed convolution), where the third
     block reads 2 reference + 2 long-term + 2 short-term frame slots.
 (f) a 4-block, 3-step stream with ConvKV is finite and its cache does not grow after block 1.
+(g) the DiR hooks (``video_extra``, ``video_temb_delta``; not in the paper): with every row visible ``dir_step``
+    equals ``dir_h3.generator_step``, and under the causal mask with ConvKV the streamed DiR iteration equals
+    the one-pass one, with an O(1) control (the same iteration without the previous estimate).
 
 (a)-(c) use ``parity_h3.py``'s thresholds: rel_rms <= max(1e-4, 2 x run-to-run floor), max_abs <= 1e-2.
 (d)-(e) compare two different batchings of the same arithmetic (a block alone against the block inside the
@@ -161,6 +164,33 @@ def main() -> None:
     ok_f = (bool(torch.isfinite(stream_out).all()) and tuple(stream_out.shape) == (1, 24, 30, height, width)
             and rows[1] == rows[2] == rows[3] and sizes == [0, 1, 2, 3])
 
+    # (g) DiR hooks: dense == dir_h3.generator_step; causal + ConvKV: stream == one pass
+    from dir_h3 import DirHead, estimate_extra, generator_step, probe_temb_dim
+    from nf_h3 import DENSE, dir_step
+
+    head = DirHead(model.config.hidden_size, probe_temb_dim(model)).paper_init(torch.Generator().manual_seed(0)).cuda()
+    estimate = torch.randn(1, 24, frames, height, width, device="cuda")
+    sigma_r, r = 0.857, 2
+    with torch.inference_mode():
+        stock_dir = generator_step(model, head, z, estimate, r, text, sigma=sigma_r,
+                                   audio_generator=torch.Generator("cuda").manual_seed(0))
+        mine_dir = dir_step(model, head, z, estimate, r, text, sigma_r, config=DENSE,
+                            audio_generator=torch.Generator("cuda").manual_seed(0))
+        whole_dir = dir_step(model, head, z, estimate, r, text, sigma_r, config=memory, convkv=convkv, audio=audio)
+        no_estimate = dir_step(model, head, z, torch.zeros_like(estimate), r, text, sigma_r, config=memory, convkv=convkv,
+                               audio=audio)
+    gap_g, ok_g_dense = rel_rms(mine_dir, stock_dir), within(mine_dir, stock_dir)
+    stream = NFStream(model, lat_h=height, lat_w=width, steps=1, config=memory, convkv=convkv, total_frames=frames)
+    parts = []
+    for index, (a, b) in enumerate(memory.spans(frames)):
+        a0, a1 = Geometry.audio_span(a, b, frames)
+        velocity = stream.velocity(index, 0, z[:, :, a:b], 1.0 - sigma_r, text, audio[..., a0:a1],
+                                   video_extra=estimate_extra(head, estimate[:, :, a:b], None), video_temb_delta=head.r_embed[r])
+        parts.append(z[:, :, a:b].float() + sigma_r * velocity.float())
+    gap_g_stream = rel_rms(torch.cat(parts, dim=2), whole_dir)
+    control_g = rel_rms(no_estimate, whole_dir)
+    ok_g = ok_g_dense and gap_g_stream <= STREAM_BOUND and control_g > 10 * STREAM_BOUND
+
     # (c) zero-init LoRA under the causal mask (applied last: it wraps the Linears for good)
     network = make_lora(model, 4)
     network.to(device="cuda", dtype=torch.bfloat16)
@@ -168,7 +198,7 @@ def main() -> None:
         with_lora = forward(causal)
     gap_c, ok_c = rel_rms(with_lora, masked), within(with_lora, masked)
 
-    ok = int(ok_a and ok_a2 and ok_b and ok_c and ok_stream and ok_f and floor <= 1e-3)
+    ok = int(ok_a and ok_a2 and ok_b and ok_c and ok_stream and ok_f and ok_g and floor <= 1e-3)
     peak_mb = torch.cuda.max_memory_allocated() / (1024 * 1024)
     print(
         "LOT_H3 kind=nf_parity "
@@ -180,6 +210,7 @@ def main() -> None:
         + f" same_early={same_early:.6g} control_memory={controls['memory_vs_stage1']:.6g} "
         f"control_conv={controls['rough_vs_mean']:.6g} stream_ok={int(ok_stream)} "
         f"f_cache_rows={rows} f_stream_ms={stream_ms:.0f}/{int(ok_f)} "
+        f"g_dir_dense={gap_g:.6g} g_dir_stream={gap_g_stream:.6g} g_control={control_g:.6g}/{int(ok_g)} "
         f"peak_mb={peak_mb:.1f} dtype=bf16 ok={ok}"
     )
     if not ok:

@@ -11,7 +11,9 @@ long-term slots and 2 short-term frames, so the cache does not grow with the len
 
 ``--untrained`` is the base H3 with no LoRA and the mean-initialised ConvKV (the paper's fig. 1
 zero-shot setting, plus an untrained memory). ``--run`` loads ``lora_gen`` and, for a Stage 2 run,
-``convkv`` and its 3-step schedule.
+``convkv`` and its 3-step schedule; for a DiR-generator run (``train_nf_h3.py --dir-init``) also its
+``DirHead``, and each block then runs the run's R DiR iterations. ``--dir-run`` is the zero-shot arm of
+that: a ``train_dir_h3.py`` run rendered under the causal mask as it is.
 
 Prompts and reference frames come from the held-out clips of the run's cache (text embedding, and the
 clip's first latent frame as the FL2VA ``first`` condition; ``--ref none`` drops it). ``--audio driving``
@@ -55,12 +57,18 @@ def main() -> None:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--run", type=Path, help="a train_nf_h3.py run")
     source.add_argument("--untrained", action="store_true", help="base H3, no LoRA, mean-initialised ConvKV")
+    source.add_argument("--dir-run", type=Path,
+                        help="a train_dir_h3.py (DiR) run rendered under the causal mask with no further training: "
+                             "its generator LoRA + DirHead, R iterations per block, mean-initialised ConvKV")
+    parser.add_argument("--dir-ema", action="store_true", help="--dir-run: load the *_ema generator files")
     parser.add_argument("--tag", default="", help="checkpoint suffix, e.g. _200 (default: final)")
     parser.add_argument("--blocks", type=int, default=3, help="blocks to stream (6 + 8 (N - 1) latent frames)")
     parser.add_argument("--memory", action=argparse.BooleanOptionalAction, default=True,
                         help="ConvKV context from the third block on (--no-memory: every earlier frame, Stage 1)")
     parser.add_argument("--steps", type=int, default=0, help="0 = the 3-step schedule; N = H3's N-step Euler schedule")
-    parser.add_argument("--ref", choices=["first", "none"], default="first")
+    parser.add_argument("--ref", choices=["first", "none"], default=None,
+                        help="default: first, or what the run was trained with; none for a DiR generator (text-to-video)")
+    parser.add_argument("--holdout", type=int, default=None, help="held-out split size (default: the run's, else 8)")
     parser.add_argument("--audio", choices=["silent", "driving"], default=None,
                         help="driving: the held-out clip's clean H3 audio latent as conditioning (covers 3 blocks); "
                              "default: what the run was trained with, else silent")
@@ -78,7 +86,8 @@ def main() -> None:
     import train_h3
     from dir_h3 import use_networks
     from h3_musubi import load_dit, load_vae, sigma_schedule
-    from nf_h3 import ConvKV, NFConfig, NoiseBank, few_step_sigmas, load_nf_run, nf_stream_sample
+    from nf_h3 import (ConvKV, NFConfig, NoiseBank, few_step_sigmas, load_nf_dir_head, load_nf_run,
+                       nf_dir_stream_sample, nf_stream_sample)
     from train_nf_h3 import list_clips, load_audio, load_clip
 
     width, height = args.size
@@ -86,21 +95,34 @@ def main() -> None:
         raise SystemExit("--size must be multiples of 32")
     lat_h, lat_w = height // 16, width // 16
     model = load_dit(LOT_H3_CHECKPOINT, swap=args.swap)
-    network, convkv, meta = None, None, {}
+    network, convkv, meta, head = None, None, {}, None
     if args.run is not None:
         network, convkv, meta = load_nf_run(args.run, model, tag=args.tag)
+        if meta.get("dir"):
+            head = load_nf_dir_head(args.run, meta, tag=args.tag)
+    elif args.dir_run is not None:
+        from dir_h3 import load_dir_run
+
+        head, network, dir_meta = load_dir_run(args.dir_run, model, tag=args.tag, ema=args.dir_ema)
+        meta = {"dir": True, "sigmas": dir_meta["sigmas"], "mix_state": dir_meta.get("mix_state", False), "ref": "none"}
+    args.ref = args.ref or meta.get("ref") or "first"
     blocks = meta.get("blocks", [6, 8])
     config = NFConfig(blocks[0], blocks[1], memory=args.memory)
     if args.memory and convkv is None:
         convkv = ConvKV.for_dit(model).cuda().eval()          # the mean: an untrained memory
-    if args.steps:
+    if head is not None:
+        if args.steps:
+            raise SystemExit("--steps does not apply to a DiR generator (R iterations from its config)")
+        sigmas, sampler = [float(s) for s in meta["sigmas"]], "dir"
+    elif args.steps:
         sigmas, sampler = [float(s) for s in sigma_schedule(args.steps)], "euler"
     else:
         sigmas, sampler = meta.get("sigmas") or few_step_sigmas(), meta.get("sampler", "renoise")
 
     cache = args.cache or (Path(meta["cache"]) if meta.get("cache") else LOT_H3_CLIPS_CACHE)
     train_h3.MAX_LATENT_HW, train_h3.CROP_MULTIPLE = (lat_h, lat_w), 2
-    _train, held = list_clips(cache, meta.get("sources", ["set_nk"]), 22, int(meta.get("holdout", 8)))
+    holdout = args.holdout if args.holdout is not None else int(meta.get("holdout", 8))
+    _train, held = list_clips(cache, meta.get("sources", ["set_nk"]), 22, holdout)
     rng = random.Random(args.seed)
     results = []
     for index, item in enumerate(held[:args.prompts]):
@@ -119,15 +141,19 @@ def main() -> None:
             mark[0] = now
 
         with torch.inference_mode(), use_networks(network, None, gen=True, fake=False):
-            latents = nf_stream_sample(model, text, args.blocks, lat_h=lat_h, lat_w=lat_w, config=config, sigmas=sigmas,
-                                       noise=NoiseBank(args.seed + index, "cuda"), convkv=convkv if args.memory else None,
-                                       first=first, sampler=sampler, cache_device=args.cache_device, on_block=on_block,
-                                       audio=audio)
+            common = dict(lat_h=lat_h, lat_w=lat_w, config=config, sigmas=sigmas, noise=NoiseBank(args.seed + index, "cuda"),
+                          convkv=convkv if args.memory else None, first=first, cache_device=args.cache_device,
+                          on_block=on_block)
+            if head is not None:
+                latents = nf_dir_stream_sample(model, head, text, args.blocks, mix_state=bool(meta.get("mix_state")), **common)
+            else:
+                latents = nf_stream_sample(model, text, args.blocks, sampler=sampler, audio=audio, **common)
         finite = bool(torch.isfinite(latents).all())
         results.append({"clip": item[0].name, "latents": latents.float().cpu(), "block_ms": block_ms, "finite": finite,
                         "latent_frames": int(latents.shape[2]), "abs_mean": float(latents.float().abs().mean()),
                         "real_abs_mean": float(x0.abs().mean())})
-        print(f"LOT_H3 kind=render_nf prompt={index} latent_frames={latents.shape[2]} steps={len(sigmas) - 1} "
+        print(f"LOT_H3 kind=render_nf prompt={index} latent_frames={latents.shape[2]} "
+              f"steps={len(sigmas) - (0 if head is not None else 1)} "
               f"sampler={sampler} memory={int(args.memory)} audio={audio_mode} block_ms={','.join(f'{ms:.0f}' for ms in block_ms)} "
               f"abs_mean={results[-1]['abs_mean']:.3f} real_abs_mean={results[-1]['real_abs_mean']:.3f} "
               f"finite={int(finite)} peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
@@ -154,7 +180,8 @@ def main() -> None:
             sheet(frames).save(args.out / f"p{index}_sheet.png")
             result["decoded_latent_frames"], result["pixel_frames"] = keep, int(frames.shape[0])
     record = {"paper": "arXiv 2603.11746", "run": None if args.run is None else str(args.run), "tag": args.tag,
-              "untrained": args.untrained, "size": f"{width}x{height}", "blocks": args.blocks, "block_sizes": blocks,
+              "untrained": args.untrained, "dir_run": None if args.dir_run is None else str(args.dir_run), "dir_ema": args.dir_ema,
+              "size": f"{width}x{height}", "blocks": args.blocks, "block_sizes": blocks,
               "memory": args.memory, "sigmas": sigmas, "sampler": sampler, "ref": args.ref, "seed": args.seed, "fps": FPS,
               "note": "block_ms is wall time per block (steps forwards of that block's rows; the first includes warm-up)",
               "prompts": [{k: v for k, v in r.items() if k != "latents"} for r in results]}
