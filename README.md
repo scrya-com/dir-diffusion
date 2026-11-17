@@ -227,6 +227,56 @@ Training, same run, RTX 5090, swap 4:
 | Whole run, wall clock | 2 h 49 min: 31 min of loading, anchors and warm-up, then 2 h 18 min for 300 steps. About 110 of those steps ran slower because renders on the second card competed for CPU; undisturbed the total would be about 2 h 25 min |
 | Peak memory | 24.9 GB: does not fit a 24 GB card at swap 4 |
 
+## Demo: DiR iterations inside mpeg-diffusion's two-track sampler
+
+> [!WARNING]
+> **A demo of the wiring, not a result.** It runs, the forward is checked exactly, and the DiT time falls 3 to 4 times. The picture inside the full-resolution region is not yet better than half resolution upscaled. Two generators, three prompts, one seed each, judged by eye.
+
+[mpeg-diffusion](https://github.com/scrya-com/mpeg-diffusion) (MPEG-Diffusion, Menn et al., [arXiv 2611.12069](https://arxiv.org/abs/2611.12069)) denoises the whole frame at half resolution and adds full-resolution tokens only on a region a small head selects. `lot/dir_two_track_h3.py` runs a DiR generator through that sampler: the first `--switch` iterations at half resolution, the rest on one packed sequence of the half-resolution grid plus full-resolution tokens on the region. Both tracks get the run's `x0_proj` of their own estimate and the same `r` embedding. Neither paper combines the two.
+
+```bash
+# RUN: a train_dir_h3.py output directory, or owner/repo[/sub/folder] on Hugging Face with the same files
+python3 lot/dir_two_track_h3.py --run RUN --tag _50 --check                    # GPU parity -> ok=1
+python3 lot/dir_two_track_h3.py --run RUN --tag _50 --out runs/two_track \
+  --variants dir,lr,two_track --frames 39 --prompts 3 --outline                # grid.jpg, mp4s, meta.json
+```
+
+The K/V maps and the region head download from [johndpope/MiniMax-H3-MPEG-Diffusion](https://huggingface.co/johndpope/MiniMax-H3-MPEG-Diffusion) (`--maps`, `--region` or `--box` override them). `lot/mixed_res.py` and `lot/two_track_h3.py` are copied from mpeg-diffusion at 8e91323; fitting maps and training the region head stay in that repository.
+
+![DiR at full resolution, at half resolution upscaled, and two-track with the region outlined](assets/dir-two-track-turbo.jpg)
+
+Turbo-start generator (`dir_turbo_clip_a`, step 50, averaged weights), switch 2. Columns: DiR at full resolution, DiR at half resolution upscaled, two-track with the region outlined. Middle frame of each clip.
+
+**Time**, RTX 5090, 1344×768, 39 frames, 4 iterations, prompts 2 and 3 (the first prompt carries warm-up). "Total" includes the VAE.
+
+| | Total | DiT only |
+|---|---|---|
+| Base H3, 20 steps (2 prompts, first one cold) | 56–61 s | 52–56 s |
+| DiR, full resolution | 16.3–16.4 s | 12.0–12.1 s |
+| DiR, half resolution, upscaled | 15.1–15.2 s | 2.2 s |
+| Two-track, Turbo-start run, switch 2 | 12.5–17.0 s | 3.5 s |
+| Two-track, Turbo-start run, switch 3 | 11.8–14.0 s | 2.8 s |
+| Two-track, mix-state run, switch 2 | 14.5–15.3 s | 3.7 s |
+| Two-track, mix-state run, switch 3 | 12.3–17.4 s | 2.9–3.0 s |
+
+- **DiT time falls 3.3 to 4.3 times** against full-resolution DiR, with 11–23% of the frame in the region.
+- **End to end it is between 1.4 times faster and slightly slower.** Once the DiT takes 3 s, the VAE upscale of the region and the two decodes are most of the total (9 to 14.5 s), and that part varied between prompts with the same DiT time. The split inside it was not measured. Longer clips were not run.
+- **Half resolution upscaled costs almost as much as full resolution**, because its upscale is a full VAE round trip.
+
+**Picture.** Half resolution upscaled, then two-track at switch 2 and at switch 3; the Turbo-start run above, the mix-state run (`dir_mix_clip_a`, step 50) below:
+
+![region crops at switch 2 and switch 3](assets/dir-two-track-switch.jpg)
+
+- **Switch 2 repaints the region.** The region opens at sigma 0.857, where its state is 86% new noise. The Turbo-start run gives a sharp, clean region with different content (a beard, a redrawn arm that does not meet the body outside the region). The mix-state run replaces the hammer with floor texture.
+- **Switch 3 keeps the content and adds little.** The region opens at sigma 0.667 and gets one iteration. People and objects match the half-resolution picture; the region is not clearly sharper, and it has colour fringing (Turbo-start) or a fine grain and a washed-out patch (mix-state).
+- **Repeating the last iteration (`--repeat-last 2`) made the mix-state region worse** (stray patterns on clothing and railings), on a render made before the rounding fix below.
+- **The published maps and region head carry over.** The region head, trained on base H3 states, covers the people or the character in three of the six prompt and run pairs at switch 2. In the others it covers the area beside the subject, a hammer head, or a rug in a frame with no person. Without the fitted maps (`--maps none`) the region is a diamond grid, as in mpeg-diffusion.
+- **What is untested:** whether the cause is the two iterations, the noise level, or that neither generator was trained at 1344×768 (both were distilled at 512×768) or on a mixed sequence.
+
+**Checks** (`--check`, 7 latent frames at 768×512, both runs): with no region the hooked `two_track_forward` equals `forward_video` with the same hooks (relative error 0); with a region, zero hooks change nothing (0); the sampler with the region never opened equals `dir_sample` at half resolution (0); live hooks move both tracks (6% and 23%).
+
+**A rounding difference found on the way.** `forward_video` rounds the flow time to 32-bit and mpeg-diffusion's `two_track_forward` did not. At t = 1/3 the two then differ by 3% relative rms on base H3 and 4.9% with a generator LoRA; at t = 0.25 or 0.333 they are identical. Why 1e-8 in the time moves the output that much was not found. The copy here rounds; mpeg-diffusion's own file is unchanged, so its two-track sampler and its full-resolution baseline differ in the same way at such times. The renders before and after the fix look the same.
+
 ## Status
 
 The rows below are the earlier pinned-σ runs. Read them with the finding above: their iterations do not refine. Their swap-4 timings on a 24 GB card are from run 1's rank-16 LoRA; the table above uses a rank-128 LoRA on a card whose desktop holds 5 GB, where swap 8 no longer fits.
@@ -290,6 +340,7 @@ Building a cache from your own clips, and every path variable, are covered in [`
 | [`lot/probe_dir_h3.py`](lot/probe_dir_h3.py) | Does a generator refine, and does it read its estimate: rollout and controlled-feed distances on held-out prompts, picture grid |
 | [`lot/build_clip_cache_h3.py`](lot/build_clip_cache_h3.py) | A training cache from clip latents that already exist (`z.pt` + `meta.json` prompt), text-encoded once per distinct prompt |
 | [`lot/bench_dir_h3.py`](lot/bench_dir_h3.py) | Time and peak memory of DiR sampling against the dense sampler, per canvas |
+| [`lot/dir_two_track_h3.py`](lot/dir_two_track_h3.py) | Demo: DiR iterations inside mpeg-diffusion's two-track sampler (`lot/two_track_h3.py`, `lot/mixed_res.py`, copied from it), render and `--check` |
 | [`lot/stream_dir_h3.py`](lot/stream_dir_h3.py) | Streaming DiR: sliding 5n+2 window, per-frame `r`, FL2VA first-frame hand-off, coarse memory keyframes |
 | [`lot/train_stream_dir_h3.py`](lot/train_stream_dir_h3.py) / [`lot/render_stream_h3.py`](lot/render_stream_h3.py) / [`lot/parity_stream_h3.py`](lot/parity_stream_h3.py) | Streaming DMD trainer, mp4 renderer, GPU parity and timing |
 | [`DIR_CHEATSHEET.md`](DIR_CHEATSHEET.md) | Getting started: samples, cache, training recipe, renders, streaming |
