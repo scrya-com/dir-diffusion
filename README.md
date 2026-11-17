@@ -124,7 +124,7 @@ Columns: H3 20 steps, H3 4 Euler steps, Turbo 4 steps, DiR baseline (part 2), Di
 
 What this is not: one run per variant, 50 steps each, three prompts, frame sheets and pixel statistics. The floor diagnosis was measured on two clips. eDMD's calibrated noise levels, precise-teacher walk and teacher guidance are not ported.
 
-### Next: the rest of eDMD, from Turbo's weights (added, not yet evaluated)
+### The rest of eDMD, from Turbo's weights (flags)
 
 eDMD's student is a 4-step Euler sampler, which is what Turbo is, so the aligned recipe starts from Turbo's LoRA with its own sigmas and a zero DiR head (step 0 is Turbo). Added behind flags, defaults unchanged:
 
@@ -132,9 +132,33 @@ eDMD's student is a 4-step Euler sampler, which is what Turbo is, so the aligned
 - `--precise-teacher 4`: the last iteration's reads at or below its input sigma are answered by a 4-node Euler walk of the teacher to 0. One node reproduces the single call exactly.
 - `--fake-loss-weight edmd`, `--fake-grad-clip`, `--weight-decay`, `--lr-warmup`, `--fake-first`: eDMD's fake-model loss weight and update settings.
 - Teacher guidance is not ported because there is none to port: eDMD trains at the teacher's default guidance and this repo samples H3 unguided.
+- `--read-noise own`: an iteration before the last is read at its own next state, forward-noised to the drawn level (eDMD's setting for its unguided Qwen-Image run). `--tau-max`: redraw generator reads above a cap.
 - Not matched: eDMD's batch of 16 and 2,000 updates.
 
-A control (Turbo start, endpoint fake model only) and the aligned run are in progress; no result yet.
+### Video, part 4: three runs from Turbo's weights, and why eDMD's read levels fail on H3
+
+Three runs from Turbo's LoRA (12-frame latents, 2 samples per update, lr 2e-5). None beats Turbo; nothing is published from them. "Gap" is the eval's mean distance between the final output and the teacher's one-call answer on it at level 0.6; "motion" is the latent motion score on 8 held-out prompts (20-step H3: 0.23).
+
+| Run | Change against the control | Stopped at | Gap, step 0 → 25 → 50 | Motion, step 0 → 25 → 50 |
+|---|---|---|---|---|
+| Control | endpoint fake model, `--dmd-weight norm`, clip 1.0, EMA 0.99 | 125 | 0.117 → 0.119 → 0.121 | 0.44 → 0.48 → 0.52 |
+| eDMD-aligned | plus calibrated `--tau-floor`, `--read-noise own`, `--precise-teacher 4`, eDMD's fake-model settings | 25 | 0.117 → 0.128 | 0.44 → 0.53 |
+| Capped reads | control plus `--tau-max 0.9` | about 60 | 0.117 → 0.128 → 0.130 | 0.44 → 0.42 → 0.42 |
+
+- **Control:** stable and sharp, about level with Turbo at step 50 (distance to the 20-step clips 0.71–0.81 against Turbo's 0.69–0.76), then the first iteration degrades (its gap 0.17 → 0.38 by step 125).
+- **eDMD-aligned:** worse than the control at step 25 on every iteration, so it was stopped. It changed several settings at once and cannot say which one hurt.
+- **Capped reads:** the only run where the motion score falls, but its step-50 clips are further from the 20-step clips than Turbo's (0.80–0.95 against 0.69–0.76) and busier: more ornament, extra people on one prompt, more pixel change per frame (11–15 against Turbo's 9.5–11.5). Not blur; the opposite.
+
+![20-step H3, Turbo 4-step, capped-read run at step 50 (live and averaged weights)](assets/dir-turbo-cap-p0.jpg)
+
+**Why eDMD's read levels fail here** (offline, on the control's step-50 and step-100 checkpoints, 3 held-out prompts, 16 draws per rule):
+
+- H3's one-call answer is unreliable above level 0.9 on these latents. On its own 20-step clips its squared error is 0.08–0.10 at 0.85 and 0.13–0.16 at 0.90, then 0.5–0.8 at 0.95 and 0.8–1.3 at 0.98 on two of three clips. A constant guess scores 0.9–1.0, and the answer's mean square reaches twice the clip's. Changing the silent-audio noise seed barely moves it.
+- eDMD reads the first iteration on [0.947, 0.99), inside that range. There the direction agrees across draws (cosine of two halves 0.6–0.9) and a small step along it makes the output larger, raises motion and moves it away from the 20-step clip, with fresh noise and with own-state reads alike. `--read-noise own` does not help.
+- With reads on [0.3, 0.9] the direction is stable (0.5–0.84) and a small step along it moves the output toward the 20-step clip in 17 of 18 cases and lowers motion in 15 of 18. It also shrinks the output every time, and the training run above did not turn that into a better sampler by step 50.
+- The control's own read rule (Beta(2.5, 1), about a quarter of reads above 0.9) gives a weak direction: halves agree at 0.1–0.5.
+
+The calibration table (`lot/calibrate_edmd_h3.py`, 32 prompts) puts H3 between eDMD's FLUX and SD3 cases: mean read 0.966 / 0.898 / 0.790 at landings 0.947 / 0.857 / 0.667, against 0.969 / 0.924 / 0.828 for uniform.
 
 ### Real clips (built, not trained on)
 
