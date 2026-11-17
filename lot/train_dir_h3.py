@@ -687,8 +687,9 @@ def main() -> None:
                         help="generator updates of linear learning-rate warm-up (eDMD: 100); 0 = off")
     parser.add_argument("--tau-max", type=float, default=TAU_MAX,
                         help="upper bound of the generator's DMD read level without --tau-floor (default 0.98, the "
-                             "clamp): draws above it are redrawn; the fake model's own training keeps the full "
-                             "range. H3's one-call answer on 12-frame latents is unreliable above about 0.9")
+                             "clamp): draws above it are redrawn. With --fake-source final the fake model's own "
+                             "training keeps the full range; with --fake-source iteration it is capped too. H3's "
+                             "baked guidance dominates its one-call answer above about 0.9")
     parser.add_argument("--read-noise", choices=["fresh", "own"], default="fresh",
                         help="with --tau-floor, the point an iteration before the last is read at: its estimate with "
                              "fresh noise (fresh), or its own next state forward-noised to the drawn level (own, "
