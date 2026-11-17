@@ -170,7 +170,7 @@ Turbo already has nearly twice the teacher's motion and more detail. The control
 - With reads on [0.3, 0.9] a small step along the direction lowers size in every case and lowers motion and detail in most (7 of 9), with or without scaling the guidance. The capped training run nevertheless raised detail, so the read level is not the whole explanation.
 - In both the control and the capped run the damage is in the first iteration: on the three probe clips its size goes from Turbo's 1.02–1.09 to 1.13–1.15 (control) and 1.20–1.22 (capped), and its detail from 0.37–0.45 to 0.54–0.57 and 0.75–0.76. Both use the endpoint fake model, which never sees first-iteration estimates. In the earlier mix-state pair (part 3) the endpoint fake model also raised first-iteration size and detail against the per-iteration one (size 0.98–1.12 against 0.77–0.87). The run with the per-iteration fake model from Turbo is below.
 
-**The per-iteration run** (`--fake-source iteration --tau-max 0.9`, otherwise the capped run; 100 steps, 2026-11-17/18). Same yardstick, every row scored on the RTX 5090 at `--swap 4` (the yardstick table above mixed two cards for no row, but single clips differ between cards, so only same-card rows can be paired):
+**The per-iteration run** (`--fake-source iteration --tau-max 0.9`, otherwise the capped run; 100 steps, 2026-11-17/18). Same yardstick, every row scored on the RTX 5090 at `--swap 4`. The same noise gives different clips on different cards, so only rows scored on one card can be paired:
 
 | | Motion | Detail | Size (rms) | Motion against Turbo, paired |
 |---|---|---|---|---|
