@@ -188,7 +188,7 @@ Turbo already has nearly twice the teacher's motion and more detail. The control
 
 ![20-step H3, Turbo 4-step, per-iteration run at steps 75 and 100 (averaged weights)](assets/dir-turbo-iter-p2.jpg)
 
-Not published: it trades over-motion for over-detail. One run, 2 samples per update; the recipe for a larger batch is in [DIR_CHEATSHEET.md](DIR_CHEATSHEET.md) and [issue #4](https://github.com/scrya-com/dir-diffusion/issues/4).
+Published as a research checkpoint ([Hugging Face](https://huggingface.co/johndpope/dir-diffusion-h3)), with that trade stated on its card: it swaps over-motion for over-detail. One run, 2 samples per update; the recipe for a larger batch is in [DIR_CHEATSHEET.md](DIR_CHEATSHEET.md) and [issue #4](https://github.com/scrya-com/dir-diffusion/issues/4).
 
 The calibration table (`lot/calibrate_edmd_h3.py`, 32 prompts) puts H3 between eDMD's FLUX and SD3 cases: mean read 0.966 / 0.898 / 0.790 at landings 0.947 / 0.857 / 0.667, against 0.969 / 0.924 / 0.828 for uniform.
 
@@ -302,6 +302,7 @@ Differences from the paper: batch 1 with `--accum` instead of batch 256 (about 2
 
 ## Weights and license
 
+- **Research checkpoint:** [huggingface.co/johndpope/dir-diffusion-h3](https://huggingface.co/johndpope/dir-diffusion-h3), also attached to the [GitHub release](https://github.com/scrya-com/dir-diffusion/releases/tag/turbo-clip-iter-100). The per-iteration run from Turbo at step 100, averaged weights: Turbo's over-motion is gone, detail is above the teacher's (part 4). Load it as a run directory (`--run`).
 - Code in `lot/` and `comfyui/`: Apache-2.0 ([`LICENSE`](LICENSE)).
 - `third_party/musubi_tuner/`: Apache-2.0, from musubi-tuner, which adapts it from Hugging Face Diffusers; see [`NOTICE`](NOTICE).
 - MiniMax H3 weights, and anything trained from them, are under the [MiniMax H3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE): **not for use in the EU, UK, South Korea or USA**, and keep its `LICENSE` and `NOTICE` with any copy.
