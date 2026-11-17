@@ -900,13 +900,13 @@ def test_dir_sigma_schedule_is_euler():
         raise AssertionError(bad)
 
 
-def _tiny_h3():
+def _tiny_h3(num_layers: int = 2):
     """A 2-layer, 64-wide MiniMax-H3 on the CPU in fp32 (random weights), or None without musubi."""
     if _musubi() is None:
         return None
     from musubi_tuner.minimax_h3.model import MiniMaxH3Config, MiniMaxH3Model
 
-    config = MiniMaxH3Config(hidden_size=64, num_layers=2, num_attention_heads=2, attention_head_dim=32,
+    config = MiniMaxH3Config(hidden_size=64, num_layers=num_layers, num_attention_heads=2, attention_head_dim=32,
                              ffn_hidden_size=128, text_dim=16, timestep_input_dim=16, time_embed_hidden_size=32,
                              time_embed_dim=16, rope_inv_freq_len=4)
     torch.manual_seed(0)
@@ -1196,6 +1196,414 @@ def test_dir_trainer_draws_on_cpu():
     assert float(head.x0_proj.weight.grad.abs().sum()) > 0 and fake_head.fake_r_embed.grad is None
 
 
+# ------------------------------------------------- Neighbor Forcing + ConvKV (arXiv 2603.11746)
+
+def _nf_stock(dit, z, t, text, first, audio):
+    """The stock ``dit(...)`` call on H3's own T2VA / FL2VA-first layout."""
+    from h3_musubi import audio_frames, audio_sigma
+    from musubi_tuner.minimax_h3.packing import build_h3_layout
+
+    frames, height, width = z.shape[2:]
+    kwargs = dict(text_length=text.shape[1], target_video=(frames, height, width), target_audio_frames=audio_frames(frames))
+    if first is None:
+        layout = build_h3_layout(task="t2va", **kwargs)
+    else:
+        layout = build_h3_layout(task="fl2va", visual_conditions=[(1, height, width)], condition_roles=("first",), **kwargs)
+    tags = torch.ones(1, text.shape[1], dtype=torch.int64)
+    out = dit(video_latents=z, audio_latents=audio, text_hidden_states=text, text_token_tags=tags, layout=layout,
+              model_t_video=t, model_t_audio=1.0 - float(audio_sigma(1.0 - t)),
+              visual_condition_latents=[] if first is None else [first])
+    return out.video, layout
+
+
+def test_nf_blocks_and_geometry():
+    """Block sizes (Table 5), the 2 + 2 + 2 context, audio spans, and positions / timestep rows equal to H3's own."""
+    if _musubi() is None:
+        print("SKIPPED test_nf_blocks_and_geometry: musubi_tuner not importable", flush=True)
+        return
+    from h3_musubi import audio_frames, pixel_frames
+    from musubi_tuner.minimax_h3.packing import (FRAME_RESCALE, build_h3_layout, build_position_grid,
+                                                 build_timestep_rows)
+    from nf_h3 import DENSE, Geometry, NFConfig, few_step_sigmas, timestep_table
+
+    config = NFConfig()
+    assert (config.first_block, config.next_block) == (6, 8)
+    assert config.spans(22) == [(0, 6), (6, 14), (14, 22)] and config.frames(3) == 22 and DENSE.spans(22) == [(0, 22)]
+    for bad in (21, 5):
+        try:
+            config.spans(bad)
+        except ValueError:
+            continue
+        raise AssertionError(bad)
+    memory = NFConfig(memory=True)
+    assert memory.context_slots == 6 and (memory.ref, memory.long, memory.short, memory.ratio) == (2, 2, 2, 5)
+    for kwargs in (dict(first_block=7), dict(next_block=10), dict(causal=False)):
+        try:
+            NFConfig(memory=True, **kwargs)       # 6 / 8 is the only pair the 2 + 2 + 2 window with ratio 5 allows
+        except ValueError:
+            continue
+        raise AssertionError(kwargs)
+    # the release's 1000, 937.5, 833.3 are (1, .75, .5) under Wan's shift 5; H3's shift is 12
+    wan = few_step_sigmas(shift=5.0)
+    assert [round(1000 * s, 1) for s in wan] == [1000.0, 937.5, 833.3, 0.0]
+    assert [round(s, 4) for s in few_step_sigmas()] == [1.0, 0.973, 0.9231, 0.0]
+    # audio frames are split by time and tile the clip's audio
+    for total in (22, 30, 38):
+        spans = [Geometry.audio_span(a, b, total) for a, b in config.spans(total)]
+        assert spans[0][0] == 0 and spans[-1][1] == audio_frames(total)
+        assert all(left[1] == right[0] for left, right in zip(spans[:-1], spans[1:]))
+        for (start, _stop), (a0, _a1) in zip(config.spans(total), spans):
+            assert a0 - 1 < FRAME_RESCALE * pixel_frames(start) <= a0     # first audio frame at or after the block
+    assert Geometry.audio_span(6, 14) == Geometry.audio_span(6, 14, 22)   # a stream needs no clip length
+    for first in (False, True):
+        geometry = Geometry(5, 4, 6, first)
+        kwargs = dict(text_length=5, target_video=(22, 4, 6), target_audio_frames=audio_frames(22))
+        layout = (build_h3_layout(task="fl2va", visual_conditions=[(1, 4, 6)], condition_roles=("first",), **kwargs)
+                  if first else build_h3_layout(task="t2va", **kwargs))
+        mine = torch.cat([geometry.prefix_positions(), geometry.audio_positions(0, audio_frames(22)),
+                          geometry.video_positions(0, 22)])
+        assert torch.equal(mine, build_position_grid(layout)[0])
+        for t in (0.0, 0.4, 0.9995):
+            t_audio = 0.37 if t else 0.0
+            rows = build_timestep_rows(layout, text_token_tags=torch.ones(1, 5, dtype=torch.int64), model_t_video=t,
+                                       model_t_audio=t_audio)
+            unique, codes, video_index, audio_index = timestep_table(t, t_audio, first)
+            assert torch.equal(unique, rows.unique_timesteps)
+            assert (video_index, audio_index) == (rows.video_timestep_index, rows.audio_timestep_index)
+            for role, name in (("text", "text"), ("target_audio", "audio"), ("target_video", "video")) + (
+                    (("first", "first"),) if first else ()):
+                assert rows.block_adaln_indices[0][layout.segment(role).row_slice].eq(codes[name]).all(), (role, t)
+    # RoPE reset: from block 2 on, the first short-term frame sits at slot 4 of the first window, the
+    # reference and long-term slots at slots 0-3, and the window never moves again.
+    geometry = Geometry(5, 4, 6)
+    slot = [geometry.frame_time(k) for k in range(6)]
+    assert geometry.window_shift(memory, 0) == geometry.window_shift(memory, 1) == 0.0
+    assert geometry.context_positions(memory, 0) is None
+    assert torch.equal(geometry.context_positions(memory, 1), geometry.video_positions(0, 6))
+    for index in (2, 3, 7, 40):
+        start, stop = memory.span(index)
+        times = geometry.context_positions(memory, index)[::geometry.frame_rows, 0] - 5
+        assert torch.allclose(times[:5], torch.tensor(slot[:5], dtype=torch.float64), atol=1e-9)
+        own = geometry.video_positions(start, stop, geometry.window_shift(memory, index))[::geometry.frame_rows, 0] - 5
+        real = torch.tensor([geometry.frame_time(f) for f in range(start - 2, stop)], dtype=torch.float64)
+        got = torch.cat([times[4:], own])
+        assert torch.allclose(got - got[0], real - real[0], atol=1e-9)      # true H3 spacing kept
+        assert float(own.max()) < 80.0                                     # bounded for any stream length
+    assert torch.equal(geometry.context_positions(NFConfig(), 3), geometry.video_positions(0, 22))
+
+
+def test_nf_dense_is_stock_h3():
+    """``nf_forward`` with every row visible is the stock forward, T2VA and FL2VA-first (the base model)."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_dense_is_stock_h3: musubi_tuner not importable", flush=True)
+        return
+    from h3_musubi import _silence
+    from nf_h3 import nf_forward
+
+    z, text = torch.randn(1, 24, 22, 4, 6), torch.randn(1, 5, 16)
+    audio = _silence(22, 0.7, "cpu", torch.Generator().manual_seed(3))
+    for first in (None, torch.randn(1, 24, 1, 4, 6)):
+        with torch.no_grad():
+            stock, _layout = _nf_stock(dit, z, 0.4, text, first, audio)
+            got = nf_forward(dit, z, 0.4, text, first=first, audio=audio)
+        assert float((got - stock).abs().max()) < 1e-6, first is None
+
+
+def test_nf_causal_is_eq5_mask():
+    """The per-block attention equals one attention under the explicit eq. 5 mask, and nothing leaks backwards."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_causal_is_eq5_mask: musubi_tuner not importable", flush=True)
+        return
+    import torch.nn.functional as F
+    from h3_musubi import _silence, audio_frames
+    from musubi_tuner.minimax_h3 import model as h3_model
+    from nf_h3 import Geometry, NFConfig, nf_forward
+
+    config = NFConfig()
+    z, text = torch.randn(1, 24, 22, 4, 6), torch.randn(1, 5, 16)
+    audio = _silence(22, 0.7, "cpu", torch.Generator().manual_seed(3))
+    total = audio_frames(22)
+    for first in (None, torch.randn(1, 24, 1, 4, 6)):
+        geometry = Geometry(5, 4, 6, first is not None)
+        # block of every row in stock order text | first | audio (low, high) | video; -1 is the prefix
+        audio_block = torch.empty(total, dtype=torch.int64)
+        video_block = torch.empty(22, dtype=torch.int64)
+        for index, (start, stop) in enumerate(config.spans(22)):
+            a0, a1 = Geometry.audio_span(start, stop, 22)
+            audio_block[a0:a1] = index
+            video_block[start:stop] = index                 # eq. 5 with a first block of 6: floor((f + 2) / 8)
+            assert all((f + 2) // 8 == index for f in range(start, stop))
+        block = torch.cat([torch.full((geometry.prefix_rows,), -1), audio_block, audio_block,
+                           video_block.repeat_interleave(geometry.frame_rows)])
+        is_video = torch.zeros_like(block, dtype=torch.bool)
+        is_video[geometry.prefix_rows + 2 * total:] = True
+        i, j = block[:, None], block[None, :]
+        mask = (j == -1) | ((i >= 0) & ((j == i) | ((j < i) & (j >= 0) & is_video[None, :])))
+
+        def masked(attn):
+            def forward(hidden, rotation=None):
+                batch, rows, _ = hidden.shape
+                q, k, v = attn.qkv_proj(hidden).split(attn.inner_dim, dim=-1)
+                q = attn.q_norm(q.reshape(batch, rows, attn.num_heads, attn.head_dim))
+                k = attn.k_norm(k.reshape(batch, rows, attn.num_heads, attn.head_dim))
+                v = v.reshape(batch, rows, attn.num_heads, attn.head_dim)
+                q, k = h3_model._apply_rope_split_half(q, rotation), h3_model._apply_rope_split_half(k, rotation)
+                out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask)
+                return attn.out_proj(out.transpose(1, 2).reshape(batch, rows, -1))
+            return forward
+
+        with torch.no_grad():
+            got = nf_forward(dit, z, 0.4, text, config=config, first=first, audio=audio)
+            dense = nf_forward(dit, z, 0.4, text, first=first, audio=audio)
+            for layer in dit.blocks:
+                layer.attn.forward = masked(layer.attn)
+            try:
+                reference, _layout = _nf_stock(dit, z, 0.4, text, first, audio)
+            finally:
+                for layer in dit.blocks:
+                    del layer.attn.forward
+            assert float((got - reference).abs().max()) < 1e-5, first is None
+            assert float((got - dense).abs().max()) > 1e-2                 # the mask matters
+            # perturb block n: every earlier block is unchanged to the bit, the block itself moves
+            for index, (start, stop) in enumerate(config.spans(22)):
+                moved = z.clone()
+                moved[:, :, start:stop] += torch.randn(1, 24, stop - start, 4, 6)
+                out = nf_forward(dit, moved, 0.4, text, config=config, first=first, audio=audio)
+                assert torch.equal(out[:, :, :start], got[:, :, :start]), index
+                assert float((out[:, :, start:stop] - got[:, :, start:stop]).abs().max()) > 1e-3
+            # a later block's audio does not reach an earlier block either
+            a0, _a1 = Geometry.audio_span(14, 22, 22)
+            loud = audio.clone()
+            loud[..., a0:] += 1.0
+            out = nf_forward(dit, z, 0.4, text, config=config, first=first, audio=loud)
+            assert torch.equal(out[:, :, :14], got[:, :, :14]) and not torch.equal(out[:, :, 14:], got[:, :, 14:])
+            # the prefix reads only itself: text changes everything, but video cannot change what text does
+            other = nf_forward(dit, z, 0.4, torch.randn(1, 5, 16), config=config, first=first, audio=audio)
+            assert float((other[:, :, :6] - got[:, :, :6]).abs().max()) > 1e-3
+
+
+def test_nf_convkv_memory():
+    """Eq. 6-7: kernel = stride = 5 over time, mean init, one conv for K and V; the 2 + 2 + 2 context of fig. 3."""
+    from nf_h3 import ConvKV, ConvKVLayer, LayerState, NFConfig
+
+    layer = ConvKVLayer(8, ratio=5)
+    conv = layer.memory_proj_k
+    assert conv.kernel_size == (5,) and conv.stride == (5,) and conv.bias is None and layer.memory_proj_v is None
+    assert torch.allclose(conv.weight, torch.full_like(conv.weight, 0.2))
+    assert ConvKVLayer(8, shared=False).memory_proj_v is not None
+    states = torch.randn(1, 10 * 3, 2, 4)                    # 10 frames x 3 positions, 2 heads x 4
+    out = layer.compress(states, 3, "k")
+    frames = states.reshape(1, 10, 3, 2, 4)
+    assert out.shape == (1, 2 * 3, 2, 4)
+    assert torch.allclose(out.reshape(1, 2, 3, 2, 4), frames.reshape(1, 2, 5, 3, 2, 4).mean(2), atol=1e-6)   # same position, 5 frames
+    constant = frames[:, :1].expand(-1, 10, -1, -1, -1).reshape(1, 30, 2, 4)
+    assert torch.allclose(layer.compress(constant, 3, "v"), constant[:, :6], atol=1e-6)       # identity on a still
+    with torch.no_grad():
+        conv.weight[3, 0, 4] = 2.0                           # one channel, last tap: the conv is real, not a mean
+    assert not torch.allclose(layer.compress(states, 3, "k"), out)
+    assert torch.equal(layer.compress(states, 3, "k"), layer.compress(states, 3, "v"))        # shared theta
+    try:
+        layer.compress(states[:, :9 * 3], 3, "k")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("9 frames accepted")
+
+    # the fold, with frame f's key filled with the value f: block sizes 6, 8, 8, 8
+    config = NFConfig(memory=True)
+    state = LayerState(config, frame_rows=3)
+    mean = ConvKVLayer(8)
+
+    def kv(start, stop):
+        k = torch.arange(start, stop, dtype=torch.float32).repeat_interleave(3).reshape(1, -1, 1, 1).expand(-1, -1, 2, 4)
+        return k.clone(), -k.clone()
+
+    def frames_of(context):
+        return context[0][0, ::3, 0, 0].tolist()
+
+    assert state.context(0, mean) is None
+    state.push(0, *kv(0, 6))
+    assert frames_of(state.context(1, mean)) == [0, 1, 2, 3, 4, 5]
+    state.push(1, *kv(6, 14))
+    context = state.context(2, mean)                         # ref 0, 1 | conv(2..6), conv(7..11) | short 12, 13
+    assert frames_of(context) == [0, 1, 4, 9, 12, 13] and torch.equal(context[1], -context[0])
+    state.push(2, *kv(14, 22))
+    # the release's recursion: L0' = conv(L0, L1, S0, S1, C0), L1' = conv(C1..C5), S' = (C6, C7)
+    expected = [0, 1, (4 + 9 + 12 + 13 + 14) / 5, 17, 20, 21]
+    assert torch.allclose(torch.tensor(frames_of(state.context(3, mean))), torch.tensor(expected))
+    state.push(3, *kv(22, 30))
+    assert state.window[0].shape[1] == 12 * 3 and state.ref[0].shape[1] == 2 * 3 and state.frames == 30
+    plain = LayerState(NFConfig(), frame_rows=3)             # Stage 1: every earlier frame, uncompressed
+    for index, (start, stop) in enumerate(NFConfig().spans(22)):
+        context = plain.context(index, None)
+        assert (context is None) if index == 0 else frames_of(context) == list(range(start))
+        plain.push(index, *kv(start, stop))
+    try:
+        LayerState(config, 3, window=kv(0, 12), ref=kv(0, 2)).context(2, None)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("memory without a ConvKV module accepted")
+
+    # through the model (one layer, so a row's key depends on its own frame only): a frame in the
+    # compressed range reaches block 2 through the convolution and through nothing else
+    dit = _tiny_h3(num_layers=1)
+    if dit is None:
+        print("SKIPPED test_nf_convkv_memory (model part): musubi_tuner not importable", flush=True)
+        return
+    from h3_musubi import _silence
+    from nf_h3 import nf_forward
+
+    convkv = ConvKV.for_dit(dit)
+    assert len(convkv.layers) == 1 and convkv.layers[0].memory_proj_k.weight.shape == (64, 1, 5)
+    z, text = torch.randn(1, 24, 22, 4, 6), torch.randn(1, 5, 16)
+    audio = _silence(22, 0.7, "cpu", torch.Generator().manual_seed(3))
+    with torch.no_grad():
+        base = nf_forward(dit, z, 0.4, text, config=config, convkv=convkv, audio=audio)
+        stage1 = nf_forward(dit, z, 0.4, text, config=NFConfig(), audio=audio)
+        assert torch.equal(base[:, :, :14], stage1[:, :, :14])            # blocks 0 and 1 are not compressed
+        assert float((base[:, :, 14:] - stage1[:, :, 14:]).abs().max()) > 1e-3
+        for frame, visible in ((0, True), (3, True), (7, True), (11, True), (12, True)):
+            moved = z.clone()
+            moved[:, :, frame] += torch.randn(24, 4, 6)
+            out = nf_forward(dit, moved, 0.4, text, config=config, convkv=convkv, audio=audio)
+            assert (float((out[:, :, 14:] - base[:, :, 14:]).abs().max()) > 1e-4) == visible, frame
+        zero = ConvKV.for_dit(dit)
+        for param in zero.parameters():
+            param.zero_()
+        base0 = nf_forward(dit, z, 0.4, text, config=config, convkv=zero, audio=audio)
+        for frame, visible in ((0, True), (1, True), (3, False), (7, False), (11, False), (12, True), (13, True)):
+            moved = z.clone()
+            moved[:, :, frame] += torch.randn(24, 4, 6)
+            out = nf_forward(dit, moved, 0.4, text, config=config, convkv=zero, audio=audio)
+            assert (float((out[:, :, 14:] - base0[:, :, 14:]).abs().max()) > 1e-4) == visible, frame
+    try:
+        nf_forward(dit, z, 0.4, text, config=config, audio=audio)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("memory forward without ConvKV accepted")
+
+
+def test_nf_stream_equals_parallel():
+    """Fig. 3 right: block-by-block inference with per-step KV caches equals the one-pass masked forward and the
+    step-outer sampler, with and without ConvKV (4 blocks: the recursive fold runs), and the memory cache is bounded."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_stream_equals_parallel: musubi_tuner not importable", flush=True)
+        return
+    from h3_musubi import audio_sigma
+    from nf_h3 import (ConvKV, Geometry, NFConfig, NFStream, NoiseBank, few_step_sigmas, nf_forward,
+                       nf_parallel_sample, nf_stream_sample, parallel_noise)
+
+    text = torch.randn(1, 5, 16)
+    convkv = ConvKV.for_dit(dit)
+    with torch.no_grad():
+        for layer in convkv.layers:
+            layer.memory_proj_k.weight.normal_(0.2, 0.2)     # a trained-looking conv, not the mean
+    sigmas = few_step_sigmas()
+    frames = NFConfig().frames(4)                            # 30 latent frames
+    for memory in (False, True):
+        config = NFConfig(memory=memory)
+        for first in (None, torch.randn(1, 24, 1, 4, 6)):
+            noise = NoiseBank(11, "cpu")
+            kwargs = dict(lat_h=4, lat_w=6, config=config, sigmas=sigmas, noise=noise, first=first,
+                          convkv=convkv if memory else None)
+            # one step: the parallel pass against the stream, block by block
+            sigma = sigmas[1]
+            x, unit = parallel_noise(noise, config, frames, 1, 4, 6)
+            audio = float(audio_sigma(sigma)) * unit
+            with torch.no_grad():
+                whole = nf_forward(dit, x, 1.0 - sigma, text, config=config, convkv=kwargs["convkv"], first=first, audio=audio)
+            stream = NFStream(dit, lat_h=4, lat_w=6, steps=3, config=config, convkv=kwargs["convkv"], first=first,
+                              total_frames=frames)
+            sizes = []
+            for index, (start, stop) in enumerate(config.spans(frames)):
+                a0, a1 = Geometry.audio_span(start, stop, frames)
+                got = stream.velocity(index, 1, x[:, :, start:stop], 1.0 - sigma, text, audio[..., a0:a1])
+                assert float((got - whole[:, :, start:stop]).abs().max()) < 1e-5, (memory, first is None, index)
+                sizes.append(stream.cache_rows(1))
+            prefix = 5 + (6 if first is not None else 0)
+            if memory:      # prefix + 2 reference frames + the 12-slot window, however long the stream
+                assert sizes[1:] == [prefix + 14 * 6] * 3, sizes
+            else:           # Stage 1 keeps everything
+                assert sizes == [prefix + stop * 6 for _start, stop in config.spans(frames)], sizes
+            # the whole sampler, both update rules
+            for sampler in ("renoise", "euler"):
+                with torch.no_grad():
+                    parallel = nf_parallel_sample(dit, text, frames, sampler=sampler, **kwargs)
+                streamed = nf_stream_sample(dit, text, 4, sampler=sampler, total_frames=frames, **kwargs)
+                assert streamed.shape == (1, 24, frames, 4, 6) and bool(torch.isfinite(streamed).all())
+                assert float((streamed - parallel).abs().max()) < 1e-4, (memory, first is None, sampler)
+            state, audio_s = nf_parallel_sample(dit, text, frames, stop_step=0, **kwargs)
+            assert torch.equal(state, parallel_noise(noise, config, frames, 0, 4, 6)[0]) and audio_s.shape[-1] > 0
+    # prompt switching (the release's emotion/action editing): a new prompt from block 2 on changes only blocks 2+
+    config = NFConfig(memory=True)
+    other = torch.randn(1, 5, 16)
+    kwargs = dict(lat_h=4, lat_w=6, config=config, sigmas=sigmas, noise=NoiseBank(11, "cpu"), convkv=convkv)
+    same = nf_stream_sample(dit, text, 3, **kwargs)
+    edited = nf_stream_sample(dit, lambda index: text if index < 2 else other, 3, **kwargs)
+    assert torch.equal(edited[:, :, :14], same[:, :, :14]) and float((edited[:, :, 14:] - same[:, :, 14:]).abs().max()) > 1e-3
+
+
+def test_nf_trainer_updates_on_cpu():
+    """Stage 1 (eq. 4) and Stage 2 (DMD through the ConvKV rollout) updates on the toy H3 with real LoRAs:
+    each side's gradient reaches only its own parameters, and ConvKV is trained by the generator update."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_trainer_updates_on_cpu: musubi_tuner not importable", flush=True)
+        return
+    import argparse
+
+    from h3_musubi import make_lora
+    from nf_h3 import DENSE, ConvKV, NFConfig, nf_forward
+    from train_nf_h3 import NFRun, grad_sum, zero_grads
+
+    gen_net, fake_net = make_lora(dit, 2), make_lora(dit, 2)
+    for net in (gen_net, fake_net):
+        net.requires_grad_(True)
+    gen_params = [p for p in gen_net.parameters()]
+    fake_params = [p for p in fake_net.parameters()]
+    x0, text = torch.randn(1, 24, 22, 4, 6), torch.randn(1, 5, 16)
+    args = argparse.Namespace(stage=1, blocks=[6, 8], ref="first", sigmas="1,0.75,0.5", sampler_shift=12.0,
+                              sampler="renoise", sigma_shift=1.0, tau_shift=1.0)
+    run = NFRun(dit, gen_net, None, None, args, "cpu")
+    eps = torch.randn_like(x0)
+    loss, stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3)
+    # eq. 2 and eq. 4 by hand; the LoRA starts at zero, so this is the base model under the causal mask
+    x_t = 0.4 * x0 + 0.6 * eps
+    with torch.no_grad():
+        by_hand = nf_forward(dit, x_t, 0.4, text, config=NFConfig(), first=x0[:, :, :1],
+                             audio_generator=torch.Generator().manual_seed(3))
+    assert abs(float(loss) - float((by_hand - (x0 - eps)).pow(2).mean())) < 1e-5 and stats["sigma"] == 0.6
+    loss.backward()
+    assert grad_sum(gen_params) > 0
+    dense, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, config=DENSE)
+    assert abs(float(dense) - float(loss)) > 1e-4
+    assert all(0.0 < run.draw_sigma() < 1.0 and 0.02 <= run.draw_tau() <= 0.98 for _ in range(50))
+
+    args.stage = 2
+    convkv = ConvKV.for_dit(dit)
+    with torch.no_grad():
+        for module in fake_net.unet_loras:
+            module.lora_up.weight.normal_(0.0, 0.05)        # fake != real, so the DMD direction is non-zero
+    run = NFRun(dit, gen_net, fake_net, convkv, args, "cpu")
+    assert run.memory.memory and [round(s, 3) for s in run.sigmas] == [1.0, 0.973, 0.923, 0.0]
+    for exit_step in (0, 2):
+        zero_grads(gen_params + fake_params + list(convkv.parameters()))
+        loss, sample, stats = run.generator_update(x0, text, exit_step=exit_step)
+        assert math.isfinite(stats["loss"]) and stats["match"] < 1e-5 and stats["gap"] > 0, stats
+        assert stats["exit_step"] == exit_step and sample[0].shape == x0.shape
+        assert grad_sum(gen_params) > 0 and grad_sum(list(convkv.parameters())) > 0
+        assert grad_sum(fake_params) == 0.0
+        zero_grads(gen_params + list(convkv.parameters()))
+        floss, tau = run.fake_update(sample)
+        assert math.isfinite(float(floss)) and grad_sum(fake_params) > 0 and 0.02 <= tau <= 0.98
+        assert grad_sum(gen_params) == 0.0 and grad_sum(list(convkv.parameters())) == 0.0
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -1241,6 +1649,12 @@ def main():
         test_stream_slide_is_exact_and_bounded,
         test_stream_head_warm_start,
         test_stream_trainer_updates_on_cpu,
+        test_nf_blocks_and_geometry,
+        test_nf_dense_is_stock_h3,
+        test_nf_causal_is_eq5_mask,
+        test_nf_convkv_memory,
+        test_nf_stream_equals_parallel,
+        test_nf_trainer_updates_on_cpu,
     ]
     for test in tests:
         test()
