@@ -18,9 +18,10 @@ GPU script is alive):
 
 (a)-(c) use ``parity_h3.py``'s thresholds: rel_rms <= max(1e-4, 2 x run-to-run floor), max_abs <= 1e-2.
 (d)-(e) compare two different batchings of the same arithmetic (a block alone against the block inside the
-whole clip): equal in exact arithmetic (``test_lot.py`` on the CPU in fp32, 1e-5) but not to the bf16 bit,
-and the 50-block stack amplifies last-bit differences (see ``parity_dir_h3.py``, case d). ``STREAM_BOUND``
-is a ceiling for that, read against the O(1) control ``control`` (the same rows under the wrong context).
+whole clip): equal in exact arithmetic (``test_lot.py`` on the CPU in fp32, 1e-5) but not guaranteed to the
+bf16 bit. Measured: 6.6e-7. ``STREAM_BOUND`` (1e-3) is a ceiling over that, read against the controls
+``control_memory`` (the third block under the Stage 1 context instead of ConvKV, 0.14) and ``control_conv``
+(a perturbed convolution, 0.08).
 
     python3 lot/parity_nf_h3.py
 """
@@ -39,7 +40,7 @@ from lot_paths import LOT_H3_CHECKPOINT  # noqa: E402
 from gpu_guard import refuse_if_busy  # noqa: E402
 
 CHECKPOINT = LOT_H3_CHECKPOINT
-STREAM_BOUND = 0.15
+STREAM_BOUND = 1e-3
 
 
 def rel_rms(left: torch.Tensor, right: torch.Tensor) -> float:
@@ -65,7 +66,10 @@ def main() -> None:
     first = torch.randn(1, 24, 1, height, width, device="cuda", dtype=torch.float32)
     text = torch.randn(1, 4, model.config.text_dim, device="cuda", dtype=torch.bfloat16)
     t = 0.6
-    sigma_a = float(audio_sigma(1.0 - t))
+    # ``predict`` and ``nf_forward`` round t to float32 before the audio sigma; so must the audio made here.
+    # (With the double-precision sigma the silent audio differs in its last bit and the 50-block stack turns
+    # that into 2.4% of the output: measured on the first run of this script.)
+    sigma_a = float(audio_sigma(1.0 - float(torch.as_tensor(t).reshape(-1)[0])))
     audio = silence(audio_frames(frames), sigma_a, "cuda", torch.Generator("cuda").manual_seed(0))
     causal, memory = NFConfig(), NFConfig(memory=True)
 
