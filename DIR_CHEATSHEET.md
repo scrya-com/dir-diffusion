@@ -218,6 +218,7 @@ python3 lot/yardstick_dir_h3.py --out lot/runs/yardstick --report dense turbo s2
 |---|---|---|---|
 | H3, 20 steps | 0.25 | 0.35 | 1.08 |
 | Turbo 4-step | 0.47 | 0.43 | 1.04 |
+| Latest run, step 100, averaged weights | 0.26 | 0.45 | 1.00 |
 
 **Score every name on the same card with the same `--swap`.** The same noise gives visibly different clips on two cards (one prompt's Turbo motion: 0.06 on the 5090 at `--swap 4`, 0.50 on a PRO 4000 at `--swap 18`), so paired differences across cards are not paired.
 
@@ -232,7 +233,7 @@ LOT_H3_TRAIN=1 python3 lot/train_dir_h3.py --init lot/runs/turbo4_init --sigmas 
   --steps 100 --eval-every 25 --save-every 25 --eval-anchors --holdout 8 --seed 0 --out lot/runs/dir_turbo_clip_iter
 ```
 
-Held-out eval of that run, final iteration: motion 0.44 → 0.37 → 0.34 → 0.23 at steps 0 / 25 / 50 / 75 (20-step H3: 0.23), gap to the teacher's answer 0.117 → 0.129 → 0.133 → 0.133. Its step-50 renders are sharp but busier than Turbo's, with no less pixel motion on three clips; steps 75 and 100 are not yet rendered, and the same-card yardstick for all four checkpoints is pending. Its weights are not published; with the same cache, seed and commit the command above retrains them in about 2.5 hours.
+Held-out eval of that run, final iteration: motion 0.44 → 0.37 → 0.34 → 0.23 at steps 0 / 25 / 50 / 75 (20-step H3: 0.23), gap to the teacher's answer 0.117 → 0.129 → 0.133 → 0.133. Same-card yardstick (5090, `--swap 4`): motion 0.45 / 0.43 / 0.35 / 0.22 at steps 25 / 50 / 75 / 100 and 0.26 with step 100's averaged weights (Turbo 0.47, 20-step H3 0.25); detail 0.44–0.46 throughout (Turbo 0.43, H3 0.35). The renders are sharp with less motion than Turbo's, but busier and more tightly framed. Its weights are not published; with the same cache, seed and commit the command above retrains them in about 2.5 hours.
 
 **A 96 GB card** (RTX PRO 6000) runs the same commands. Use the headroom for `--max-latent-hw 48 48` or a larger `--accum`, not a larger rank.
 

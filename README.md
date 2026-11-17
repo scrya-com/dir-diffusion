@@ -168,7 +168,27 @@ Turbo already has nearly twice the teacher's motion and more detail. The control
 - Above about 0.9 the one-call answer is therefore not a posterior mean. On the teacher's own 20-step clips its squared error is 0.08–0.10 at 0.85 and 0.43–1.60 at 0.98 (a constant guess: 0.9–1.2), with a mean square up to 2.6 times the clip's. Dividing the gap by 2–3 brings the error at 0.98 down to 0.28–0.77 and the size back to the clip's.
 - eDMD reads the first iteration on [0.947, 0.99), inside that range. There the direction agrees across draws (cosine of two halves 0.4–0.9) and a small step along it raises size, motion and detail. Scaling the baked guidance to 40% halves that push but does not reverse it. `--read-noise own` does not help.
 - With reads on [0.3, 0.9] a small step along the direction lowers size in every case and lowers motion and detail in most (7 of 9), with or without scaling the guidance. The capped training run nevertheless raised detail, so the read level is not the whole explanation.
-- In both the control and the capped run the damage is in the first iteration: on the three probe clips its size goes from Turbo's 1.02–1.09 to 1.13–1.15 (control) and 1.20–1.22 (capped), and its detail from 0.37–0.45 to 0.54–0.57 and 0.75–0.76. Both use the endpoint fake model, which never sees first-iteration estimates. In the earlier mix-state pair (part 3) the endpoint fake model also raised first-iteration size and detail against the per-iteration one (size 0.98–1.12 against 0.77–0.87). A run with the per-iteration fake model from Turbo is the next test.
+- In both the control and the capped run the damage is in the first iteration: on the three probe clips its size goes from Turbo's 1.02–1.09 to 1.13–1.15 (control) and 1.20–1.22 (capped), and its detail from 0.37–0.45 to 0.54–0.57 and 0.75–0.76. Both use the endpoint fake model, which never sees first-iteration estimates. In the earlier mix-state pair (part 3) the endpoint fake model also raised first-iteration size and detail against the per-iteration one (size 0.98–1.12 against 0.77–0.87). The run with the per-iteration fake model from Turbo is below.
+
+**The per-iteration run** (`--fake-source iteration --tau-max 0.9`, otherwise the capped run; 100 steps, 2026-11-17/18). Same yardstick, every row scored on the RTX 5090 at `--swap 4` (the yardstick table above mixed two cards for no row, but single clips differ between cards, so only same-card rows can be paired):
+
+| | Motion | Detail | Size (rms) | Motion against Turbo, paired |
+|---|---|---|---|---|
+| H3, 20 steps | 0.25 | 0.35 | 1.08 | |
+| Turbo 4-step | 0.47 | 0.43 | 1.04 | |
+| Step 25 | 0.45 | 0.44 | 1.01 | −0.026 ± 0.007 |
+| Step 50 | 0.43 | 0.45 | 1.00 | −0.045 ± 0.015 |
+| Step 75 | 0.35 | 0.44 | 1.01 | −0.123 ± 0.018 |
+| Step 100 | 0.22 | 0.46 | 1.01 | −0.251 ± 0.031 |
+| Step 100, averaged weights | 0.26 | 0.45 | 1.00 | −0.212 ± 0.028 |
+
+- Motion falls to the teacher's level by step 100 (averaged weights 0.26 against 0.25), and the first iteration stays stable (its eval gap is flat from step 25). This is the first run that fixes Turbo's over-motion. The live weights are still falling at step 100, so it has not settled.
+- Detail does not come down: +0.018 ± 0.005 against Turbo with averaged weights, further from the teacher. In pixels, on three decoded clips at step 100, change per frame is 7.6 / 6.1 / 6.5 against Turbo's 11.4 / 9.5 / 11.5 (20-step H3: 10.3 / 1.1 / 5.8), and edge strength is 40–70% above Turbo's. The frames are sharp but busier, framing is tighter, and one prompt gains a second person.
+- Size stays 0.04 below Turbo's from step 25 on.
+
+![20-step H3, Turbo 4-step, per-iteration run at steps 75 and 100 (averaged weights)](assets/dir-turbo-iter-p2.jpg)
+
+Not published: it trades over-motion for over-detail. One run, 2 samples per update; the recipe for a larger batch is in [DIR_CHEATSHEET.md](DIR_CHEATSHEET.md) and [issue #4](https://github.com/scrya-com/dir-diffusion/issues/4).
 
 The calibration table (`lot/calibrate_edmd_h3.py`, 32 prompts) puts H3 between eDMD's FLUX and SD3 cases: mean read 0.966 / 0.898 / 0.790 at landings 0.947 / 0.857 / 0.667, against 0.969 / 0.924 / 0.828 for uniform.
 
