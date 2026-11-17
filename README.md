@@ -97,9 +97,33 @@ Left to right: base H3 at 20 steps, base H3 at 4 Euler steps, DiR iteration 4 at
 
 What this is not: 50 steps, three prompts looked at, frame sheets and pixel statistics only. Nobody has yet watched the clips for flicker or identity drift, there is no later checkpoint, and the stills run was unstable between checkpoints.
 
-### Next: eDMD rules and real clips (added, not yet evaluated)
+### Video, part 3: Turbo 4-step, and two eDMD rules (step 50)
 
-- `--tau-floor sigma` and `--fake-source final`, after eDMD ([arXiv 2611.17194](https://arxiv.org/abs/2611.17194), an image-only paper): iterations before the last are trained only at noise levels at or above the one their estimate is re-noised to, and the fake model is trained on the final output only. The link to motion is our inference from the 0.95 test above, not the paper's claim. Their calibrated noise levels, precise-teacher walk and teacher guidance are not ported. A run with both flags is in progress; no result yet.
+Same three prompts and noise as part 2. Turbo is the 4-step LoRA sampler DiR is meant to improve on (its own sigmas, no estimate input). The two DiR variants add rules from eDMD ([arXiv 2611.17194](https://arxiv.org/abs/2611.17194), an image-only paper) to the part 2 recipe and change nothing else.
+
+![first, middle and last frame: H3 20 steps, H3 4 steps, Turbo 4 steps, DiR baseline, DiR with the endpoint fake model](assets/dir-clip-compare-p2.jpg)
+
+Columns: H3 20 steps, H3 4 Euler steps, Turbo 4 steps, DiR baseline (part 2), DiR with `--fake-source final`. [Clip 0](assets/dir-clip-compare-p0.jpg).
+
+| 4 forwards, step 50 | Distance to H3 20 steps (same noise) | Pixel change per frame, clips 0 / 1 / 2 | By eye |
+|---|---|---|---|
+| H3 20 steps | reference | 10.3 / 1.1 / 5.8 | |
+| H3 4 Euler steps | 0.51 to 0.71 | 3.9 / 1.0 / 3.0 | soft, garbled |
+| Turbo 4 steps | 0.69 to 0.76 | 11.4 / 9.5 / 11.5 | sharp, strongest motion |
+| DiR baseline | 0.57 to 0.64 | 7.6 / 4.4 / 6.0 | sharp, on prompt |
+| DiR + `--fake-source final` | 0.72 to 0.78 | 7.6 / 5.9 / 5.3 | sharp, on prompt |
+| DiR + `--fake-source final --tau-floor sigma` | 0.71 to 0.93 | 8.6 / 11.8 / 9.8 | sharp, off prompt |
+
+- **Turbo is not beaten.** At the same 4 forwards it is as sharp as either DiR run and moves more than the 20-step clip on all three prompts. Its clip 0 opens with black corners and its clip 2 ends pushed into the subject's face. On the 8 stills prompts Turbo is sharp on all 8 and averages 0.57 from the 20-step image, against 0.63 for the stills DiR generator at step 200.
+- **`--tau-floor sigma` breaks DiR.** With it the run drifts off the prompt: clip 0 turns front-on, clip 2 loses its person ([sheet](assets/dir-clip-compare-floor-p2.jpg)), and step 100 is no better (0.71 to 0.89).
+- **Why.** The floor puts iteration 1's noise level in [0.947, 0.98], and about 70% of draws land on the 0.98 cap, where the judged sample is 2% estimate. Measured on the step-100 weights (one clip): the DMD direction there is 7 times larger than at 0.5 (0.63 against 0.09), nearly unrelated between different estimates under the same noise (cosine 0.03 to 0.22), and has no component along the estimate (cosine -0.01). Iteration 1's output grew from rms 1.55 to 2.40 over training, where a finished latent is about 1.0. Iterations 2 to 4 read that estimate: with it replaced by the 20-step latent the final lands 0.52 from the 20-step clip, with its own 0.72, with zeros 0.87.
+- **Why eDMD can use the floor and DiR cannot.** An eDMD student sees its previous prediction only inside the re-noised state, so what the fake model cannot see the next step barely sees either. DiR feeds the estimate through its own clean input at full strength. The DiR paper's Table 2(a) has the same restricted range as a comparison row; its first entry is about 44.9 against 3.85 for the default (our reading of a garbled table extraction).
+- **`--fake-source final` alone is stable and not better.** Iteration 1 settles to rms 1.05 by step 25 as in the baseline, DMD directions are about half the baseline's size, and all three clips stay on prompt. It is further from the 20-step clips than the baseline (0.72 to 0.78 against 0.57 to 0.64). That distance compares single samples from the same noise, which DMD does not optimise, so it ranks closeness to the teacher's sample and not quality.
+
+What this is not: one run per variant, 50 steps each, three prompts, frame sheets and pixel statistics. The floor diagnosis was measured on one clip. eDMD's calibrated noise levels, precise-teacher walk, teacher guidance and gradient normaliser are not ported, and its batch of 16 against our 2 samples per update is a likely part of the difference.
+
+### Next: real clips (built, not trained on)
+
 - `lot/build_clip_cache_h3.py` turns existing clip latents (`z.pt` plus a `meta.json` prompt) into a training cache without re-encoding. With a clip cache, `--frames` cuts real windows aligned to VAE clip starts, the eval scores real clips, and `--priming-weight` has real motion to use. Built once (1,377 clips, 894 prompts); not trained on yet.
 
 ### Speed and memory

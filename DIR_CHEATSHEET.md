@@ -203,7 +203,7 @@ python3 lot/probe_dir_h3.py --out lot/runs/probe_clip --decode s50          # si
 python3 lot/build_clip_cache_h3.py --src /path/to/clips --out /path/to/cache_clips
 ```
 
-`--tau-floor sigma` and `--fake-source final` (after eDMD, arXiv 2611.17194) are available and untested; see the README.
+`--tau-floor sigma` and `--fake-source final` (after eDMD, arXiv 2611.17194): the floor pushes DiR off the prompt, and the endpoint fake model alone is stable but no closer to the teacher at step 50; see the README, "Video, part 3".
 
 Trained result (one run, 300 steps): iteration 4 is sharp on all 8 held-out prompts where base H3 at 4 steps is blurred, and the generator still follows a fed estimate. Checkpoints differ a lot (step 100 collapsed three prompts to a cutaway on white, step 200 did not), so save often and pick by the probe grid. Tables and pictures are in the [README](README.md#results-2026-11-17-what-works-on-h3-and-what-it-costs).
 

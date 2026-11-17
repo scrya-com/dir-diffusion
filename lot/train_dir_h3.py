@@ -162,11 +162,13 @@ class Run:
         return len(self.sigmas) - 1 if getattr(self.args, "fake_source", "iteration") == "final" else r
 
     def draw_tau(self, r: int | None = None) -> float:
-        """A DMD noise level. ``--tau-floor sigma``: iteration ``r`` before the last is only ever consumed
-        re-noised at ``sigmas[r + 1]``, so its estimate is queried (and its fake model trained) at
-        ``tau >= sigmas[r + 1]`` only, the base distribution squeezed into ``[sigmas[r + 1], 1)``. The last
+        """A DMD noise level. ``--tau-floor sigma``: iteration ``r`` before the last is queried at
+        ``tau >= sigmas[r + 1]`` only, the base distribution squeezed into ``[sigmas[r + 1], 1)``; the last
         iteration keeps the whole range. After eDMD (arXiv 2611.17194, eq. 11-12: step k queried at
-        ``tau >= sigma_{k+1}``); without it every intermediate estimate is asked to be a finished sample."""
+        ``tau >= sigma_{k+1}``). Measured to break DiR (README, "Video, part 3"): eDMD's student sees its
+        prediction only inside the re-noised state, DiR also feeds the estimate through ``x0_proj`` at full
+        strength, so an estimate judged only at 2-5% signal drifts and the later iterations follow it. With
+        ``grid:6`` and ``beta:2.5`` most r = 0 draws also land on ``TAU_MAX``."""
         tau = self._base_tau()
         if r is not None and getattr(self.args, "tau_floor", "none") == "sigma" and r + 1 < len(self.sigmas):
             floor = float(self.sigmas[r + 1])
@@ -588,7 +590,8 @@ def main() -> None:
                              "costs a full rollout. Not in the DiR paper")
     parser.add_argument("--tau-floor", choices=["none", "sigma"], default="none",
                         help="sigma: with a --sigmas grid, iterations before the last get DMD noise levels at or above "
-                             "the sigma their estimate is re-noised to (after eDMD, arXiv 2611.17194). Not in the DiR paper")
+                             "the sigma their estimate is re-noised to (after eDMD, arXiv 2611.17194). Not in the DiR paper; "
+                             "measured to push DiR off the prompt (README, Video part 3)")
     parser.add_argument("--frames", type=int, default=1,
                         help="latent frames per training sample: 1 (default) trains on stills; 5n+2 (7, 12, ...) "
                              "trains on clip-shaped noise, H3's chunk layout, so the DMD target is the teacher's "
