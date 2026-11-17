@@ -272,6 +272,7 @@ Building a cache from your own clips, and every path variable, are covered in [`
 | [`lot/bench_dir_h3.py`](lot/bench_dir_h3.py) | Time and peak memory of DiR sampling against the dense sampler, per canvas |
 | [`lot/stream_dir_h3.py`](lot/stream_dir_h3.py) | Streaming DiR: sliding 5n+2 window, per-frame `r`, FL2VA first-frame hand-off, coarse memory keyframes |
 | [`lot/train_stream_dir_h3.py`](lot/train_stream_dir_h3.py) / [`lot/render_stream_h3.py`](lot/render_stream_h3.py) / [`lot/parity_stream_h3.py`](lot/parity_stream_h3.py) | Streaming DMD trainer, mp4 renderer, GPU parity and timing |
+| [`lot/nf_h3.py`](lot/nf_h3.py) / [`lot/train_nf_h3.py`](lot/train_nf_h3.py) / [`lot/render_nf_h3.py`](lot/render_nf_h3.py) / [`lot/parity_nf_h3.py`](lot/parity_nf_h3.py) | Experimental, untrained: Neighbor Forcing and ConvKV Memory (SoulX-LiveAct, [arXiv 2603.11746](https://arxiv.org/abs/2603.11746)) on H3: block-causal same-step context, per-step KV caches, a 6-slot convolutional memory. Paper-to-code table, deviations and what was run: [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md) |
 | [`DIR_CHEATSHEET.md`](DIR_CHEATSHEET.md) | Getting started: samples, cache, training recipe, renders, streaming |
 | [`lot/h3_musubi.py`](lot/h3_musubi.py) | H3 runtime glue; `forward_video` with the `video_extra` and `video_temb_delta` hooks |
 | [`lot/`](lot) (rest) | Level-of-Token Diffusion for H3, unchanged from [scrya-com/lot-diffusion](https://github.com/scrya-com/lot-diffusion); start at [`lot/CHEATSHEET.md`](lot/CHEATSHEET.md) |
