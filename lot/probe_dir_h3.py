@@ -64,6 +64,7 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=1, help="latent frames (1 = stills; 5n+2 for clips)")
     parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--swap", type=int, default=16)
+    parser.add_argument("--ema", action="store_true", help="load the run's averaged weights (--ema runs)")
     parser.add_argument("--decode", nargs="+", default=None, metavar="NAME")
     parser.add_argument("--cell", type=int, default=384)
     args = parser.parse_args()
@@ -87,7 +88,7 @@ def main() -> None:
     R = args.iterations
     config, net = {}, None
     if args.run is not None:
-        head, net, config = load_dir_run(args.run, dit, tag=f"_{args.tag}" if args.tag else "")
+        head, net, config = load_dir_run(args.run, dit, tag=f"_{args.tag}" if args.tag else "", ema=args.ema)
     else:
         head = DirHead(dit.config.hidden_size, probe_temb_dim(dit), R).to(dev).eval()
         if args.x0_proj_copy is not None:

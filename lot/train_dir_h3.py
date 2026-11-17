@@ -107,6 +107,38 @@ FLOOR_TAU_MAX = 0.99      # --tau-floor sigma: top of the read window (eDMD)
 
 # ------------------------------------------------------------------------------- pieces
 
+class ReadLaw:
+    """``p(tau) ∝ exp(-d(tau))`` on ``[lower, upper)``, ``d`` linear between a calibration row's levels and
+    clamped at its ends (eDMD's calibrated read law). Inverse-CDF draw on a fine grid."""
+
+    def __init__(self, levels, d, lower: float, upper: float, points: int = 4001):
+        import numpy as np
+
+        self.grid = np.linspace(lower, upper, points)
+        density = np.exp(-np.interp(self.grid, np.asarray(levels, float), np.asarray(d, float)))
+        cum = np.concatenate([[0.0], np.cumsum(0.5 * (density[1:] + density[:-1]) * np.diff(self.grid))])
+        self.cdf = cum / cum[-1]
+        weighted = self.grid * density
+        self.mean = float((0.5 * (weighted[1:] + weighted[:-1]) * np.diff(self.grid)).sum() / cum[-1])
+
+    def draw(self, u: float) -> float:
+        import numpy as np
+
+        return float(min(np.interp(u, self.cdf, self.grid), self.grid[-1] - 1e-6))
+
+
+def load_read_laws(path, sigmas, tolerance: float = 5e-3) -> list:
+    """One :class:`ReadLaw` per iteration before the last from a ``calibrate_edmd_h3.py`` table; the table's
+    landing points must be this run's ``sigmas[1:]``."""
+    table = json.loads(Path(path).read_text())
+    landing = [float(v) for v in table["landing"]]
+    if len(landing) != len(sigmas) - 1 or any(abs(a - float(b)) > tolerance for a, b in zip(landing, sigmas[1:])):
+        raise SystemExit(f"--tau-floor {path}: measured at landing points {landing}, this run lands at "
+                         f"{[round(float(v), 4) for v in sigmas[1:]]} (measure a table for this grid)")
+    return [ReadLaw(table["levels"][k], table["d"][k], max(landing[k], TAU_MIN), FLOOR_TAU_MAX)
+            for k in range(len(landing))]
+
+
 class Run:
     """Everything one update needs, so ``--check``, training and eval share the same code."""
 
@@ -122,6 +154,8 @@ class Run:
         # Priming references draw from their own stream so the global torch RNG (z, tau, eps) is
         # the same with and without --priming-weight: a paired A/B against a run without it.
         self.prime_rng = torch.Generator().manual_seed(args.seed + 7919)
+        floor = getattr(args, "tau_floor", "none")
+        self.laws = None if floor in ("none", "sigma") else load_read_laws(floor, self.sigmas)
 
     def schedule(self, z: torch.Tensor) -> list:
         """Layouts for ``z``'s token grid (cached per shape)."""
@@ -163,22 +197,40 @@ class Run:
         return len(self.sigmas) - 1 if getattr(self.args, "fake_source", "iteration") == "final" else r
 
     def draw_tau(self, r: int | None = None) -> float:
-        """A DMD noise level. ``--tau-floor sigma``: iteration ``r`` before the last is queried at
-        ``tau >= sigmas[r + 1]`` only, uniform on ``[sigmas[r + 1], 0.99)``; the last iteration keeps the
-        whole range, and with ``--fake-source final`` the fake model trains at ``U[0.02, 0.99)``. After eDMD
-        (arXiv 2611.17194, eq. 11-12: step k queried at
-        ``tau >= sigma_{k+1}``). The first port of this flag (squeezed base distribution, clamp at 0.98) pushed a
-        clip run off the prompt; see the README, "Video, part 3"."""
-        floored = getattr(self.args, "tau_floor", "none") == "sigma"
-        if floored and r is not None and r + 1 < len(self.sigmas):
-            # eDMD's uncalibrated law: uniform on [sigma_{r+1}, 0.99). (Until 2026-11-17 this squeezed the base
-            # distribution into the window and clamped at TAU_MAX: with grid:6 about 70% of r = 0 draws were 0.98.)
+        """A DMD noise level for a read at iteration ``r`` (``None``: the endpoint fake model's own training).
+
+        Default: the base distribution (``--tau-shift``) for everything, the DiR paper.
+        ``--tau-floor sigma | TABLE.json``: eDMD's read law (arXiv 2611.17194, eq. 11-12 and ``edmd.yaml``).
+        Iteration ``r`` before the last is read at ``tau >= sigmas[r + 1]`` only, on ``[sigmas[r + 1], 0.99)``:
+        uniform (``sigma``), or with the calibrated density ``exp(-d(tau))`` of a table measured by
+        ``calibrate_edmd_h3.py``. The last iteration and the fake model draw uniform on ``[0.02, 0.99)``.
+        The first port of this flag (base distribution squeezed into the window, clamp at 0.98) pushed a clip
+        run off the prompt; see the README, "Video, part 3"."""
+        if getattr(self.args, "tau_floor", "none") == "none":
+            return self._base_tau()
+        if r is not None and r + 1 < len(self.sigmas):
+            if self.laws is not None:
+                return self.laws[r].draw(float(torch.rand(())))
             floor = float(self.sigmas[r + 1])
             return floor + (FLOOR_TAU_MAX - floor) * float(torch.rand(()))
-        if floored and r is None and getattr(self.args, "fake_source", "iteration") == "final":
-            # the endpoint fake model has to cover the floored reads: eDMD trains it at U[0.02, 0.99)
-            return TAU_MIN + (FLOOR_TAU_MAX - TAU_MIN) * float(torch.rand(()))
-        return self._base_tau()
+        return TAU_MIN + (FLOOR_TAU_MAX - TAU_MIN) * float(torch.rand(()))
+
+    def teacher_x0(self, x_tau, tau: float, r: int, text, seed: int):
+        """The frozen base model's clean answer at ``(x_tau, tau)`` (call with every LoRA off).
+
+        ``--precise-teacher K`` (eDMD's precise teacher): a read of the LAST iteration at or below its input
+        level ``sigmas[-1]`` is answered by a K-node Euler walk of the teacher from ``tau`` to 0 (nodes
+        ``tau * linspace(1, 1/K, K)``) instead of one call; where the walk lands is the answer. K = 1 and every
+        other read: one call. One audio-noise generator runs through the walk, as in the dense sampler."""
+        nodes = int(getattr(self.args, "precise_teacher", 0) or 0)
+        audio = self.audio(seed + 99)
+        if nodes <= 1 or r != len(self.sigmas) - 1 or tau > float(self.sigmas[-1]):
+            return real_x0(self.dit, x_tau, tau, text, audio_generator=audio)
+        x, levels = x_tau, [tau * (1.0 - k / nodes) for k in range(nodes)] + [0.0]
+        for t, t_next in zip(levels[:-1], levels[1:]):
+            x0 = real_x0(self.dit, x, t, text, audio_generator=audio)
+            x = ((t_next / t) * x.float() + (1.0 - t_next / t) * x0).to(x_tau.dtype)
+        return x.float()
 
     def _base_tau(self) -> float:
         dist = self.args.tau_shift
@@ -254,7 +306,7 @@ class Run:
         eps = torch.randn_like(x0_hat)
         x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
-            x0_real = real_x0(self.dit, x_tau, tau, text, audio_generator=self.audio(seed + 99))
+            x0_real = self.teacher_x0(x_tau, tau, r, text, seed)
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
             x0_fake = fake_x0(self.dit, self.fake_head, x_tau, tau, self.fake_index(r), text,
                               audio_generator=self.audio(seed + 99))
@@ -320,6 +372,9 @@ class Run:
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=True), torch.enable_grad():
             out = fake_velocity(self.dit, self.fake_head, x_tau, tau, r, text)
             loss = F.mse_loss(out, x0_hat - eps)       # H3 head convention: x0 - eps
+            if getattr(self.args, "fake_loss_weight", "none") == "edmd":
+                # eDMD's critic weight: clamp(SNR, 1, 10) on the tau-scaled residual tau (v - target)
+                loss = loss * (tau * tau * min(max(((1.0 - tau) / tau) ** 2, 1.0), 10.0))
             if backward:
                 (loss * self.loss_scale).backward()
         return loss, tau
@@ -499,13 +554,13 @@ def check(run: Run, groups: dict, items, rng, device) -> None:
 
 # ------------------------------------------------------------------------------- main
 
-def make_optimizer(groups, betas=(0.9, 0.999)):
+def make_optimizer(groups, betas=(0.9, 0.999), weight_decay: float = 0.0):
     betas = tuple(betas)
     try:
         import bitsandbytes as bnb
-        return bnb.optim.AdamW8bit(groups, weight_decay=0.0, betas=betas), "adamw8bit"
+        return bnb.optim.AdamW8bit(groups, weight_decay=weight_decay, betas=betas), "adamw8bit"
     except ImportError:
-        return torch.optim.AdamW(groups, weight_decay=0.0, betas=betas), "adamw"
+        return torch.optim.AdamW(groups, weight_decay=weight_decay, betas=betas), "adamw"
 
 
 def parse_tau(value: str):
@@ -593,11 +648,24 @@ def main() -> None:
                              "iteration's estimate. final: trained on the last iteration's output only and read with the "
                              "last index at every r (eDMD's endpoint critic, arXiv 2611.17194); each fake update then "
                              "costs a full rollout. Not in the DiR paper")
-    parser.add_argument("--tau-floor", choices=["none", "sigma"], default="none",
-                        help="sigma: with a --sigmas grid, iterations before the last get DMD noise levels at or above "
-                             "the sigma their estimate is re-noised to (after eDMD, arXiv 2611.17194). Not in the DiR paper; "
-                             "uniform on [sigma, 0.99); the first port of this flag pushed a run off the prompt "
-                             "(README, Video part 3)")
+    parser.add_argument("--tau-floor", default="none", metavar="none|sigma|TABLE.json",
+                        help="eDMD's read law (arXiv 2611.17194) with a --sigmas grid: iterations before the last are "
+                             "read at or above the sigma they land on, on [sigma, 0.99): uniform (sigma) or with the "
+                             "calibrated density of a calibrate_edmd_h3.py table; the last iteration and the fake "
+                             "model draw uniform on [0.02, 0.99). Not in the DiR paper")
+    parser.add_argument("--precise-teacher", type=int, default=0, metavar="K",
+                        help="eDMD's precise teacher: the last iteration's reads at or below its input sigma are "
+                             "answered by a K-node Euler walk of the teacher to 0 (eDMD: 4) instead of one call; "
+                             "K - 1 extra teacher forwards on those reads. 0 = off")
+    parser.add_argument("--fake-loss-weight", choices=["none", "edmd"], default="none",
+                        help="edmd: weight the fake model's velocity loss by tau^2 clamp(SNR, 1, 10) (eDMD's critic)")
+    parser.add_argument("--fake-grad-clip", type=float, default=None,
+                        help="gradient-norm clip of the fake model (default: --grad-clip; eDMD: 1.0 against 3.0)")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay, both optimizers (eDMD: 0.01)")
+    parser.add_argument("--lr-warmup", type=int, default=0,
+                        help="generator updates of linear learning-rate warm-up (eDMD: 100); 0 = off")
+    parser.add_argument("--fake-first", action="store_true",
+                        help="run the fake updates before the generator update, all on fresh rollouts (eDMD's order)")
     parser.add_argument("--frames", type=int, default=1,
                         help="latent frames per training sample: 1 (default) trains on stills; 5n+2 (7, 12, ...) "
                              "trains on clip-shaped noise, H3's chunk layout, so the DMD target is the teacher's "
@@ -701,8 +769,9 @@ def main() -> None:
     if adapter_params:
         gen_groups.append({"params": adapter_params, "lr": args.lr})
     fake_groups = fake_lora_groups + [{"params": list(fake_head.parameters()), "lr": args.fake_lr}]
-    gen_opt, opt_name = make_optimizer(gen_groups, args.betas)
-    fake_opt, _ = make_optimizer(fake_groups, args.betas)
+    gen_opt, opt_name = make_optimizer(gen_groups, args.betas, args.weight_decay)
+    fake_opt, _ = make_optimizer(fake_groups, args.betas, args.weight_decay)
+    gen_base_lrs = [group["lr"] for group in gen_opt.param_groups]
     param_groups = {
         "gen_lora": [p for g in gen_lora_groups for p in g["params"]],
         "dir_head": head_params,
@@ -752,7 +821,7 @@ def main() -> None:
           f"allocated_mb={torch.cuda.memory_allocated() / 2**20:.0f}", flush=True)
 
     run = Run(dit, head, fake_head, gen_net, fake_net, adapter, args, device)
-    if args.tau_floor == "sigma" and min(run.sigmas) >= 1.0:
+    if args.tau_floor != "none" and min(run.sigmas) >= 1.0:
         raise SystemExit("--tau-floor sigma needs a --sigmas grid below 1 (with sigma pinned at 1 the floor is 1)")
     if args.check:
         check(run, param_groups, train_items, rng, device)
@@ -768,7 +837,9 @@ def main() -> None:
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
             "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas, "mix_state": run.mix_state,
             "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr,
-            "tau_floor": args.tau_floor, "fake_source": args.fake_source, "frames": FRAMES, "eval_frames": EVAL_FRAMES, "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
+            "tau_floor": str(args.tau_floor), "precise_teacher": args.precise_teacher, "fake_loss_weight": args.fake_loss_weight,
+            "fake_grad_clip": args.fake_grad_clip, "weight_decay": args.weight_decay, "lr_warmup": args.lr_warmup,
+            "fake_first": args.fake_first, "lr": args.lr, "fake_lr": args.fake_lr, "fake_source": args.fake_source, "frames": FRAMES, "eval_frames": EVAL_FRAMES, "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
             "swap": args.swap, "gpu": torch.cuda.get_device_name(device)}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
@@ -898,7 +969,7 @@ def main() -> None:
                 floss, _tau = run.fake_update(torch.randn_like(x1), text1, r1)
                 losses.append(float(floss.detach()))
             run.loss_scale = 1.0
-            clip(fake_params, args.grad_clip)
+            clip(fake_params, args.grad_clip if args.fake_grad_clip is None else args.fake_grad_clip)
             fake_opt.step()
             log.write(json.dumps({"fake_warmup": w + 1, "fake_loss": sum(losses) / len(losses)}) + "\n")
             if (w + 1) % 10 == 0 or w + 1 == args.fake_warmup:
@@ -909,11 +980,38 @@ def main() -> None:
         torch.set_rng_state(cpu_state)
         torch.cuda.set_rng_state(cuda_state, device)
         evaluate(0)      # fake_real is now the warmed fake's view of the untouched generator
+    fake_clip = args.grad_clip if args.fake_grad_clip is None else args.fake_grad_clip
+
+    def fake_phase(step: int, samples) -> list:
+        """--fake-updates fake steps. With the generator step's ``samples`` the first reuses them (detached),
+        the rest draw fresh rollouts (Algorithm 1 draws fresh ones for every update; the reuse saves the
+        rollouts). ``samples`` None (--fake-first): every update is fresh."""
+        losses = []
+        for k in range(args.fake_updates):
+            fake_opt.zero_grad(set_to_none=True)
+            for j in range(args.accum):
+                run.loss_scale = 1.0 / args.accum
+                if k == 0 and samples is not None:
+                    z, text, r, x0_hat = samples[j]
+                    floss, _tau = run.fake_update(z, text, r, x0_hat)
+                else:
+                    x1, text1 = load_item(rng.choice(train_items), rng, device)
+                    r1 = (step - 1) % args.iterations if args.r_schedule == "mod" else rng.randrange(args.iterations)
+                    floss, _tau = run.fake_update(torch.randn_like(x1), text1, r1)
+                losses.append(float(floss.detach()))
+            run.loss_scale = 1.0
+            clip(fake_params, fake_clip)
+            fake_opt.step()
+            fake_opt.zero_grad(set_to_none=True)
+        return losses
+
     started = time.perf_counter()
     for step in range(args.resume_step + 1, args.steps + 1):
         # One generator update = --accum samples (each its own prompt, noise, r and tau), grads
         # summed with 1/accum so the step matches a batch of that size. Batch 1 is the H3 runtime's limit.
         gen_opt.zero_grad(set_to_none=True)
+        if args.fake_first:
+            fake_losses = fake_phase(step, None)
         samples, all_stats = [], []
         for _ in range(args.accum):
             x0, text = load_item(rng.choice(train_items), rng, device)
@@ -927,28 +1025,15 @@ def main() -> None:
             all_stats.append(stats)
         run.loss_scale = 1.0
         grad_norm = clip(gen_params, args.grad_clip)
+        if args.lr_warmup:
+            for group, base in zip(gen_opt.param_groups, gen_base_lrs):
+                group["lr"] = base * min(1.0, step / args.lr_warmup)
         gen_opt.step()
         if ema is not None:
             ema.update()
         gen_opt.zero_grad(set_to_none=True)
-        # Fake updates: the first reuses the generator step's detached samples, the rest draw fresh
-        # rollouts (Algorithm 1 draws fresh ones for every update; the reuse saves the rollouts).
-        fake_losses = []
-        for k in range(args.fake_updates):
-            fake_opt.zero_grad(set_to_none=True)
-            for z, text, r, x0_hat in samples:
-                run.loss_scale = 1.0 / args.accum
-                if k == 0:
-                    floss, _tau = run.fake_update(z, text, r, x0_hat)
-                else:
-                    x1, text1 = load_item(rng.choice(train_items), rng, device)
-                    r1 = (step - 1) % args.iterations if args.r_schedule == "mod" else rng.randrange(args.iterations)
-                    floss, _tau = run.fake_update(torch.randn_like(x1), text1, r1)
-                fake_losses.append(float(floss.detach()))
-            run.loss_scale = 1.0
-            clip(fake_params, args.grad_clip)
-            fake_opt.step()
-            fake_opt.zero_grad(set_to_none=True)
+        if not args.fake_first:
+            fake_losses = fake_phase(step, samples)
         stats = {key: (sum(s[key] for s in all_stats) / len(all_stats)
                        if all(isinstance(s[key], (int, float)) for s in all_stats) else all_stats[-1][key])
                  for key in all_stats[0]}

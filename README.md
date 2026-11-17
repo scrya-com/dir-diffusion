@@ -116,7 +116,7 @@ Columns: H3 20 steps, H3 4 Euler steps, Turbo 4 steps, DiR baseline (part 2), Di
 
 - **Turbo is not beaten.** At the same 4 forwards it is as sharp as either DiR run and moves more than the 20-step clip on all three prompts. Its clip 0 opens with black corners and its clip 2 ends pushed into the subject's face. On the 8 stills prompts Turbo is sharp on all 8 and averages 0.57 from the 20-step image, against 0.63 for the stills DiR generator at step 200.
 - **The first port of `--tau-floor sigma` broke the run.** With it the run drifts off the prompt: clip 0 turns front-on, clip 2 loses its person ([sheet](assets/dir-clip-compare-floor-p2.jpg)), and step 100 is no better (0.71 to 0.89).
-- **What the first port did.** It squeezed the noise distribution into each window and clamped at 0.98, so iteration 1's window was [0.947, 0.98] and about 70% of its draws were exactly 0.98, where the judged sample is 2% estimate. The fake model saw that range in only about 13% of its updates. eDMD draws uniformly on [landing level, 0.99) and trains its fake model on U[0.02, 0.99); the flag now does the same (not yet re-run).
+- **What the first port did.** It squeezed the noise distribution into each window and clamped at 0.98, so iteration 1's window was [0.947, 0.98] and about 70% of its draws were exactly 0.98, where the judged sample is 2% estimate. The fake model saw that range in only about 13% of its updates. eDMD draws uniformly on [landing level, 0.99) and trains its fake model on U[0.02, 0.99); the flag now does the same. Resumed for 20 steps from the stable `--fake-source final` weights with that law, iteration 1 still grew (rms 1.41 to 1.86, one parameter-gradient norm of 5.4), at learning rate 1e-4 with no clipping and a fake model that was not re-warmed for the new range.
 - **What was measured on those weights** (two clips). Iteration 1's output grew from rms 1.55 to 2.40 over training, where a finished latent is about 1.0. The DMD direction at 0.98 is 7 times larger than at 0.5 (0.63 against 0.09) and agrees between noise draws (pairwise cosine 0.40 and 0.53), so it is a consistent push and not jitter. On one of the two clips the push points along the estimate itself (cosine 0.44), which makes it larger; on the other it does not (-0.02).
 - **The estimate travels through the state, not the clean input.** At step 100, zeroing the `x0_proj` input at every iteration moves the final latent by 0.10 to 0.12; replacing the estimate inside the mixed state moves it by 0.66 to 0.95. So the later iterations follow a bad first estimate through the 5% of it that is mixed into the next state, which is the same route an eDMD student uses. eDMD's premise therefore holds for the mix-state form, and the failure is in this port's read levels, fake-model coverage and step size (2 samples per update, no normaliser, no clipping, against eDMD's batch of 16), not in DiR's extra input. An earlier version of this section blamed the clean input; that was wrong.
 - **The DiR paper's Table 2(a)** has the same restricted range as a comparison row for its pinned form; its first entry is about 44.9 against 3.85 for the default (our reading of a garbled table extraction).
@@ -124,7 +124,19 @@ Columns: H3 20 steps, H3 4 Euler steps, Turbo 4 steps, DiR baseline (part 2), Di
 
 What this is not: one run per variant, 50 steps each, three prompts, frame sheets and pixel statistics. The floor diagnosis was measured on two clips. eDMD's calibrated noise levels, precise-teacher walk and teacher guidance are not ported.
 
-### Next: real clips (built, not trained on)
+### Next: the rest of eDMD, from Turbo's weights (added, not yet evaluated)
+
+eDMD's student is a 4-step Euler sampler, which is what Turbo is, so the aligned recipe starts from Turbo's LoRA with its own sigmas and a zero DiR head (step 0 is Turbo). Added behind flags, defaults unchanged:
+
+- `--tau-floor sigma | TABLE.json`: eDMD's read law. Iterations before the last are read on [their landing sigma, 0.99), uniform or with the calibrated density of a table from `lot/calibrate_edmd_h3.py`; the last iteration and the fake model draw uniform on [0.02, 0.99). The law code reproduces the paper's mean read level for SD3 (0.913 at landing 0.900) from eDMD's own table.
+- `--precise-teacher 4`: the last iteration's reads at or below its input sigma are answered by a 4-node Euler walk of the teacher to 0. One node reproduces the single call exactly.
+- `--fake-loss-weight edmd`, `--fake-grad-clip`, `--weight-decay`, `--lr-warmup`, `--fake-first`: eDMD's fake-model loss weight and update settings.
+- Teacher guidance is not ported because there is none to port: eDMD trains at the teacher's default guidance and this repo samples H3 unguided.
+- Not matched: eDMD's batch of 16 and 2,000 updates.
+
+A control (Turbo start, endpoint fake model only) and the aligned run are in progress; no result yet.
+
+### Real clips (built, not trained on)
 
 - `lot/build_clip_cache_h3.py` turns existing clip latents (`z.pt` plus a `meta.json` prompt) into a training cache without re-encoding. With a clip cache, `--frames` cuts real windows aligned to VAE clip starts, the eval scores real clips, and `--priming-weight` has real motion to use. Built once (1,377 clips, 894 prompts); not trained on yet.
 
