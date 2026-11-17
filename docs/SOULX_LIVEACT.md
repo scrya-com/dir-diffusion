@@ -47,27 +47,27 @@ Nothing under `third_party/` and no H3 weight is modified. New parameters are th
 
 Each one is a decision made here. The reviewer should treat these as the places where this port is not the paper.
 
-1. **No driving audio, no audio cross-attention.** The paper's model is driven by speech through audio cross-attention layers (from InfiniteTalk) and Stage 1 trains exactly those layers. H3 has no such layers: its audio is a generated modality in the same token sequence. The cached clips carry no audio latents. Audio rows here are silent noise at the matching audio sigma, with no loss, as in the rest of this repo. Lip-sync, the paper's headline result, is therefore out of scope.
-2. **Trained parameters.** Stage 1 trains a LoRA on `qkv_proj`, `out_proj`, `fc1`, `fc2` of every block (rank 16), not audio cross-attention. Stage 2 trains that LoRA and ConvKV for the generator and a second LoRA for the fake score. The paper does not say what Stage 2 trains beyond "ConvKV Memory ... jointly optimized".
+1. **Audio conditioning without audio cross-attention.** The paper's model is driven by speech through audio cross-attention layers (wav2vec features, layers from InfiniteTalk). H3 has no such layers: its audio is a modality in the same token sequence as the video. The H3 form of `c_audio` here is `--audio driving`: the clip's clean H3 audio latent is fed as the audio rows, at H3's clean-condition time (`AUDIO_CLEAN = 1.0`) instead of the video's noise level, and each block reads the audio of its own time span (`nf_forward(audio=..., audio_t=AUDIO_CLEAN)`, `nf_stream_sample(audio=...)`). The audio latents are `audio_latent.pt` in the clips' source folders (`LOT_H3_CLIPS_SOURCE`); the clip cache itself holds video and text only. The default is still `--audio silent` (silent noise rows at the matching audio sigma, no loss, as in the rest of this repo), because that is what the parity script and the smoke runs used; `--audio driving` has CPU tests and GPU dry passes only (see below). Whether H3 uses clean audio rows the way Wan uses audio cross-attention (lip-sync, the paper's headline result) is untested.
+2. **Trained parameters.** Fig. 2 marks them with fire and snowflake icons. Stage 1: only the audio cross-attention is trained; self-attention and text & image cross-attention are frozen, so the causal behaviour itself is not trained in Stage 1. Stage 2: ConvKV, self-attention and text & image cross-attention are trained, audio cross-attention is frozen; the real score is frozen and the fake score trained. H3 has one attention per block for everything, so the split cannot be reproduced. Here Stage 1 trains a LoRA (rank 16) on `qkv_proj`, `out_proj`, `fc1`, `fc2` of every block; Stage 2 trains that LoRA and ConvKV for the generator and a second LoRA for the fake score. No full fine-tune.
 3. **Single-stream prefix.** In Wan, text and the reference image enter by cross-attention and channel concatenation, so the mask of eq. 5 only concerns video tokens. In H3 they are rows of the same self-attention. Here text rows and the FL2VA `first` rows are a *prefix*: every block reads it, and it reads only itself. That is what cross-attention gives Wan (text states do not depend on video) and it is what makes the prefix cacheable. The base H3 lets text rows read video; this port does not, under the causal mask.
 4. **Audio rows under the mask.** Each audio frame belongs to the block that contains its time and is visible to that block only. Earlier blocks' audio is not part of any later block's context (the context is video keys/values, as in the paper).
 5. **Reference frames.** The paper's "two chunks represent the reference image" are, in the release, the first two latent frames of the first generated block (Wan I2V has put the reference image into them by channel concatenation). Here the same two frames are kept, and in addition the reference image is given the way H3 was trained to take it: one clean latent frame as the FL2VA `first` condition (`--ref first`, the default; `--ref none` removes it).
 6. **RoPE reset on H3's time axis.** Eq. 7 says the compressed keys are aligned "to the starting position `s`"; fig. 3 draws them at ℛ2, ℛ3; the release re-indexes the whole 14-slot window every iteration (keys rotated from frame index 0, the current block always at 6..13). H3's rotary time is not a frame index: latent frame `5k` spans one pixel frame and the others four. Here the two reference frames and the two long-term slots take the times of slots 0-3 of the first window (as the release), and the short-term frames and the current block keep their true spacing, translated so the first short-term frame is at slot 4. Positions are bounded for any stream length. Stage 1 (`memory=False`) keeps true positions.
 7. **RoPE on values.** Eq. 7 writes `RoPE(Conv_θ(v), freq_s)`. Attention rotates queries and keys only (in H3 and in the release); values are not rotated here.
 8. **The convolution's axis.** The paper: "reduces every five chunks of KV states into a single chunk", i.e. along time. The release's `k_compress` runs its `Conv1d` along the flattened token axis of a 5-frame slice, which merges 5 raster-adjacent tokens (and its `kv_mean` option groups the same way). This port follows the paper's text: five frames at the same spatial position.
-9. **The convolution's form.** Depthwise (one filter per channel, 7168 x 5 weights per DiT block), no bias, initialised to `1/5`, i.e. the mean. This is the release's `memory_proj_k`; the paper says only "lightweight 1D convolution". ConvKV cannot be zero-initialised (a zero convolution removes the memory instead of reproducing the base model); the mean is an identity on a still. One convolution serves keys and values, as eq. 6 writes (`Conv_θ` twice) and as the release behaves (`v_compress` calls `memory_proj_k`); `--separate-v` gives values their own.
+9. **The convolution's form.** Applied to the keys after `k_norm` and before the rotary rotation, and to the raw values, with no re-normalisation of the compressed keys (as the release; the paper does not say). Depthwise (one filter per channel, 7168 x 5 weights per DiT block), no bias, initialised to `1/5`, i.e. the mean. This is the release's `memory_proj_k`; the paper says only "lightweight 1D convolution". ConvKV cannot be zero-initialised (a zero convolution removes the memory instead of reproducing the base model); the mean is an identity on a still. One convolution serves keys and values, as eq. 6 writes (`Conv_θ` twice) and as the release behaves (`v_compress` calls `memory_proj_k`); `--separate-v` gives values their own.
 10. **Recursive long-term memory.** From the fourth block on, the release folds the old long-term slots back in: `L0' = conv(L0, L1, S0, S1, C0)`, `L1' = conv(C1..C5)`. The paper says "continuously compresses older KV"; this port copies the release's fold. The cached clips have 22 latent frames = 3 blocks, so **training never exercises the fold**; only the samplers and tests do.
 11. **Block sizes against H3's VAE.** H3's VAE encodes 17-pixel-frame clips of 5 latent frames independently and non-causally. Blocks of 6 and 8 cut through those clips, so a ground-truth context frame carries some information from later pixel frames of its own VAE clip, and decoding needs whole clips (`render_nf_h3.py` decodes the longest `5n + 2` prefix). 6 and 8 are kept because the 2 + 2 + 2 window with ratio 5 allows no other pair (`NFConfig` checks this) and because the cached clips are exactly 6 + 8 + 8 = 22 frames.
 12. **Sampler.** `renoise` is the release's few-step update, not UniPC. Stage 1 models can be sampled with H3's Euler schedule (`render_nf_h3.py --steps N`).
 13. **Sign.** H3's head predicts `x0 − ε`; the paper's target is `ε − x`.
 14. **Stage 2 details the paper does not give.** Chosen here: a random exit step with the earlier steps detached (Self-Forcing's rollout); DMD's normaliser `1 / mean|x0_hat − x0_real|`; `tau` uniform on [0.02, 0.98]; one fake update per generator update; AdamW, lr 1e-4; the real and fake scores are bidirectional and see the same `first` condition as the generator. H3 is guidance-distilled, so there is no CFG on the real score.
 15. **Rollout as parallel passes.** Stage 2 does not run the block-by-block loop in training. Under Neighbor Forcing, block `n` at step `i` depends on blocks `< n` at step `i` only, so one masked pass per step computes every block's step; `nf_parallel_sample` is that, and it is tested equal to the block-by-block sampler with the same noise. Gradients flow through the last step's pass, including through the context keys/values (the paper does not say whether the cache is detached).
-16. **Scale.** Batch 1 (H3's forward takes one sample; `--accum`), about 600 Nikki clips of 3 s instead of 300 hours, no 400-step Stage 2 run. The paper states Stage 2 as 400 steps in sec. 3 and 300 in Table 4.
+16. **Scale and data.** Batch 1 (H3's forward takes one sample; `--accum`); 623 Nikki clips of 3 s (about half an hour) instead of 300 hours; no 400-step Stage 2 run. The Nikki clips were themselves generated by H3 (`meta.json`: 20 steps, `res_multistep`), so Stage 1 here regresses onto the base model's own samples of one person, not onto real video. The paper states Stage 2 as 400 steps in sec. 3 and 300 in Table 4.
 17. **Not implemented.** The "Emotion and Action Editing Module" (the paper names it and shows fig. 7 but does not describe it; the release switches the text prompt per block, which `nf_stream_sample(text=callable)` supports and `test_nf_stream_equals_parallel` exercises). FP8, sequence parallelism, operator fusion and the 20 FPS system. All evaluation (Sync-C/D, FID, FVD, VBench).
 
 ## Data
 
-`train_nf_h3.py` reads an existing H3 clip cache, `/media/2TB/lora-data/h3_lot/cache_atlas_clips` (`LOT_H3_CLIPS_CACHE`): VAE latents `(24, 22, 48, 32)` (73 pixel frames, 512x768) and Qwen3-VL text states, built earlier by `build_clip_cache_h3.py`. Nothing was re-encoded and nothing is written there. The default `--source set_nk` keeps the Nikki sets (`set_nk_bank`, `set_nk_red`, `set_nk_return` in the files' `source` metadata). The raw Nikki folder (`/media/2TB/lora-data/r2-scrya/nikki`: 61 mp4 with sound, expression stills) was inspected and not used: it has no H3 latents, and its audio is what deviation 1 leaves out.
+`train_nf_h3.py` reads an existing H3 clip cache, `/media/2TB/lora-data/h3_lot/cache_atlas_clips` (`LOT_H3_CLIPS_CACHE`): VAE latents `(24, 22, 48, 32)` (73 pixel frames, 512x768) and Qwen3-VL text states, built earlier by `build_clip_cache_h3.py` from `/home/johndpope/Documents/GitHub/h3-atlas/data`. Nothing was re-encoded and nothing is written there. The default `--source set_nk` keeps the Nikki sets (`set_nk_bank`, `set_nk_red`, `set_nk_return` in the files' `source` metadata; `h3-atlas/AGENTS.md` describes `set_nk_bank` as the "Nikki talking-head state bank", and the clips' `meta.json` has `"id": "nikki"`): 623 clips of 22 latent frames with text. `--audio driving` reads `audio_latent.pt` `(1, 32, 2, 122)` from the same source folders (`LOT_H3_CLIPS_SOURCE`). 22 latent frames is exactly three blocks (6 + 8 + 8), which is why the paper's block sizes fit this data without cutting. The raw Nikki folder (`/media/2TB/lora-data/r2-scrya/nikki`: 61 mp4 with sound, expression stills) was inspected and not used: it has no H3 latents, and encoding it would need the VAE and the text encoder on a GPU that is shared.
 
 ## What was run
 
@@ -87,8 +87,10 @@ All on 2026-11-18, RTX 5090 (32 GB), pruned int8 ConvRot H3 checkpoint. Commands
 **GPU parity** (`python parity_nf_h3.py`, 22 latent frames at 16x16 latent, `swap=32`):
 
 ```
-LOT_H3 kind=nf_parity frames=22 latent_hw=16x16 blocks=[(0, 6), (6, 14), (14, 22)] rel_rms_floor=0 a_t2va=0/1 a_first=0/1 b_mask_moved=0.221942 b_leak=0 b_changed=1.02368/1 c_lora0=0/1 d=6.64156e-07 d_first=6.4704e-07 e=6.59505e-07 e_first=6.42699e-07 e_rough=6.58529e-07 same_early=0 control_memory=0.130264 control_conv=0.095602 stream_ok=1 f_cache_rows=[388, 900, 900, 900] f_stream_ms=32625/1 peak_mb=18464.1 dtype=bf16 ok=1
+LOT_H3 kind=nf_parity frames=22 latent_hw=16x16 blocks=[(0, 6), (6, 14), (14, 22)] rel_rms_floor=0 a_t2va=0/1 a_first=0/1 b_mask_moved=0.221942 b_leak=0 b_changed=1.02368/1 c_lora0=0/1 d=6.64156e-07 d_first=6.4704e-07 e=6.59505e-07 e_first=6.42699e-07 e_rough=6.58529e-07 same_early=0 control_memory=0.130264 control_conv=0.095602 stream_ok=1 f_cache_rows=[388, 900, 900, 900] f_stream_ms=35754/1 peak_mb=18464.1 dtype=bf16 ok=1
 ```
+
+This line is from the final forward path (commit `ed58072`, each stock `DiTBlock` called as a module). The run before that change gave the same numbers.
 
 Reading: with the mask off the forward is the stock H3 to the bit (`a_t2va`, `a_first` = 0), which is the only sense in which "step 0 equals the base model" holds; the causal mask alone moves the output by 22% rel. RMS (`b_mask_moved`) and nothing flows backwards (`b_leak` = 0); a zero-initialised LoRA changes nothing (`c_lora0` = 0); block-by-block inference equals the one-pass forward to 6.6e-7 with the Stage 1 context (`d`) and with ConvKV (`e`), against controls of 0.13 (ConvKV context instead of the Stage 1 context) and 0.10 (a perturbed convolution); a 4-block stream keeps 900 cached key rows per step and DiT block from block 1 on (`f`). The first run of this script failed case `a_t2va` at 0.024: the script built its silent audio with a sigma computed from an un-rounded `t`, one float32 ulp away from the model's; fixed in the script, not in the model code.
 
@@ -99,9 +101,16 @@ LOT_H3 kind=nf_check stage=1 frames=22 latent_hw=(32, 32) blocks=[(0, 6), (6, 14
 LOT_H3 kind=nf_check stage=2 frames=22 latent_hw=(32, 32) sigmas=1.0000,0.9730,0.9231,0.0000 loss=0.002352 fake_loss=0.06278 gap=0.003489 match_rel=0 exit_step=2 gen_grad=0.3572 conv_grad=0.014 fake_grad=30.31 peak_mb=25724 ok=1
 ```
 
+With `--audio driving` (the clip's clean audio latent as conditioning; this clip is a silent "listening" take, so the numbers barely move):
+
+```
+LOT_H3 kind=nf_check stage=1 audio=driving frames=22 latent_hw=(32, 32) blocks=[(0, 6), (6, 14), (14, 22)] loss_dense=0.04852 loss_causal=0.07991 loss_grad=0.07991 gen_grad=7.711 peak_mb=25196 ok=1
+LOT_H3 kind=nf_check stage=2 audio=driving frames=22 latent_hw=(32, 32) sigmas=1.0000,0.9730,0.9231,0.0000 loss=0.0027361 fake_loss=0.05948 gap=0.003586 match_rel=0 exit_step=2 gen_grad=0.858 conv_grad=0.03077 fake_grad=11.55 peak_mb=25724 ok=1
+```
+
 `loss_dense` / `loss_causal` is the paper's fig. 1 setting in one number: the untouched base model on a real clip at sigma 0.6 has flow loss 0.048 with every frame visible and 0.080 under the block-causal mask with same-step neighbours. The first two attempts at these dry passes failed in `backward()` and were fixed in the code: the blocks have to be called as modules (the block-swap offloader moves them during backward from module hooks), and the backward has to run while the same LoRAs are switched on as in the forward (activation checkpointing re-runs the blocks).
 
-**Smoke training**, 512x512 crops (`--max-latent-hw 32 32`), 621 Nikki clips, 2 held out. These show that the trainers run and that the loss moves. They are not trained models.
+**Smoke training**, 512x512 crops (`--max-latent-hw 32 32`), `--audio silent`, 621 Nikki clips for training, 2 held out. Stage 1 used `--lr 2e-4` (the default is 1e-4). These show that the trainers run and that the loss moves. They are not trained models.
 
 ```
 LOT_H3_TRAIN=1 python train_nf_h3.py --stage 1 --steps 30 --lr 2e-4 --max-latent-hw 32 32 --holdout 2 --swap 4 --out runs/nf_smoke_stage1
@@ -130,18 +139,34 @@ LOT_H3 kind=render_nf prompt=0 latent_frames=22 steps=3 sampler=renoise memory=1
 LOT_H3 kind=render_nf_done out=runs/nf_smoke_render decoded=1 ok=1
 ```
 
-One sample each, looked at as a contact sheet, so these are observations and not results. Untrained base H3 (12 Euler steps, mean ConvKV, 4 blocks): the first two blocks (no compression yet) are a coherent talking-head clip of one person; from the third block on, where the context becomes the six memory slots, the person changes into someone else. That is what an untrained memory should be expected to do, and it is the thing Stage 2 is supposed to fix. The 35-update smoke model at 3 steps: a clean, nearly static 3-second clip with the same person through all three blocks. The same render with `--cache-device cuda` ran out of memory (three step caches of about 5 GB each next to a resident model); `cpu` is the default. Outputs are under `lot/runs/` (gitignored, not committed).
+```
+python render_nf_h3.py --untrained --no-memory --blocks 4 --size 256 256 --steps 12 --out runs/nf_untrained_render_nomem
+LOT_H3 kind=render_nf prompt=0 latent_frames=30 steps=12 sampler=euler memory=0 audio=silent block_ms=9276,11827,19954,30416 abs_mean=0.858 real_abs_mean=0.951 finite=1 peak_mb=20392
+LOT_H3 kind=render_nf_done out=runs/nf_untrained_render_nomem decoded=1 ok=1
+```
+
+One sample each, looked at as a contact sheet, so these are observations and not results.
+
+- Untrained base H3, 12 Euler steps, 4 blocks, same noise with and without memory. The first two blocks are the same in both and are a coherent talking-head clip of one person: on this one sample the paper's fig. 1 claim (a causal mask with same-step neighbours works on the pretrained model without training) holds for 14 latent frames. After that the person drifts in both: with the mean-initialised ConvKV the face changes at the third block, without memory the third block stays closer and the fourth turns away. So the drift is not only the untrained memory; these four-block clips are also longer than anything the cache contains. No conclusion beyond that.
+- Time per block: with memory 10.7, 10.7, 11.8, 11.7 s (constant); without, 9.3, 11.8, 20.0, 30.4 s (the context grows). These include moving the caches between host and GPU memory and are not a speed claim.
+- The 35-update smoke model at 3 steps: a clean, nearly static 3-second clip with the same person through all three blocks.
+- The same render with `--cache-device cuda` ran out of memory (three step caches of about 5 GB each next to a resident model); `cpu` is the default.
+
+Outputs are under `lot/runs/` (gitignored, not committed; about 450 MB, mostly the three smoke LoRAs).
 
 ## What was not run
 
 - No training beyond the smoke runs above. No Stage 1 run to convergence, no 400-step Stage 2.
-- No trained-model render, so nothing here shows that the method produces good video on H3.
+- No render of anything beyond the 35-update smoke model, so nothing here shows that the method produces good video on H3.
+- `--audio driving` was not trained and not rendered (dry passes only).
+- Training at the full 48x32 latent (the smoke runs used 32x32 crops).
 - The recursive long-term fold (deviation 10) is exercised by tests and the sampler only, never by a training step.
 - No long (minutes) stream, no speed claim.
 
 ## Things in the paper that stayed unclear
 
-- What Stage 2 trains, and whether the DMD rollout detaches the cache.
+- Whether the DMD rollout detaches the cache, and every Stage 2 hyperparameter (learning rate, batch, fake/generator update ratio, DMD noise levels). The paper has no hyperparameter appendix: appendix A is the smoothness argument and appendix B is related work.
+- What is trained is given only by the icons of fig. 2 (deviation 2), not by the text.
 - Whether the training-time memory (fig. 3 left) shifts the query positions of the block that reads it. The text only says the memory is appended and the mask modified; this port makes training equal to the inference window (deviation 6).
 - Eq. 7's position `s` against fig. 3's ℛ2, ℛ3 against the release's slot indices.
 - Eq. 5 with unequal block sizes (6 then 8): taken as "block index of `j` ≤ block index of `i`".

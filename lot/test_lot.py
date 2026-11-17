@@ -1539,6 +1539,28 @@ def test_nf_stream_equals_parallel():
                 assert float((streamed - parallel).abs().max()) < 1e-4, (memory, first is None, sampler)
             state, audio_s = nf_parallel_sample(dit, text, frames, stop_step=0, **kwargs)
             assert torch.equal(state, parallel_noise(noise, config, frames, 0, 4, 6)[0]) and audio_s.shape[-1] > 0
+    # driving audio (clean audio latent rows at the clean-condition time): same equality, and block n hears
+    # only its own time span, so audio after block 1 cannot change blocks 0 and 1
+    from h3_musubi import audio_frames
+    config = NFConfig(memory=True)
+    driving = torch.randn(1, 32, 2, audio_frames(frames))
+    kwargs = dict(lat_h=4, lat_w=6, config=config, sigmas=sigmas, noise=NoiseBank(5, "cpu"), convkv=convkv, audio=driving)
+    with torch.no_grad():
+        parallel = nf_parallel_sample(dit, text, frames, **kwargs)
+    streamed = nf_stream_sample(dit, text, 4, total_frames=frames, **kwargs)
+    assert float((streamed - parallel).abs().max()) < 1e-4
+    silent = nf_stream_sample(dit, text, 4, total_frames=frames, **{**kwargs, "audio": None})
+    assert float((streamed - silent).abs().max()) > 1e-3
+    later = driving.clone()
+    later[..., Geometry.audio_span(14, 22, frames)[0]:] += 1.0
+    moved = nf_stream_sample(dit, text, 4, total_frames=frames, **{**kwargs, "audio": later})
+    assert torch.equal(moved[:, :, :14], streamed[:, :, :14]) and not torch.equal(moved[:, :, 14:], streamed[:, :, 14:])
+    try:
+        nf_stream_sample(dit, text, 4, total_frames=frames, **{**kwargs, "audio": driving[..., :50]})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("short driving audio accepted")
     # prompt switching (the release's emotion/action editing): a new prompt from block 2 on changes only blocks 2+
     config = NFConfig(memory=True)
     other = torch.randn(1, 5, 16)
@@ -1568,7 +1590,7 @@ def test_nf_trainer_updates_on_cpu():
     fake_params = [p for p in fake_net.parameters()]
     x0, text = torch.randn(1, 24, 22, 4, 6), torch.randn(1, 5, 16)
     args = argparse.Namespace(stage=1, blocks=[6, 8], ref="first", sigmas="1,0.75,0.5", sampler_shift=12.0,
-                              sampler="renoise", sigma_shift=1.0, tau_shift=1.0)
+                              sampler="renoise", sigma_shift=1.0, tau_shift=1.0, audio="silent")
     run = NFRun(dit, gen_net, None, None, args, "cpu")
     eps = torch.randn_like(x0)
     loss, stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, backward=True)
@@ -1590,9 +1612,15 @@ def test_nf_trainer_updates_on_cpu():
             module.lora_up.weight.normal_(0.0, 0.05)        # fake != real, so the DMD direction is non-zero
     run = NFRun(dit, gen_net, fake_net, convkv, args, "cpu")
     assert run.memory.memory and [round(s, 3) for s in run.sigmas] == [1.0, 0.973, 0.923, 0.0]
-    for exit_step in (0, 2):
+    from h3_musubi import audio_frames
+    driving = torch.randn(1, 32, 2, audio_frames(22))          # a clean audio latent as conditioning (c_audio)
+    with torch.no_grad():
+        silent, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, config=NFConfig())
+        driven, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio=driving, config=NFConfig())
+    assert math.isfinite(float(driven)) and abs(float(driven) - float(silent)) > 1e-5
+    for exit_step, audio in ((0, None), (2, None), (1, driving)):
         zero_grads(gen_params + fake_params + list(convkv.parameters()))
-        loss, sample, stats = run.generator_update(x0, text, exit_step=exit_step)
+        loss, sample, stats = run.generator_update(x0, text, exit_step=exit_step, audio=audio)
         assert math.isfinite(stats["loss"]) and stats["match"] < 1e-5 and stats["gap"] > 0, stats
         assert stats["exit_step"] == exit_step and sample[0].shape == x0.shape
         assert grad_sum(gen_params) > 0 and grad_sum(list(convkv.parameters())) > 0

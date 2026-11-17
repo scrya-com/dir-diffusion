@@ -14,7 +14,8 @@ zero-shot setting, plus an untrained memory). ``--run`` loads ``lora_gen`` and, 
 ``convkv`` and its 3-step schedule.
 
 Prompts and reference frames come from the held-out clips of the run's cache (text embedding, and the
-clip's first latent frame as the FL2VA ``first`` condition; ``--ref none`` drops it).
+clip's first latent frame as the FL2VA ``first`` condition; ``--ref none`` drops it). ``--audio driving``
+also feeds the clip's clean audio latent as conditioning (it covers 22 latent frames, so 3 blocks).
 
 Steps: ``--steps 0`` (default) uses the few-step schedule (``1, 0.75, 0.5`` under H3's shift, the
 release's re-noising update); ``--steps N`` uses H3's own N-step schedule with Euler steps. One
@@ -60,6 +61,9 @@ def main() -> None:
                         help="ConvKV context from the third block on (--no-memory: every earlier frame, Stage 1)")
     parser.add_argument("--steps", type=int, default=0, help="0 = the 3-step schedule; N = H3's N-step Euler schedule")
     parser.add_argument("--ref", choices=["first", "none"], default="first")
+    parser.add_argument("--audio", choices=["silent", "driving"], default=None,
+                        help="driving: the held-out clip's clean H3 audio latent as conditioning (covers 3 blocks); "
+                             "default: what the run was trained with, else silent")
     parser.add_argument("--prompts", type=int, default=1, help="held-out clips to render")
     parser.add_argument("--cache", type=Path, default=None, help="clip cache (default: the run's, else LOT_H3_CLIPS_CACHE)")
     parser.add_argument("--size", type=int, nargs=2, default=[512, 768], metavar=("W", "H"), help="pixels, multiples of 32")
@@ -75,7 +79,7 @@ def main() -> None:
     from dir_h3 import use_networks
     from h3_musubi import load_dit, load_vae, sigma_schedule
     from nf_h3 import ConvKV, NFConfig, NoiseBank, few_step_sigmas, load_nf_run, nf_stream_sample
-    from train_nf_h3 import list_clips, load_clip
+    from train_nf_h3 import list_clips, load_audio, load_clip
 
     width, height = args.size
     if width % 32 or height % 32:
@@ -104,6 +108,8 @@ def main() -> None:
         if tuple(x0.shape[-2:]) != (lat_h, lat_w):
             raise SystemExit(f"clip latent {tuple(x0.shape[-2:])} is smaller than --size {lat_h}x{lat_w} latent")
         first = x0[:, :, :1].contiguous() if args.ref == "first" else None
+        audio_mode = args.audio or meta.get("audio", "silent")
+        audio = load_audio(item, "cuda", 22) if audio_mode == "driving" else None
         block_ms, mark = [], [time.perf_counter()]
 
         def on_block(_index, _latent):
@@ -115,13 +121,14 @@ def main() -> None:
         with torch.inference_mode(), use_networks(network, None, gen=True, fake=False):
             latents = nf_stream_sample(model, text, args.blocks, lat_h=lat_h, lat_w=lat_w, config=config, sigmas=sigmas,
                                        noise=NoiseBank(args.seed + index, "cuda"), convkv=convkv if args.memory else None,
-                                       first=first, sampler=sampler, cache_device=args.cache_device, on_block=on_block)
+                                       first=first, sampler=sampler, cache_device=args.cache_device, on_block=on_block,
+                                       audio=audio)
         finite = bool(torch.isfinite(latents).all())
         results.append({"clip": item[0].name, "latents": latents.float().cpu(), "block_ms": block_ms, "finite": finite,
                         "latent_frames": int(latents.shape[2]), "abs_mean": float(latents.float().abs().mean()),
                         "real_abs_mean": float(x0.abs().mean())})
         print(f"LOT_H3 kind=render_nf prompt={index} latent_frames={latents.shape[2]} steps={len(sigmas) - 1} "
-              f"sampler={sampler} memory={int(args.memory)} block_ms={','.join(f'{ms:.0f}' for ms in block_ms)} "
+              f"sampler={sampler} memory={int(args.memory)} audio={audio_mode} block_ms={','.join(f'{ms:.0f}' for ms in block_ms)} "
               f"abs_mean={results[-1]['abs_mean']:.3f} real_abs_mean={results[-1]['real_abs_mean']:.3f} "
               f"finite={int(finite)} peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
 

@@ -64,16 +64,17 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lot_paths import LOT_H3_CLIPS_CACHE  # noqa: E402
+from lot_paths import LOT_H3_CLIPS_CACHE, LOT_H3_CLIPS_SOURCE  # noqa: E402
 
 from dir_h3 import use_networks  # noqa: E402
 from h3_musubi import VIDEO_SHIFT, sample_sigma  # noqa: E402
-from nf_h3 import (BASE_SIGMAS, DENSE, FIRST_BLOCK, NEXT_BLOCK, ConvKV, NFConfig, NoiseBank, few_step_sigmas,  # noqa: E402
-                   nf_forward, nf_parallel_sample, save_nf_run)
+from h3_musubi import audio_frames  # noqa: E402
+from nf_h3 import (AUDIO_CLEAN, BASE_SIGMAS, DENSE, FIRST_BLOCK, NEXT_BLOCK, ConvKV, NFConfig, NoiseBank,  # noqa: E402
+                   few_step_sigmas, nf_forward, nf_parallel_sample, save_nf_run)
 
 TAU_MIN, TAU_MAX = 0.02, 0.98
 SIGMA_MIN, SIGMA_MAX = 1e-3, 1.0 - 1e-3
-MATCH_BOUND = 0.15      # --check: the grad re-forward against its no-grad value (bf16 noise through 50 blocks, as parity_dir_h3)
+MATCH_BOUND = 1e-2      # --check: the grad re-forward against its no-grad value, relative RMS (measured: 0)
 
 
 # --------------------------------------------------------------------------------- data
@@ -114,6 +115,25 @@ def load_clip(item, rng, device, frames: int):
     return x0[:, :, :frames].contiguous(), text
 
 
+def load_audio(item, device, frames: int, root: Path = LOT_H3_CLIPS_SOURCE) -> torch.Tensor:
+    """The clip's clean H3 audio latent ``(1, 32, 2, A)`` for its first ``frames`` latent frames.
+
+    The clip cache holds video and text only; the audio latent is ``audio_latent.pt`` in the clip's
+    source folder (``<root>/<source metadata>``), written when the clip was made."""
+    from safetensors import safe_open
+
+    with safe_open(str(item[0]), "pt") as handle:
+        source = (handle.metadata() or {}).get("source", "")
+    path = Path(root) / source / "audio_latent.pt"
+    if not source or not path.is_file():
+        raise SystemExit(f"--audio driving: no audio latent for {item[0].name} at {path}")
+    audio = torch.load(path, map_location="cpu", weights_only=True).float()
+    count = audio_frames(frames)
+    if audio.ndim != 4 or audio.shape[1:3] != (32, 2) or audio.shape[-1] < count:
+        raise SystemExit(f"{path}: audio latent {tuple(audio.shape)} does not cover {count} frames")
+    return audio[..., :count].contiguous().to(device)
+
+
 # ---------------------------------------------------------------------------------- run
 
 class NFRun:
@@ -141,15 +161,20 @@ class NFRun:
         tau = float(sample_sigma(float(self.args.tau_shift), "cpu"))
         return min(max(tau, TAU_MIN), TAU_MAX)
 
-    def dense_x0(self, x_tau, tau: float, text, first, seed: int) -> torch.Tensor:
+    def audio_kwargs(self, audio, seed: int | None) -> dict:
+        """``nf_forward`` arguments for the audio rows: clean driving audio, or seeded silent noise."""
+        if audio is not None:
+            return {"audio": audio, "audio_t": AUDIO_CLEAN}
+        return {"audio_generator": None if seed is None else torch.Generator(self.device).manual_seed(seed)}
+
+    def dense_x0(self, x_tau, tau: float, text, first, seed: int, audio=None) -> torch.Tensor:
         """A bidirectional model's clean estimate at ``tau`` (the caller sets which LoRAs are on)."""
-        audio = torch.Generator(self.device).manual_seed(seed)
-        out = nf_forward(self.dit, x_tau, 1.0 - tau, text, config=DENSE, first=first, audio_generator=audio)
+        out = nf_forward(self.dit, x_tau, 1.0 - tau, text, config=DENSE, first=first, **self.audio_kwargs(audio, seed))
         return x_tau.float() + tau * out.float()
 
     # ---- Stage 1
     def stage1_loss(self, x0, text, *, sigma: float | None = None, eps=None, config: NFConfig | None = None,
-                    audio_seed: int | None = None, backward: bool = False):
+                    audio_seed: int | None = None, backward: bool = False, audio=None):
         """Eq. 4 on one clip. Returns ``(loss, stats)``; the generator LoRA is on.
 
         ``backward=True`` runs the backward here, inside the LoRA switch: activation checkpointing
@@ -157,24 +182,23 @@ class NFRun:
         sigma = self.draw_sigma() if sigma is None else float(sigma)
         eps = torch.randn_like(x0) if eps is None else eps
         x_t = ((1.0 - sigma) * x0.float() + sigma * eps.float()).to(x0.dtype)          # eq. 2, every block at one step
-        audio = None if audio_seed is None else torch.Generator(self.device).manual_seed(audio_seed)
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             velocity = nf_forward(self.dit, x_t, 1.0 - sigma, text, config=config or self.causal,
-                                  first=self.reference(x0), audio_generator=audio)
+                                  first=self.reference(x0), **self.audio_kwargs(audio, audio_seed))
             loss = F.mse_loss(velocity.float(), x0.float() - eps.float())
             if backward:
                 (loss * self.loss_scale).backward()
         return loss, {"loss": float(loss.detach()), "sigma": sigma}
 
     # ---- Stage 2
-    def generator_step(self, x_s, audio_s, step: int, text, first) -> torch.Tensor:
+    def generator_step(self, x_s, audio_s, step: int, text, first, driving: bool = False) -> torch.Tensor:
         """Step ``step`` of the few-step generator on a whole clip: the clean estimate ``x0_hat``."""
         sigma = float(self.sigmas[step])
         velocity = nf_forward(self.dit, x_s, 1.0 - sigma, text, config=self.memory, convkv=self.convkv, first=first,
-                              audio=audio_s)
+                              audio=audio_s, audio_t=AUDIO_CLEAN if driving else None)
         return x_s.float() + sigma * velocity.float()
 
-    def generator_update(self, x0, text, *, exit_step: int | None = None, backward: bool = True):
+    def generator_update(self, x0, text, *, exit_step: int | None = None, backward: bool = True, audio=None):
         """One DMD generator update on a clip shaped like ``x0`` (its values are used for ``x_ref`` only).
 
         Order, as in ``train_dir_h3.py``: every no-grad forward first (rollout, ``x0_hat`` value, real,
@@ -190,22 +214,22 @@ class NFRun:
         with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             x_s, audio_s = nf_parallel_sample(self.dit, text, latent_t, lat_h=lat_h, lat_w=lat_w, config=self.memory,
                                               sigmas=self.sigmas, noise=noise, convkv=self.convkv, first=first,
-                                              sampler=self.args.sampler, stop_step=step)
+                                              sampler=self.args.sampler, stop_step=step, audio=audio)
             x_s = x_s.to(x0.dtype)
-            x0_hat = self.generator_step(x_s, audio_s, step, text, first)
+            x0_hat = self.generator_step(x_s, audio_s, step, text, first, audio is not None)
         tau = self.draw_tau()
         eps = torch.randn_like(x0_hat)
         x_tau = ((1.0 - tau) * x0_hat + tau * eps).to(x0.dtype)
         with torch.no_grad():
             with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
-                real = self.dense_x0(x_tau, tau, text, first, seed + 1)
+                real = self.dense_x0(x_tau, tau, text, first, seed + 1, audio)
             with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
-                fake = self.dense_x0(x_tau, tau, text, first, seed + 1)
+                fake = self.dense_x0(x_tau, tau, text, first, seed + 1, audio)
             weight = 1.0 / (x0_hat - real).abs().mean().clamp(min=1e-6)
             grad = (fake - real) * weight
             target = (x0_hat - grad).detach()
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
-            live = self.generator_step(x_s, audio_s, step, text, first)
+            live = self.generator_step(x_s, audio_s, step, text, first, audio is not None)
             loss = 0.5 * F.mse_loss(live, target)
             if backward:        # inside the switch: checkpointing re-runs the blocks with these LoRAs
                 (loss * self.loss_scale).backward()
@@ -214,17 +238,17 @@ class NFRun:
                  "match_rel": float((live.detach() - x0_hat).pow(2).mean().sqrt() / x0_hat.pow(2).mean().sqrt().clamp(min=1e-8)),
                  "gap": float((fake - real).abs().mean()), "x0_abs": float(x0_hat.abs().mean()),
                  "real_gap": float((x0_hat - real).abs().mean())}
-        return loss, (x0_hat.detach(), text, first, seed), stats
+        return loss, (x0_hat.detach(), text, first, seed, audio), stats
 
     def fake_update(self, sample, *, backward: bool = True):
         """Flow regression of the fake model on the generator's (detached) sample."""
-        x0_hat, text, first, seed = sample
+        x0_hat, text, first, seed, audio = sample
         tau = self.draw_tau()
         eps = torch.randn_like(x0_hat)
         x_tau = (1.0 - tau) * x0_hat + tau * eps
-        audio = torch.Generator(self.device).manual_seed(seed + 2)
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
-            velocity = nf_forward(self.dit, x_tau, 1.0 - tau, text, config=DENSE, first=first, audio_generator=audio)
+            velocity = nf_forward(self.dit, x_tau, 1.0 - tau, text, config=DENSE, first=first,
+                                  **self.audio_kwargs(audio, seed + 2))
             loss = F.mse_loss(velocity.float(), x0_hat - eps)
             if backward:
                 (loss * self.loss_scale).backward()
@@ -249,9 +273,10 @@ def heldout_loss(run: NFRun, items, device, frames: int, sigmas=(0.3, 0.6, 0.9))
     rng = random.Random(0)
     for index, item in enumerate(items):
         x0, text = load_clip(item, rng, device, frames)
+        audio = load_audio(item, device, frames) if run.args.audio == "driving" else None
         for k, sigma in enumerate(sigmas):
             eps = torch.randn(x0.shape, generator=torch.Generator().manual_seed(1000 * index + k)).to(x0)
-            loss, _stats = run.stage1_loss(x0, text, sigma=sigma, eps=eps, audio_seed=7 + k)
+            loss, _stats = run.stage1_loss(x0, text, sigma=sigma, eps=eps, audio_seed=7 + k, audio=audio)
             total, count = total + float(loss), count + 1
     return total / max(1, count)
 
@@ -259,16 +284,17 @@ def heldout_loss(run: NFRun, items, device, frames: int, sigmas=(0.3, 0.6, 0.9))
 def check(run: NFRun, gen_params, fake_params, items, rng, device, frames: int) -> None:
     """A dry pass: one update of each kind, nothing written."""
     x0, text = load_clip(items[0], rng, device, frames)
+    audio = load_audio(items[0], device, frames) if run.args.audio == "driving" else None
     if run.args.stage == 1:
         eps = torch.randn_like(x0)
         with torch.no_grad():
-            dense, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, config=DENSE, audio_seed=3)
-            causal, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3)
-        loss, _stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, backward=True)
+            dense, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, config=DENSE, audio_seed=3, audio=audio)
+            causal, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, audio=audio)
+        loss, _stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, backward=True, audio=audio)
         gen_grad = grad_sum(gen_params)
-        # the grad forward (checkpointing, swap in training mode) and the no-grad one agree up to bf16 noise
-        ok = int(math.isfinite(float(loss)) and gen_grad > 0 and abs(float(loss) - float(causal)) < 5e-2 * max(1.0, float(causal)))
-        print(f"LOT_H3 kind=nf_check stage=1 frames={frames} latent_hw={tuple(x0.shape[-2:])} "
+        # the grad forward (checkpointing, swap in training mode) against the no-grad one (measured: equal to 5 digits)
+        ok = int(math.isfinite(float(loss)) and gen_grad > 0 and abs(float(loss) - float(causal)) < 1e-2 * float(causal))
+        print(f"LOT_H3 kind=nf_check stage=1 audio={run.args.audio} frames={frames} latent_hw={tuple(x0.shape[-2:])} "
               f"blocks={run.causal.spans(frames)} loss_dense={float(dense):.5f} loss_causal={float(causal):.5f} "
               f"loss_grad={float(loss):.5f} gen_grad={gen_grad:.4g} peak_mb={peak_mb(device):.0f} ok={ok}", flush=True)
     else:
@@ -279,17 +305,17 @@ def check(run: NFRun, gen_params, fake_params, items, rng, device, frames: int) 
             noise = NoiseBank(0, device)
             sample = nf_parallel_sample(run.dit, text, frames, lat_h=x0.shape[-2], lat_w=x0.shape[-1], config=run.memory,
                                         sigmas=run.sigmas, noise=noise, convkv=run.convkv, first=run.reference(x0),
-                                        sampler=run.args.sampler).float()
-        floss, _tau = run.fake_update((sample, text, run.reference(x0), 0))
+                                        sampler=run.args.sampler, audio=audio).float()
+        floss, _tau = run.fake_update((sample, text, run.reference(x0), 0, audio))
         fake_grad = grad_sum(fake_params)
         optimizer.step()
         zero_grads(fake_params)
-        loss, _sample, stats = run.generator_update(x0, text, exit_step=len(run.sigmas) - 2)
+        loss, _sample, stats = run.generator_update(x0, text, exit_step=len(run.sigmas) - 2, audio=audio)
         gen_grad = grad_sum(gen_params)
         conv_grad = grad_sum(list(run.convkv.parameters()))
         ok = int(math.isfinite(float(loss)) and math.isfinite(float(floss)) and fake_grad > 0 and gen_grad > 0
                  and conv_grad > 0 and stats["match_rel"] < MATCH_BOUND)
-        print(f"LOT_H3 kind=nf_check stage=2 frames={frames} latent_hw={tuple(x0.shape[-2:])} "
+        print(f"LOT_H3 kind=nf_check stage=2 audio={run.args.audio} frames={frames} latent_hw={tuple(x0.shape[-2:])} "
               f"sigmas={','.join(f'{s:.4f}' for s in run.sigmas)} loss={float(loss):.5g} fake_loss={float(floss):.5f} "
               f"gap={stats['gap']:.4g} match_rel={stats['match_rel']:.3g} exit_step={stats['exit_step']} gen_grad={gen_grad:.4g} conv_grad={conv_grad:.4g} "
               f"fake_grad={fake_grad:.4g} peak_mb={peak_mb(device):.0f} ok={ok}", flush=True)
@@ -316,6 +342,9 @@ def main() -> None:
     parser.add_argument("--clip-blocks", type=int, default=3, help="blocks per training clip (3 = 22 latent frames)")
     parser.add_argument("--ref", choices=["first", "none"], default="first",
                         help="reference image x_ref: the clip's first latent frame as H3's FL2VA first condition")
+    parser.add_argument("--audio", choices=["silent", "driving"], default="silent",
+                        help="audio rows: silent noise (this repo's convention), or the clip's clean H3 audio latent "
+                             "as conditioning (the paper's c_audio; needs audio_latent.pt under LOT_H3_CLIPS_SOURCE)")
     parser.add_argument("--max-latent-hw", type=int, nargs=2, default=None, metavar=("H", "W"),
                         help="cap the latent crop (a random window)")
     parser.add_argument("--steps", type=int, default=1000)
@@ -400,7 +429,7 @@ def main() -> None:
     fake_opt = torch.optim.AdamW(fake_groups, lr=args.fake_lr, weight_decay=0.0) if fake_groups else None
     args.out.mkdir(parents=True, exist_ok=True)
     meta = {"paper": "arXiv 2603.11746", "stage": args.stage, "rank": args.rank, "blocks": list(args.blocks),
-            "clip_blocks": args.clip_blocks, "frames": frames, "ref": args.ref, "cache": str(args.cache),
+            "clip_blocks": args.clip_blocks, "frames": frames, "ref": args.ref, "audio": args.audio, "cache": str(args.cache),
             "sources": sources, "holdout": args.holdout, "ratio": 5, "shared_kv": not args.separate_v,
             "sigmas": run.sigmas, "sampler": args.sampler, "sigma_shift": args.sigma_shift, "lr": args.lr,
             "steps": args.steps, "seed": args.seed, "max_latent_hw": args.max_latent_hw,
@@ -425,11 +454,13 @@ def main() -> None:
         record = {"step": step}
         zero_grads(gen_params)
         for _ in range(args.accum):
-            x0, text = load_clip(rng.choice(train_items), rng, device, frames)
+            item = rng.choice(train_items)
+            x0, text = load_clip(item, rng, device, frames)
+            audio = load_audio(item, device, frames) if args.audio == "driving" else None
             if args.stage == 1:
-                loss, stats = run.stage1_loss(x0, text, backward=True)
+                loss, stats = run.stage1_loss(x0, text, backward=True, audio=audio)
             else:
-                loss, sample, stats = run.generator_update(x0, text)
+                loss, sample, stats = run.generator_update(x0, text, audio=audio)
         record.update(stats)
         record["gen_grad"] = grad_sum(gen_params)
         if convkv is not None:
@@ -440,7 +471,7 @@ def main() -> None:
                 zero_grads(fake_params)
                 if k:
                     with torch.no_grad():
-                        _loss, sample, _stats = run.generator_update(x0, text, backward=False)
+                        _loss, sample, _stats = run.generator_update(x0, text, backward=False, audio=audio)
                 floss, ftau = run.fake_update(sample)
                 fake_opt.step()
             zero_grads(gen_params)

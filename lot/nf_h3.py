@@ -25,8 +25,10 @@ H3 is not Wan, so three things have no counterpart in the paper and are decided 
 * H3 is single-stream: text, audio and video rows share one self-attention. Text rows (and the FL2VA
   ``first`` rows, the reference image ``x_ref`` of eq. 1) form a *prefix* every block can read and that
   reads only itself, which is what cross-attention to text gives Wan and what makes the prefix
-  cacheable. Audio rows are silent noise as everywhere in this repo; each belongs to the block that
-  contains its time and is visible inside that block only.
+  cacheable. Each audio row belongs to the block that contains its time and is visible inside that
+  block only. By default audio rows are silent noise, as everywhere in this repo; with driving audio
+  (``audio=..., audio_t=AUDIO_CLEAN``) they are the clip's clean H3 audio latent, which is this port's
+  ``c_audio``: H3 has no audio cross-attention, its audio is rows of the same attention.
 * H3's rotary time is not a frame index (latent frame ``5k`` spans 1 pixel frame, the others 4). The
   RoPE reset keeps the short-term frames and the current block at their true spacing, translated so
   the first short-term frame sits at slot 4 of the first window, and puts the reference frames and the
@@ -54,6 +56,7 @@ RATIO = 5                           # lambda, eq. 6
 REF_FRAMES, LONG_SLOTS, SHORT_FRAMES = 2, 2, 2    # sec. 2.3, "Inference Pipeline"
 BASE_SIGMAS = (1.0, 0.75, 0.5)      # 3 steps; the release's 1000, 937.5, 833.3 are these under Wan's shift 5
 VISUAL_CLEAN = 0.999                # H3's clean coefficient for a visual condition
+AUDIO_CLEAN = 1.0                   # H3's clean coefficient for an audio condition: the time of driving audio rows
 
 
 def _packing():
@@ -536,13 +539,16 @@ def silence(count: int, sigma_a: float, device, generator=None) -> torch.Tensor:
 
 def nf_forward(dit, latent: torch.Tensor, t, text: torch.Tensor, *, config: NFConfig = DENSE,
                convkv: ConvKV | None = None, first: torch.Tensor | None = None, audio: torch.Tensor | None = None,
-               audio_generator: torch.Generator | None = None) -> torch.Tensor:
+               audio_t: float | None = None, audio_generator: torch.Generator | None = None) -> torch.Tensor:
     """H3's velocity (``x0 - eps``) for a whole clip ``(1, 24, T, H, W)`` at cleanness ``t`` (eq. 4).
 
     Every frame of ``latent`` is at the same step; ``config`` says what each block reads. With
     ``config=DENSE`` this is the stock ``dit(...)`` call (T2VA, or FL2VA-first with ``first``).
     ``first`` ``(1, 24, 1, H, W)`` is the reference frame ``x_ref``, fed as H3's FL2VA ``first``
     condition. ``audio`` ``(1, 32, 2, A)`` defaults to silent noise at the matching audio sigma.
+    Driving audio (``c_audio`` of eq. 1): pass the clean H3 audio latent as ``audio`` with
+    ``audio_t=AUDIO_CLEAN``; the audio rows then carry the clean-condition timestep instead of the
+    video's noise level, and each block reads the audio of its own time span.
     """
     if latent.ndim != 5 or latent.shape[0] != 1:
         raise ValueError(f"latent must be (1, 24, T, H, W), got {tuple(latent.shape)}")
@@ -561,7 +567,8 @@ def nf_forward(dit, latent: torch.Tensor, t, text: torch.Tensor, *, config: NFCo
         raise ValueError(f"audio has {audio.shape[-1]} frames, expected {total_audio}")
     prefix, audio_rows, video_rows = _embed(dit, text, first, audio, latent)
     hidden = torch.cat([prefix, audio_rows, video_rows], dim=1)
-    unique, codes, video_index, _audio_index = timestep_table(t_video, 1.0 - sigma_a, first is not None)
+    unique, codes, video_index, _audio_index = timestep_table(
+        t_video, 1.0 - sigma_a if audio_t is None else float(audio_t), first is not None)
     temb = dit._timestep_embeddings(unique, device)
     rows_per_frame = geometry.frame_rows
     segments = _segments([(geometry.text_length, codes["text"]), (rows_per_frame if first is not None else 0, codes.get("first", 0)),
@@ -623,7 +630,8 @@ class NFStream:
         return sum(0 if part is None else part[0].shape[1] for part in (state.prefix, state.ref, state.window))
 
     @torch.no_grad()
-    def velocity(self, index: int, step: int, x: torch.Tensor, t, text: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
+    def velocity(self, index: int, step: int, x: torch.Tensor, t, text: torch.Tensor, audio: torch.Tensor,
+                 audio_t: float | None = None) -> torch.Tensor:
         dit, config = self.dit, self.config
         if text.ndim == 2:
             text = text.unsqueeze(0)
@@ -643,7 +651,8 @@ class NFStream:
         self._text[step] = text
         prefix, audio_rows, video_rows = _embed(dit, text if fresh else None, self.first if fresh else None, audio, x)
         hidden = torch.cat(([prefix] if fresh else []) + [audio_rows, video_rows], dim=1)
-        unique, codes, video_index, _audio_index = timestep_table(t_video, 1.0 - sigma_a, self.first is not None)
+        unique, codes, video_index, _audio_index = timestep_table(
+            t_video, 1.0 - sigma_a if audio_t is None else float(audio_t), self.first is not None)
         temb = dit._timestep_embeddings(unique, device)
         rows_per_frame = geometry.frame_rows
         count = geometry.prefix_rows if fresh else 0
@@ -700,11 +709,13 @@ def advance(x: torch.Tensor, velocity: torch.Tensor, sigma: float, sigma_next: f
 @torch.no_grad()
 def nf_stream_sample(dit, text, blocks: int, *, lat_h: int, lat_w: int, config: NFConfig, sigmas, noise: NoiseBank,
                      convkv: ConvKV | None = None, first: torch.Tensor | None = None, sampler: str = "renoise",
-                     cache_device=None, total_frames: int | None = None, on_block=None) -> torch.Tensor:
+                     cache_device=None, total_frames: int | None = None, on_block=None,
+                     audio: torch.Tensor | None = None) -> torch.Tensor:
     """Generate ``blocks`` blocks one after another; returns ``(1, 24, T, lat_h, lat_w)``.
 
     ``text`` is one tensor, or a function ``block index -> tensor`` (prompt switching). ``sigmas`` has
     one more entry than steps and ends at 0. ``on_block(index, latent)`` is called per finished block.
+    ``audio`` ``(1, 32, 2, A)`` is clean driving audio covering every block (default: silent noise).
     """
     steps = len(sigmas) - 1
     stream = NFStream(dit, lat_h=lat_h, lat_w=lat_w, steps=steps, config=config, convkv=convkv, first=first,
@@ -717,8 +728,13 @@ def nf_stream_sample(dit, text, blocks: int, *, lat_h: int, lat_w: int, config: 
         x = noise.video(index, 0, stop - start, lat_h, lat_w)
         for step in range(steps):
             sigma, sigma_next = float(sigmas[step]), float(sigmas[step + 1])
-            audio = float(audio_sigma(sigma)) * noise.audio(index, step, a1 - a0)
-            velocity = stream.velocity(index, step, x, 1.0 - sigma, prompt, audio)
+            if audio is None:
+                rows, audio_t = float(audio_sigma(sigma)) * noise.audio(index, step, a1 - a0), None
+            else:
+                if audio.shape[-1] < a1:
+                    raise ValueError(f"driving audio has {audio.shape[-1]} frames, block {index} needs {a1}")
+                rows, audio_t = audio[..., a0:a1], AUDIO_CLEAN
+            velocity = stream.velocity(index, step, x, 1.0 - sigma, prompt, rows, audio_t)
             x = advance(x, velocity, sigma, sigma_next,
                         lambda: noise.video(index, step + 1, stop - start, lat_h, lat_w), sampler)
         out.append(x)
@@ -739,23 +755,25 @@ def parallel_noise(noise: NoiseBank, config: NFConfig, latent_t: int, step: int,
 
 def nf_parallel_sample(dit, text, latent_t: int, *, lat_h: int, lat_w: int, config: NFConfig, sigmas, noise: NoiseBank,
                        convkv: ConvKV | None = None, first: torch.Tensor | None = None, sampler: str = "renoise",
-                       stop_step: int | None = None):
+                       stop_step: int | None = None, audio: torch.Tensor | None = None):
     """The sampler of ``nf_stream_sample`` run step-outer over a clip of known length.
 
     Under Neighbor Forcing block ``n`` at step ``i`` depends on blocks ``< n`` at step ``i`` only, so
     one masked pass per step produces every block's step: the autoregressive rollout of a clip costs
     ``steps`` forwards. Returns the clean latent, or with ``stop_step=s`` the state entering step ``s``
-    and that step's audio ``(x_s, audio_s)`` (Stage 2 re-runs step ``s`` with gradients). No
-    ``torch.no_grad`` here: the caller chooses.
+    and that step's audio ``(x_s, audio_s)`` (Stage 2 re-runs step ``s`` with gradients). ``audio`` is
+    clean driving audio for the clip (default: silent noise). No ``torch.no_grad`` here: the caller chooses.
     """
     steps = len(sigmas) - 1
     x, _audio = parallel_noise(noise, config, latent_t, 0, lat_h, lat_w)
     for step in range(steps):
         sigma, sigma_next = float(sigmas[step]), float(sigmas[step + 1])
-        audio = float(audio_sigma(sigma)) * parallel_noise(noise, config, latent_t, step, lat_h, lat_w)[1]
+        rows = audio if audio is not None else (
+            float(audio_sigma(sigma)) * parallel_noise(noise, config, latent_t, step, lat_h, lat_w)[1])
         if stop_step is not None and step == stop_step:
-            return x, audio
-        velocity = nf_forward(dit, x, 1.0 - sigma, text, config=config, convkv=convkv, first=first, audio=audio)
+            return x, rows
+        velocity = nf_forward(dit, x, 1.0 - sigma, text, config=config, convkv=convkv, first=first, audio=rows,
+                              audio_t=None if audio is None else AUDIO_CLEAN)
         x = advance(x, velocity, sigma, sigma_next,
                     lambda: parallel_noise(noise, config, latent_t, step + 1, lat_h, lat_w)[0], sampler)
     return x
