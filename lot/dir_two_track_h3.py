@@ -227,7 +227,8 @@ def load_prompts(args, config: dict):
 
     if args.te:
         return cached(args.prompts, list(args.te))
-    cache = Path(config["cache"][0]) if config.get("cache") else CACHE
+    # a downloaded run's config.json names the training machine's cache; fall back to $LOT_H3_STILLS_CACHE
+    cache = Path(config["cache"][0]) if config.get("cache") and Path(config["cache"][0]).is_dir() else CACHE
     held = [te for _latent, te in list_items(cache, int(config.get("holdout", 24)))[1]]
     if args.pick:
         held = [held[int(index)] for index in args.pick.split(",")]
