@@ -102,6 +102,7 @@ from h3_musubi import sample_sigma  # noqa: E402
 from h3_splice import LotSplice  # noqa: E402
 
 TAU_MIN, TAU_MAX = 0.02, 0.98
+FLOOR_TAU_MAX = 0.99      # --tau-floor sigma: top of the read window (eDMD)
 
 
 # ------------------------------------------------------------------------------- pieces
@@ -163,17 +164,21 @@ class Run:
 
     def draw_tau(self, r: int | None = None) -> float:
         """A DMD noise level. ``--tau-floor sigma``: iteration ``r`` before the last is queried at
-        ``tau >= sigmas[r + 1]`` only, the base distribution squeezed into ``[sigmas[r + 1], 1)``; the last
-        iteration keeps the whole range. After eDMD (arXiv 2611.17194, eq. 11-12: step k queried at
-        ``tau >= sigma_{k+1}``). Measured to break DiR (README, "Video, part 3"): eDMD's student sees its
-        prediction only inside the re-noised state, DiR also feeds the estimate through ``x0_proj`` at full
-        strength, so an estimate judged only at 2-5% signal drifts and the later iterations follow it. With
-        ``grid:6`` and ``beta:2.5`` most r = 0 draws also land on ``TAU_MAX``."""
-        tau = self._base_tau()
-        if r is not None and getattr(self.args, "tau_floor", "none") == "sigma" and r + 1 < len(self.sigmas):
+        ``tau >= sigmas[r + 1]`` only, uniform on ``[sigmas[r + 1], 0.99)``; the last iteration keeps the
+        whole range, and with ``--fake-source final`` the fake model trains at ``U[0.02, 0.99)``. After eDMD
+        (arXiv 2611.17194, eq. 11-12: step k queried at
+        ``tau >= sigma_{k+1}``). The first port of this flag (squeezed base distribution, clamp at 0.98) pushed a
+        clip run off the prompt; see the README, "Video, part 3"."""
+        floored = getattr(self.args, "tau_floor", "none") == "sigma"
+        if floored and r is not None and r + 1 < len(self.sigmas):
+            # eDMD's uncalibrated law: uniform on [sigma_{r+1}, 0.99). (Until 2026-11-17 this squeezed the base
+            # distribution into the window and clamped at TAU_MAX: with grid:6 about 70% of r = 0 draws were 0.98.)
             floor = float(self.sigmas[r + 1])
-            tau = min(floor + (1.0 - floor) * tau, TAU_MAX)
-        return tau
+            return floor + (FLOOR_TAU_MAX - floor) * float(torch.rand(()))
+        if floored and r is None and getattr(self.args, "fake_source", "iteration") == "final":
+            # the endpoint fake model has to cover the floored reads: eDMD trains it at U[0.02, 0.99)
+            return TAU_MIN + (FLOOR_TAU_MAX - TAU_MIN) * float(torch.rand(()))
+        return self._base_tau()
 
     def _base_tau(self) -> float:
         dist = self.args.tau_shift
@@ -591,7 +596,8 @@ def main() -> None:
     parser.add_argument("--tau-floor", choices=["none", "sigma"], default="none",
                         help="sigma: with a --sigmas grid, iterations before the last get DMD noise levels at or above "
                              "the sigma their estimate is re-noised to (after eDMD, arXiv 2611.17194). Not in the DiR paper; "
-                             "measured to push DiR off the prompt (README, Video part 3)")
+                             "uniform on [sigma, 0.99); the first port of this flag pushed a run off the prompt "
+                             "(README, Video part 3)")
     parser.add_argument("--frames", type=int, default=1,
                         help="latent frames per training sample: 1 (default) trains on stills; 5n+2 (7, 12, ...) "
                              "trains on clip-shaped noise, H3's chunk layout, so the DMD target is the teacher's "
