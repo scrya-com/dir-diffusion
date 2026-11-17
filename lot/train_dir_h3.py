@@ -280,7 +280,7 @@ class Run:
         # K = 1 is the paper's single draw and consumes the RNG exactly as before.
         draws = []
         for _draw in range(max(1, int(getattr(self.args, "dmd_draws", 1)))):
-            draws.append(self.dmd_direction(x0_hat, r, text, seed))
+            draws.append(self.dmd_direction(x0_hat, r, text, seed, state=state, z=z))
         grad = sum(d[0] for d in draws) / len(draws)
         tau, weight, gap = draws[-1][1], draws[-1][2], draws[-1][3]
         fake_real = sum(d[4] for d in draws) / len(draws)
@@ -300,11 +300,25 @@ class Run:
                                         prime_stats, tau, weight, gap, fake_real, draw_cos, backward)
 
     @torch.no_grad()
-    def dmd_direction(self, x0_hat, r, text, seed):
-        """One (tau, eps) draw: ``(grad, tau, weight, gap, mean|fake - real|)`` for a detached ``x0_hat``."""
+    def dmd_direction(self, x0_hat, r, text, seed, state=None, z=None):
+        """One (tau, eps) draw: ``(grad, tau, weight, gap, mean|fake - real|)`` for a detached ``x0_hat``.
+
+        ``--read-noise own`` (with ``--tau-floor``, iterations before the last): the read point is the iteration's
+        own next state at ``s = sigmas[r + 1]`` carried up to ``tau >= s`` by the forward kernel
+        ``a x_s + sqrt(tau^2 - (a s)^2) eps``, ``a = (1 - tau) / (1 - s)`` (eDMD's ``waypoint_noise: own``), so the
+        noise the iteration hands on is judged with its estimate. Default: ``(1 - tau) x0_hat + tau eps``."""
         tau = self.draw_tau(r)
         eps = torch.randn_like(x0_hat)
-        x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
+        own = getattr(self.args, "read_noise", "fresh") == "own" and getattr(self.args, "tau_floor", "none") != "none"
+        if own and state is not None and r + 1 < len(self.sigmas):
+            s = float(self.sigmas[r + 1])
+            tau = max(tau, s)
+            base = next_state(state, x0_hat, self.sigmas[r], s, z if self.mix_state else None).float()
+            scale = (1.0 - tau) / (1.0 - s)
+            spread = max(tau * tau - (scale * s) ** 2, 0.0) ** 0.5
+            x_tau = (scale * base + spread * eps.float()).to(x0_hat.dtype).detach()
+        else:
+            x_tau = ((1.0 - tau) * x0_hat + tau * eps).detach()
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=False):
             x0_real = self.teacher_x0(x_tau, tau, r, text, seed)
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
@@ -664,6 +678,10 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay, both optimizers (eDMD: 0.01)")
     parser.add_argument("--lr-warmup", type=int, default=0,
                         help="generator updates of linear learning-rate warm-up (eDMD: 100); 0 = off")
+    parser.add_argument("--read-noise", choices=["fresh", "own"], default="fresh",
+                        help="with --tau-floor, the point an iteration before the last is read at: its estimate with "
+                             "fresh noise (fresh), or its own next state forward-noised to the drawn level (own, "
+                             "eDMD's waypoint_noise: own, its setting for the unguided Qwen-Image run)")
     parser.add_argument("--fake-first", action="store_true",
                         help="run the fake updates before the generator update, all on fresh rollouts (eDMD's order)")
     parser.add_argument("--frames", type=int, default=1,
@@ -837,7 +855,7 @@ def main() -> None:
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
             "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas, "mix_state": run.mix_state,
             "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr,
-            "tau_floor": str(args.tau_floor), "precise_teacher": args.precise_teacher, "fake_loss_weight": args.fake_loss_weight,
+            "tau_floor": str(args.tau_floor), "read_noise": args.read_noise, "precise_teacher": args.precise_teacher, "fake_loss_weight": args.fake_loss_weight,
             "fake_grad_clip": args.fake_grad_clip, "weight_decay": args.weight_decay, "lr_warmup": args.lr_warmup,
             "fake_first": args.fake_first, "lr": args.lr, "fake_lr": args.fake_lr, "fake_source": args.fake_source, "frames": FRAMES, "eval_frames": EVAL_FRAMES, "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
             "swap": args.swap, "gpu": torch.cuda.get_device_name(device)}
