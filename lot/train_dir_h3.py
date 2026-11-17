@@ -207,7 +207,14 @@ class Run:
         The first port of this flag (base distribution squeezed into the window, clamp at 0.98) pushed a clip
         run off the prompt; see the README, "Video, part 3"."""
         if getattr(self.args, "tau_floor", "none") == "none":
-            return self._base_tau()
+            tau, cap = self._base_tau(), float(getattr(self.args, "tau_max", TAU_MAX))
+            if r is not None:       # --tau-max: generator reads only, redrawn (not clamped) until under the cap
+                for _ in range(64):
+                    if tau <= cap:
+                        break
+                    tau = self._base_tau()
+                tau = min(tau, cap)
+            return tau
         if r is not None and r + 1 < len(self.sigmas):
             if self.laws is not None:
                 return self.laws[r].draw(float(torch.rand(())))
@@ -678,6 +685,10 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.0, help="AdamW weight decay, both optimizers (eDMD: 0.01)")
     parser.add_argument("--lr-warmup", type=int, default=0,
                         help="generator updates of linear learning-rate warm-up (eDMD: 100); 0 = off")
+    parser.add_argument("--tau-max", type=float, default=TAU_MAX,
+                        help="upper bound of the generator's DMD read level without --tau-floor (default 0.98, the "
+                             "clamp): draws above it are redrawn; the fake model's own training keeps the full "
+                             "range. H3's one-call answer on 12-frame latents is unreliable above about 0.9")
     parser.add_argument("--read-noise", choices=["fresh", "own"], default="fresh",
                         help="with --tau-floor, the point an iteration before the last is read at: its estimate with "
                              "fresh noise (fresh), or its own next state forward-noised to the drawn level (own, "
@@ -855,7 +866,7 @@ def main() -> None:
             "grad_clip": args.grad_clip, "ema": args.ema, "ema_warmup": args.ema > 0,
             "priming_weight": args.priming_weight, "priming_refs": args.priming_refs, "sigmas": run.sigmas, "mix_state": run.mix_state,
             "paper_init": args.paper_init, "r_schedule": args.r_schedule, "head_lr": args.head_lr or args.lr,
-            "tau_floor": str(args.tau_floor), "read_noise": args.read_noise, "precise_teacher": args.precise_teacher, "fake_loss_weight": args.fake_loss_weight,
+            "tau_floor": str(args.tau_floor), "read_noise": args.read_noise, "tau_max": args.tau_max, "precise_teacher": args.precise_teacher, "fake_loss_weight": args.fake_loss_weight,
             "fake_grad_clip": args.fake_grad_clip, "weight_decay": args.weight_decay, "lr_warmup": args.lr_warmup,
             "fake_first": args.fake_first, "lr": args.lr, "fake_lr": args.fake_lr, "fake_source": args.fake_source, "frames": FRAMES, "eval_frames": EVAL_FRAMES, "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
             "swap": args.swap, "gpu": torch.cuda.get_device_name(device)}
