@@ -58,7 +58,8 @@ def main() -> None:
     source.add_argument("--run", type=Path, help="a train_nf_h3.py run")
     source.add_argument("--untrained", action="store_true", help="base H3, no LoRA, mean-initialised ConvKV")
     source.add_argument("--dir-run", type=Path,
-                        help="a train_dir_h3.py (DiR) run rendered under the causal mask with no further training: "
+                        help="a train_dir_h3.py (DiR) run, or a Hugging Face repo id with lora_gen.safetensors + dir_head.pt + "
+                             "config.json (johndpope/dir-diffusion-h3), rendered under the causal mask with no further training: "
                              "its generator LoRA + DirHead, R iterations per block, mean-initialised ConvKV")
     parser.add_argument("--dir-ema", action="store_true", help="--dir-run: load the *_ema generator files")
     parser.add_argument("--tag", default="", help="checkpoint suffix, e.g. _200 (default: final)")
@@ -103,7 +104,13 @@ def main() -> None:
     elif args.dir_run is not None:
         from dir_h3 import load_dir_run
 
-        head, network, dir_meta = load_dir_run(args.dir_run, model, tag=args.tag, ema=args.dir_ema)
+        dir_run = args.dir_run
+        if not dir_run.is_dir():        # a Hugging Face repo id, e.g. johndpope/dir-diffusion-h3 (no tag, no fake model)
+            from huggingface_hub import snapshot_download
+
+            dir_run = Path(snapshot_download(str(args.dir_run), allow_patterns=["lora_gen.safetensors", "dir_head.pt",
+                                                                                "config.json"]))
+        head, network, dir_meta = load_dir_run(dir_run, model, tag=args.tag, ema=args.dir_ema)
         meta = {"dir": True, "sigmas": dir_meta["sigmas"], "mix_state": dir_meta.get("mix_state", False), "ref": "none"}
     args.ref = args.ref or meta.get("ref") or "first"
     blocks = meta.get("blocks", [6, 8])

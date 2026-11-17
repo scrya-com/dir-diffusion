@@ -1872,9 +1872,12 @@ def test_nf_dir_trainer_on_cpu():
         for fake_source, mix_state, ref in (("final", False, "none"), ("iteration", True, "first")):
             args = argparse.Namespace(stage=2, blocks=[6, 8], ref=ref, sigmas="1,0.75,0.5", sampler_shift=12.0,
                                       sampler="renoise", sigma_shift=1.0, tau_shift="beta:2.5", audio="silent")
-            meta = {"sigmas": [1.0, 0.947, 0.857, 0.667], "mix_state": mix_state, "fake_source": fake_source}
+            meta = {"sigmas": [1.0, 0.947, 0.857, 0.667], "mix_state": mix_state, "fake_source": fake_source,
+                    "tau_max": 0.9}
+            args.dmd_draws = 2 if mix_state else 1
             run = NFRun(dit, gen_net, fake_net, convkv, args, "cpu", head=head, fake_head=fake_head, dir_meta=meta)
             assert all(0.02 <= run.draw_tau() <= 0.98 for _ in range(20))
+            assert all(run.draw_tau(0.9) <= 0.9 for _ in range(50)) and run.tau_max == 0.9
             for r in (0, 3):
                 zero_grads(lora_params + fake_params + head_params + conv_params)
                 loss, sample, stats = run.dir_generator_update(x0, text, r)
@@ -1883,9 +1886,10 @@ def test_nf_dir_trainer_on_cpu():
                 assert grad_sum(head_params) > 0
                 x0_hat, real, fake, target = recorded[-1]
                 assert float(((target - x0_hat) * (real - fake)).sum()) > 0          # toward real, away from fake
-                assert abs(stats["loss"] - 0.5 * float((x0_hat - target).pow(2).mean())) < 1e-6
+                if args.dmd_draws == 1:
+                    assert abs(stats["loss"] - 0.5 * float((x0_hat - target).pow(2).mean())) < 1e-6
                 zero_grads(lora_params + head_params + conv_params)
-                floss, tau = run.dir_fake_update(sample)
+                floss, tau = run.dir_fake_update(sample, fresh=1 if r else 0)
                 assert math.isfinite(float(floss)) and grad_sum(fake_params) > 0 and 0.02 <= tau <= 0.98
                 assert grad_sum(lora_params) == 0.0 and grad_sum(head_params) == 0.0 and grad_sum(conv_params) == 0.0
             result = run.dir_eval([], 22)

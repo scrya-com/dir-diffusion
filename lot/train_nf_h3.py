@@ -162,6 +162,7 @@ class NFRun:
             self.dir_sigmas = [float(s) for s in dir_meta["sigmas"]]
             self.mix_state = bool(dir_meta.get("mix_state", False))
             self.fake_final = dir_meta.get("fake_source", "iteration") == "final"
+            self.tau_max = float(dir_meta.get("tau_max", TAU_MAX))
 
     # ---- shared pieces
     def reference(self, x0: torch.Tensor):
@@ -173,13 +174,26 @@ class NFRun:
         sigma = float(sample_sigma(float(self.args.sigma_shift), "cpu"))
         return min(max(sigma, SIGMA_MIN), SIGMA_MAX)
 
-    def draw_tau(self) -> float:
+    def draw_tau(self, cap: float | None = None) -> float:
+        """A DMD noise level. ``cap`` (DiR's ``--tau-max``, generator reads only): redrawn, not clamped,
+        until at or under the cap, as ``train_dir_h3.Run.draw_tau`` does."""
         dist = self.args.tau_shift
-        if isinstance(dist, str) and dist.startswith("beta:"):      # DiR's importance sampling: tau ~ Beta(a, 1)
-            tau = float(torch.distributions.Beta(float(dist.split(":", 1)[1]), 1.0).sample((1,)))
-        else:
-            tau = float(sample_sigma(float(dist), "cpu"))
-        return min(max(tau, TAU_MIN), TAU_MAX)
+
+        def draw() -> float:
+            if isinstance(dist, str) and dist.startswith("beta:"):      # DiR's importance sampling: tau ~ Beta(a, 1)
+                tau = float(torch.distributions.Beta(float(dist.split(":", 1)[1]), 1.0).sample((1,)))
+            else:
+                tau = float(sample_sigma(float(dist), "cpu"))
+            return min(max(tau, TAU_MIN), TAU_MAX)
+
+        tau = draw()
+        if cap is not None:
+            for _ in range(64):
+                if tau <= cap:
+                    break
+                tau = draw()
+            tau = min(tau, cap)
+        return tau
 
     def audio_kwargs(self, audio, seed: int | None) -> dict:
         """``nf_forward`` arguments for the audio rows: clean driving audio, or seeded silent noise."""
@@ -303,12 +317,16 @@ class NFRun:
         with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             state, estimate, audio = self.dir_rollout(tuple(x0.shape[2:]), text, first, seed, r)
             x0_hat = self.dir_iteration(state, estimate, audio, r, text, first)
-        tau = self.draw_tau()
-        eps = torch.randn_like(x0_hat)
-        x_tau = (1.0 - tau) * x0_hat + tau * eps
+        # --dmd-draws K: the target is averaged over K independent (tau, eps) reads of this one sample
+        targets = []
         with torch.no_grad():
-            real, fake = self.dir_scores(x_tau, tau, r, text, first, seed + 1)
-            target = dmd_target(x0_hat, real, fake)
+            for draw in range(max(1, int(getattr(self.args, "dmd_draws", 1)))):
+                tau = self.draw_tau(self.tau_max)
+                eps = torch.randn_like(x0_hat)
+                x_tau = (1.0 - tau) * x0_hat + tau * eps
+                real, fake = self.dir_scores(x_tau, tau, r, text, first, seed + 1 + draw)
+                targets.append(dmd_target(x0_hat, real, fake))
+            target = sum(targets) / len(targets)
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             live = self.dir_iteration(state, estimate, audio, r, text, first)
             loss = 0.5 * F.mse_loss(live, target)
@@ -320,19 +338,19 @@ class NFRun:
                  "real_gap": float((x0_hat - real).abs().mean())}
         return loss, (x0_hat.detach(), text, first, seed, r), stats
 
-    def dir_fake_update(self, sample, *, backward: bool = True):
-        """Flow regression of the fake model on a detached generator sample. With the DiR run's endpoint
-        critic (``fake_source: final``) the sample is always a finished clip: a fresh full rollout unless the
-        generator update was at the last iteration."""
+    def dir_fake_update(self, sample, *, backward: bool = True, fresh: int = 0):
+        """Flow regression of the fake model on a detached generator sample, conditioned on its iteration.
+        ``fresh=k > 0`` draws a new rollout instead of reusing the generator update's sample. With an endpoint
+        critic (``fake_source: final``) the sample is always a finished clip."""
         from dir_h3 import fake_velocity
 
         x0_hat, text, first, seed, r = sample
         last = len(self.dir_sigmas) - 1
-        if r < 0 or (self.fake_final and r != last):
+        if fresh or (self.fake_final and r != last):
+            r = last if self.fake_final else r
             with torch.no_grad(), use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
-                state, estimate, audio = self.dir_rollout(tuple(x0_hat.shape[2:]), text, first, seed + 5, last)
-                x0_hat = self.dir_iteration(state, estimate, audio, last, text, first)
-            r = last
+                state, estimate, audio = self.dir_rollout(tuple(x0_hat.shape[2:]), text, first, seed + 5 + 11 * fresh, r)
+                x0_hat = self.dir_iteration(state, estimate, audio, r, text, first)
         index = last if self.fake_final else r
         tau = self.draw_tau()
         eps = torch.randn_like(x0_hat)
@@ -510,9 +528,12 @@ def main() -> None:
     parser.add_argument("--max-latent-hw", type=int, nargs=2, default=None, metavar=("H", "W"),
                         help="cap the latent crop (a random window)")
     parser.add_argument("--steps", type=int, default=1000)
-    parser.add_argument("--lr", type=float, default=1e-4, help="generator LoRA (not given in the paper)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="generator LoRA (default 1e-4; not given in the paper; with --dir-init: the DiR run's)")
+    parser.add_argument("--dmd-draws", type=int, default=1,
+                        help="DiR: (tau, eps) reads averaged per generator update (2 no-grad forwards each)")
     parser.add_argument("--conv-lr", type=float, default=None, help="ConvKV learning rate (default: --lr)")
-    parser.add_argument("--fake-lr", type=float, default=1e-4)
+    parser.add_argument("--fake-lr", type=float, default=None, help="default 1e-4, or the DiR run's")
     parser.add_argument("--rank", type=int, default=16, help="LoRA rank, generator and fake")
     parser.add_argument("--accum", type=int, default=1, help="gradient accumulation (batch size is 1)")
     parser.add_argument("--sigma-shift", type=float, default=1.0,
@@ -560,6 +581,8 @@ def main() -> None:
     # A DiR generator was trained text-to-video, so it starts without a reference frame unless asked.
     args.ref = args.ref or ("none" if dir_meta else "first")
     args.tau_shift = args.tau_shift if args.tau_shift is not None else (dir_meta.get("tau_shift", 1.0) if dir_meta else 1.0)
+    args.lr = args.lr if args.lr is not None else float((dir_meta or {}).get("lr", 1e-4))
+    args.fake_lr = args.fake_lr if args.fake_lr is not None else float((dir_meta or {}).get("fake_lr", 1e-4))
     if args.stage == 2 and args.accum != 1:
         # The fake update regresses on the generator update's sample; with accumulation only the last of the
         # accumulated samples would reach it. Refused rather than silently trained that way.
@@ -648,6 +671,7 @@ def main() -> None:
             "clip_blocks": args.clip_blocks, "frames": frames, "ref": args.ref, "audio": args.audio, "cache": str(args.cache),
             "sources": sources, "holdout": args.holdout, "ratio": 5, "shared_kv": not args.separate_v,
             "sigmas": run.sigmas, "sampler": args.sampler, "sigma_shift": args.sigma_shift, "lr": args.lr,
+            "eval_items": args.eval_items,
             "steps": args.steps, "seed": args.seed, "max_latent_hw": args.max_latent_hw,
             "init": None if args.init is None else str(args.init), "fake_rank": fake_rank}
     if dir_meta is not None:
@@ -655,7 +679,9 @@ def main() -> None:
                      "iters": int(dir_meta["iters"]), "sigmas": run.dir_sigmas, "mix_state": run.mix_state,
                      "hidden": int(dir_meta["hidden"]), "temb_dim": int(dir_meta["temb_dim"]),
                      "fake_source": dir_meta.get("fake_source", "iteration"), "tau_shift": args.tau_shift,
-                     "r_schedule": args.r_schedule, "grad_clip": grad_clip, "betas": list(betas), "sampler": "dir"})
+                     "r_schedule": args.r_schedule, "grad_clip": grad_clip, "betas": list(betas), "sampler": "dir",
+                     "tau_max": run.tau_max, "fake_lr": args.fake_lr, "fake_updates": args.fake_updates,
+                     "dmd_draws": args.dmd_draws})
     log = open(args.out / "log.jsonl", "a")
 
     def save(tag: str) -> None:
@@ -706,9 +732,7 @@ def main() -> None:
             for k in range(args.fake_updates):
                 zero_grads(fake_params)
                 if head is not None:
-                    if k:       # a fresh finished clip for every further fake update
-                        sample = (sample[0], sample[1], sample[2], sample[3] + 11 * k, -1)
-                    floss, ftau = run.dir_fake_update(sample)
+                    floss, ftau = run.dir_fake_update(sample, fresh=k)     # k > 0: a fresh rollout
                 else:
                     if k:
                         with torch.no_grad():
