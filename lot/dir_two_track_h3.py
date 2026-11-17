@@ -65,12 +65,14 @@ def video_extra(head, est_lr: torch.Tensor, est_hr: torch.Tensor | None = None, 
 def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, sigmas: list, mix_state: bool,
                          switch: int, seed: int, latent_t: int = 1, maps=None, region=None, box=None,
                          block: int = 25, alpha: float = 0.5, floor=None, feather: float = 4.0,
-                         switch_upscale: str = "crop", final: str = "pixel"):
+                         switch_upscale: str = "crop", final: str = "pixel", repeat_last: int = 0):
     """The sampler of the module docstring. Returns ``(latent, info)`` at ``width x height``.
 
     ``info`` has ``mask``, ``tokens`` (video tokens per forward), ``dit_s`` (seconds inside the DiT),
     ``lr`` (the final LR estimate) and, for ``final="pixel"``, ``weight`` for ``two_track_h3.pixel_compose``.
     ``switch == len(sigmas)`` never opens the region: the result is DiR at half resolution, upscaled.
+    ``repeat_last`` runs the last iteration (same ``r`` and sigma) that many more times on the packed
+    sequence, each time from the newest estimates; it only has an effect with ``mix_state``.
     """
     from dir_h3 import next_state
     from mixed_res import TwoTrackPlan, region_mask
@@ -136,14 +138,16 @@ def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, s
     z_hr = torch.randn(1, 24, latent_t, 2 * lat_h, 2 * lat_w, device="cuda",
                        generator=torch.Generator("cuda").manual_seed(seed + 2))
     state_hr = sigmas[switch] * z_hr + (1.0 - sigmas[switch]) * est_hr
-    for r in range(switch, iters):
+    mixed = list(range(switch, iters)) + [iters - 1] * repeat_last
+    for step, r in enumerate(mixed):
         v_lr, v_hr = forward(state_lr, state_hr, plan, r, video_extra(head, est_lr, est_hr, plan))
         est_lr = state_lr.float() + sigmas[r] * v_lr.float()
         est_hr = state_hr.float() + sigmas[r] * v_hr.float()          # v_hr is zero outside the region
         info["tokens"].append(plan.lr_count + plan.hr_count)
-        if r + 1 < iters:
-            state_lr = next_state(state_lr, est_lr, sigmas[r], sigmas[r + 1], z_lr if mix_state else None)
-            state_hr = next_state(state_hr, est_hr, sigmas[r], sigmas[r + 1], z_hr if mix_state else None)
+        if step + 1 < len(mixed):
+            after = sigmas[mixed[step + 1]]
+            state_lr = next_state(state_lr, est_lr, sigmas[r], after, z_lr if mix_state else None)
+            state_hr = next_state(state_hr, est_hr, sigmas[r], after, z_hr if mix_state else None)
     info["lr"] = est_lr
     weight = mask_to_latent(mask, 4, feather).to("cuda")
     if final == "pixel":
@@ -271,7 +275,7 @@ def render(args) -> None:
         block = saved["block"]
     width, height = args.size
     columns = [name for name in VARIANTS if name in args.variants.split(",")]
-    meta = {"run": args.run, "tag": args.tag, "ema": args.ema, "sigmas": sigmas, "mix_state": mix_state, "switch": switch,
+    meta = {"run": args.run, "tag": args.tag, "ema": args.ema, "sigmas": sigmas, "mix_state": mix_state, "switch": switch, "repeat_last": args.repeat_last,
             "canvas": f"{width}x{height}", "frames": args.frames, "latent_t": latent_t, "base_steps": args.steps,
             "maps": str(maps_path), "region": "box" if args.box else str(region_path), "box": args.box,
             "switch_upscale": args.switch_upscale, "final": args.final, "columns": columns, "prompts": [],
@@ -304,7 +308,8 @@ def render(args) -> None:
                         switch=len(sigmas) if name == "lr" else switch, seed=seed, latent_t=latent_t, maps=maps,
                         region=region if name == "two_track" else None, box=args.box, block=block or 25,
                         alpha=args.alpha, floor=args.floor, feather=args.feather,
-                        switch_upscale=args.switch_upscale, final=args.final)
+                        switch_upscale=args.switch_upscale, final=args.final,
+                        repeat_last=args.repeat_last if name == "two_track" else 0)
                     tokens = info["tokens"]
                     if name == "two_track":
                         mask = info["mask"]
@@ -337,7 +342,7 @@ def render(args) -> None:
     draw = ImageDraw.Draw(sheet)
     labels = {"base": f"base H3, {args.steps} steps", "dir": f"DiR, {len(sigmas)} iterations, full res",
               "lr": f"DiR, {len(sigmas)} iterations, half res, upscaled",
-              "two_track": f"DiR two-track: {switch} LR + {len(sigmas) - switch} mixed"}
+              "two_track": f"DiR two-track: {switch} LR + {len(sigmas) - switch + args.repeat_last} mixed"}
     for col, name in enumerate(columns):
         draw.text((col * cell[0] + 6, 8), labels[name], fill="black")
     for r, images in enumerate(rows):
@@ -371,12 +376,12 @@ def check(args) -> None:
     from two_track_h3 import box_mask, two_track_forward
 
     run = resolve_run(args.run)
-    dit = load_dit(LOT_H3_CHECKPOINT, device="cuda", swap=auto_swap(args.swap, inference=True, latent_t=3))
+    dit = load_dit(LOT_H3_CHECKPOINT, device="cuda", swap=auto_swap(args.swap, inference=True, latent_t=7))
     head, _network, config = load_generator(run, dit, args.tag, args.ema)
     sigmas, mix_state, _switch = schedule_of(args, config)
     _caption, text = load_prompts(args, config)[0]
     text = text.to("cuda", torch.bfloat16)
-    width, height, latent_t = 768, 512, 3
+    width, height, latent_t = 768, 512, 7           # H3 clips have 5n + 2 latent frames
     gen = torch.Generator("cuda").manual_seed(args.seed)
     lr = torch.randn(1, 24, latent_t, height // 32, width // 32, device="cuda", generator=gen)
     hr = torch.randn(1, 24, latent_t, height // 16, width // 16, device="cuda", generator=gen)
@@ -430,6 +435,8 @@ def main() -> None:
     parser.add_argument("--variants", default="dir,two_track", help=f"comma list of {','.join(VARIANTS)}")
     parser.add_argument("--switch", type=int, default=None,
                         help="iterations at half resolution before the region opens (default: R - 2)")
+    parser.add_argument("--repeat-last", type=int, default=0,
+                        help="extra passes of the last iteration on the mixed sequence (mix-state runs)")
     parser.add_argument("--size", type=int, nargs=2, default=(1344, 768), metavar=("W", "H"))
     parser.add_argument("--frames", type=int, default=39, help="pixel frames (1 = a still)")
     parser.add_argument("--prompts", type=int, default=2)

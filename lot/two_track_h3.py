@@ -2,7 +2,8 @@
 """MPEG-Diffusion's own arrangement on H3: a native LR track plus HR tokens on a selected region.
 
 Copied from scrya-com/mpeg-diffusion (``lot/two_track_h3.py`` at 8e91323) for ``dir_two_track_h3.py``.
-One change: ``two_track_forward`` takes DiR's ``video_extra`` and ``video_temb_delta`` hooks. The
+Two changes: ``two_track_forward`` takes DiR's ``video_extra`` and ``video_temb_delta`` hooks, and it
+rounds the flow time to 32-bit as ``h3_musubi.forward_video`` does. The
 ``fit-kv``, ``region`` and ``layout`` phases need files that stay in mpeg-diffusion; run them there.
 
     python3 lot/two_track_h3.py render --out DIR [--steps 20 --switch 18 --hr-steps 6] [--maps DIR/up_maps_tt.pt]
@@ -89,6 +90,10 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
         text = text.unsqueeze(0)
     _sync_swap(dit)
     device = dit.video_patch_proj.weight.device
+    # The flow time in 32-bit, as h3_musubi.predict and forward_video round it. Unrounded, 1/3 against
+    # float32(1/3) moved the output by 3-6% rel. rms (measured, cause not found), so this forward and
+    # dir_sample disagreed at a DiR run's sigmas.
+    t = float(torch.as_tensor(t).reshape(-1)[0])
     sigma_a = float(audio_sigma(1.0 - t))
     _b, _c, frames, lat_h, lat_w = lr.shape
     layout = _layout(text.shape[1], frames, lat_h, lat_w)
