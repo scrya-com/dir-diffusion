@@ -34,7 +34,8 @@ H3 is not Wan, so three things have no counterpart in the paper and are decided 
 * H3's head predicts ``x0 - eps`` (the paper's target is ``eps - x0``).
 
 Nothing in ``third_party/`` is modified: the attention below calls each block's own ``qkv_proj``,
-norms and ``out_proj`` (so LoRAs apply), and with ``causal=False`` it is the stock forward.
+norms and ``out_proj`` (so LoRAs apply) from inside the stock ``DiTBlock``, and with ``causal=False`` it is
+the stock forward.
 """
 
 from __future__ import annotations
@@ -442,22 +443,16 @@ def nf_attention(attn, hidden: torch.Tensor, call: Call, state: LayerState, conv
     return attn.out_proj(out)
 
 
-def _block(block, hidden, temb, segments, call: Call, state: LayerState | None, conv, config: NFConfig, frame_rows: int):
-    """``DiTBlock.forward`` with ``nf_attention``. A fresh ``LayerState`` when none is given (a parallel
-    pass, also when activation checkpointing recomputes the block)."""
-    from musubi_tuner.minimax_h3.model import _mod_gate, _mod_scale_shift
-
-    if state is None:
-        state = LayerState(config, frame_rows)
-    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.adaln_proj(temb)
-    normalized = _mod_scale_shift(block.norm1(hidden), shift_msa, scale_msa, segments)
-    hidden = _mod_gate(hidden, nf_attention(block.attn, normalized, call, state, conv), gate_msa, segments)
-    normalized = _mod_scale_shift(block.norm2(hidden), shift_mlp, scale_mlp, segments)
-    return _mod_gate(hidden, block.mlp(normalized), gate_mlp, segments)
-
-
 def _run(dit, hidden, temb, segments, call: Call, states, convkv: ConvKV | None, config: NFConfig, frame_rows: int):
-    """The block stack (``h3_musubi.run_blocks``: block streaming, activation checkpointing)."""
+    """The block stack (``h3_musubi.run_blocks``: block streaming, activation checkpointing), each block
+    being the stock ``DiTBlock`` called as a module with ``nf_attention`` in place of its attention.
+
+    The swap only lasts for the call (an instance attribute on ``block.attn``, removed on the way out),
+    and it is made inside the function that activation checkpointing re-runs during backward. The block
+    is called as a module, not unrolled here, because the block-swap offloader moves blocks during
+    backward from hooks on the block modules. ``states`` is ``None`` for a parallel pass (a fresh
+    ``LayerState`` per call, also when checkpointing recomputes) or one ``LayerState`` per block.
+    """
     from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
     device = dit.video_patch_proj.weight.device
@@ -468,7 +463,16 @@ def _run(dit, hidden, temb, segments, call: Call, states, convkv: ConvKV | None,
         state = None if states is None else states[index]
 
         def forward(hidden_in, temb_in, block=block, conv=conv, state=state):
-            return _block(block, hidden_in, temb_in, segments, call, state, conv, config, frame_rows)
+            attn = block.attn
+
+            def attend(normalized, _rotation=None):
+                return nf_attention(attn, normalized, call, LayerState(config, frame_rows) if state is None else state, conv)
+
+            attn.forward = attend
+            try:
+                return block(hidden_in, temb_in, segments, None)
+            finally:
+                del attn.forward
 
         if dit.gradient_checkpointing and dit.training and states is None:
             if dit.activation_cpu_offloading:

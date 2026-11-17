@@ -1571,14 +1571,13 @@ def test_nf_trainer_updates_on_cpu():
                               sampler="renoise", sigma_shift=1.0, tau_shift=1.0)
     run = NFRun(dit, gen_net, None, None, args, "cpu")
     eps = torch.randn_like(x0)
-    loss, stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3)
+    loss, stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, backward=True)
     # eq. 2 and eq. 4 by hand; the LoRA starts at zero, so this is the base model under the causal mask
     x_t = 0.4 * x0 + 0.6 * eps
     with torch.no_grad():
         by_hand = nf_forward(dit, x_t, 0.4, text, config=NFConfig(), first=x0[:, :, :1],
                              audio_generator=torch.Generator().manual_seed(3))
     assert abs(float(loss) - float((by_hand - (x0 - eps)).pow(2).mean())) < 1e-5 and stats["sigma"] == 0.6
-    loss.backward()
     assert grad_sum(gen_params) > 0
     dense, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, config=DENSE)
     assert abs(float(dense) - float(loss)) > 1e-4

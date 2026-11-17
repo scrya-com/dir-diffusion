@@ -149,8 +149,11 @@ class NFRun:
 
     # ---- Stage 1
     def stage1_loss(self, x0, text, *, sigma: float | None = None, eps=None, config: NFConfig | None = None,
-                    audio_seed: int | None = None):
-        """Eq. 4 on one clip. Returns ``(loss, stats)``; the generator LoRA is on."""
+                    audio_seed: int | None = None, backward: bool = False):
+        """Eq. 4 on one clip. Returns ``(loss, stats)``; the generator LoRA is on.
+
+        ``backward=True`` runs the backward here, inside the LoRA switch: activation checkpointing
+        re-runs every block during backward and must find the same LoRAs on as in the forward."""
         sigma = self.draw_sigma() if sigma is None else float(sigma)
         eps = torch.randn_like(x0) if eps is None else eps
         x_t = ((1.0 - sigma) * x0.float() + sigma * eps.float()).to(x0.dtype)          # eq. 2, every block at one step
@@ -158,7 +161,9 @@ class NFRun:
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             velocity = nf_forward(self.dit, x_t, 1.0 - sigma, text, config=config or self.causal,
                                   first=self.reference(x0), audio_generator=audio)
-        loss = F.mse_loss(velocity.float(), x0.float() - eps.float())
+            loss = F.mse_loss(velocity.float(), x0.float() - eps.float())
+            if backward:
+                (loss * self.loss_scale).backward()
         return loss, {"loss": float(loss.detach()), "sigma": sigma}
 
     # ---- Stage 2
@@ -201,9 +206,9 @@ class NFRun:
             target = (x0_hat - grad).detach()
         with use_networks(self.gen_net, self.fake_net, gen=True, fake=False):
             live = self.generator_step(x_s, audio_s, step, text, first)
-        loss = 0.5 * F.mse_loss(live, target)
-        if backward:
-            (loss * self.loss_scale).backward()
+            loss = 0.5 * F.mse_loss(live, target)
+            if backward:        # inside the switch: checkpointing re-runs the blocks with these LoRAs
+                (loss * self.loss_scale).backward()
         stats = {"loss": float(loss.detach()), "tau": tau, "exit_step": step,
                  "match": float((live.detach() - x0_hat).abs().max()),
                  "match_rel": float((live.detach() - x0_hat).pow(2).mean().sqrt() / x0_hat.pow(2).mean().sqrt().clamp(min=1e-8)),
@@ -220,9 +225,9 @@ class NFRun:
         audio = torch.Generator(self.device).manual_seed(seed + 2)
         with use_networks(self.gen_net, self.fake_net, gen=False, fake=True):
             velocity = nf_forward(self.dit, x_tau, 1.0 - tau, text, config=DENSE, first=first, audio_generator=audio)
-        loss = F.mse_loss(velocity.float(), x0_hat - eps)
-        if backward:
-            (loss * self.loss_scale).backward()
+            loss = F.mse_loss(velocity.float(), x0_hat - eps)
+            if backward:
+                (loss * self.loss_scale).backward()
         return loss, tau
 
 
@@ -259,8 +264,7 @@ def check(run: NFRun, gen_params, fake_params, items, rng, device, frames: int) 
         with torch.no_grad():
             dense, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, config=DENSE, audio_seed=3)
             causal, _ = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3)
-        loss, _stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3)
-        loss.backward()
+        loss, _stats = run.stage1_loss(x0, text, sigma=0.6, eps=eps, audio_seed=3, backward=True)
         gen_grad = grad_sum(gen_params)
         # the grad forward (checkpointing, swap in training mode) and the no-grad one agree up to bf16 noise
         ok = int(math.isfinite(float(loss)) and gen_grad > 0 and abs(float(loss) - float(causal)) < 5e-2 * max(1.0, float(causal)))
@@ -423,8 +427,7 @@ def main() -> None:
         for _ in range(args.accum):
             x0, text = load_clip(rng.choice(train_items), rng, device, frames)
             if args.stage == 1:
-                loss, stats = run.stage1_loss(x0, text)
-                (loss * run.loss_scale).backward()
+                loss, stats = run.stage1_loss(x0, text, backward=True)
             else:
                 loss, sample, stats = run.generator_update(x0, text)
         record.update(stats)
