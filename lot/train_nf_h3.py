@@ -152,8 +152,10 @@ class NFRun:
     def __init__(self, dit, gen_net, fake_net, convkv, args, device, head=None, fake_head=None, dir_meta=None) -> None:
         self.dit, self.gen_net, self.fake_net, self.convkv = dit, gen_net, fake_net, convkv
         self.args, self.device = args, device
-        self.causal = NFConfig(args.blocks[0], args.blocks[1], causal=True, memory=False)
-        self.memory = NFConfig(args.blocks[0], args.blocks[1], causal=True, memory=True) if args.stage == 2 else None
+        self.causal = NFConfig(args.blocks[0], args.blocks[1], causal=True, memory=False,
+                               text_reads_first=getattr(args, "text_reads_first", False))
+        self.memory = NFConfig(args.blocks[0], args.blocks[1], causal=True, memory=True,
+                               text_reads_first=getattr(args, "text_reads_first", False)) if args.stage == 2 else None
         self.sigmas = few_step_sigmas([float(s) for s in args.sigmas.split(",")], args.sampler_shift)
         self.loss_scale = 1.0
         # DiR under Neighbor Forcing: the generator is a DiR run's LoRA + DirHead, sampled in R iterations
@@ -509,6 +511,8 @@ def main() -> None:
     parser.add_argument("--source", action="append", default=None,
                         help="keep clips whose source metadata starts with this (repeatable; default set_nk = Nikki; "
                              "'' keeps all)")
+    parser.add_argument("--text-reads-first", action="store_true",
+                        help="the text prefix also reads chunk 1, as dense H3 text reads the video (deviation 3)")
     parser.add_argument("--blocks", type=int, nargs=2, default=[FIRST_BLOCK, NEXT_BLOCK], metavar=("FIRST", "NEXT"),
                         help="latent frames of the first and of every later block (paper Table 5: 6 8)")
     parser.add_argument("--clip-blocks", type=int, default=3, help="blocks per training clip (3 = 22 latent frames)")
@@ -667,7 +671,7 @@ def main() -> None:
     gen_opt = torch.optim.AdamW(gen_groups, lr=args.lr, weight_decay=0.0, betas=betas)
     fake_opt = torch.optim.AdamW(fake_groups, lr=args.fake_lr, weight_decay=0.0, betas=betas) if fake_groups else None
     args.out.mkdir(parents=True, exist_ok=True)
-    meta = {"paper": "arXiv 2603.11746", "stage": args.stage, "rank": args.rank, "blocks": list(args.blocks),
+    meta = {"paper": "arXiv 2603.11746", "stage": args.stage, "rank": args.rank, "blocks": list(args.blocks), "text_reads_first": bool(getattr(args, "text_reads_first", False)),
             "clip_blocks": args.clip_blocks, "frames": frames, "ref": args.ref, "audio": args.audio, "cache": str(args.cache),
             "sources": sources, "holdout": args.holdout, "ratio": 5, "shared_kv": not args.separate_v,
             "sigmas": run.sigmas, "sampler": args.sampler, "sigma_shift": args.sigma_shift, "lr": args.lr,

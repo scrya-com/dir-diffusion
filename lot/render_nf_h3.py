@@ -64,6 +64,8 @@ def main() -> None:
     parser.add_argument("--dir-ema", action="store_true", help="--dir-run: load the *_ema generator files")
     parser.add_argument("--tag", default="", help="checkpoint suffix, e.g. _200 (default: final)")
     parser.add_argument("--blocks", type=int, default=3, help="blocks to stream (6 + 8 (N - 1) latent frames)")
+    parser.add_argument("--text-reads-first", action="store_true",
+                        help="the text prefix also reads chunk 1 (default: whatever the run was trained with)")
     parser.add_argument("--memory", action=argparse.BooleanOptionalAction, default=True,
                         help="ConvKV context from the third block on (--no-memory: every earlier frame, Stage 1)")
     parser.add_argument("--steps", type=int, default=0, help="0 = the 3-step schedule; N = H3's N-step Euler schedule")
@@ -74,6 +76,9 @@ def main() -> None:
                         help="driving: the held-out clip's clean H3 audio latent as conditioning (covers 3 blocks); "
                              "default: what the run was trained with, else silent")
     parser.add_argument("--prompts", type=int, default=1, help="held-out clips to render")
+    parser.add_argument("--text-file", type=Path, nargs="+", default=None,
+                        help="*_minimaxh3_te.safetensors prompt embeddings used in place of each held-out clip's text: "
+                             "one per block, the last repeating (one file = the same prompt for every block)")
     parser.add_argument("--cache", type=Path, default=None, help="clip cache (default: the run's, else LOT_H3_CLIPS_CACHE)")
     parser.add_argument("--size", type=int, nargs=2, default=[512, 768], metavar=("W", "H"), help="pixels, multiples of 32")
     parser.add_argument("--cache-device", default="cpu", help="where the per-step key/value caches live (cpu or cuda)")
@@ -114,7 +119,8 @@ def main() -> None:
         meta = {"dir": True, "sigmas": dir_meta["sigmas"], "mix_state": dir_meta.get("mix_state", False), "ref": "none"}
     args.ref = args.ref or meta.get("ref") or "first"
     blocks = meta.get("blocks", [6, 8])
-    config = NFConfig(blocks[0], blocks[1], memory=args.memory)
+    config = NFConfig(blocks[0], blocks[1], memory=args.memory,
+                      text_reads_first=bool(args.text_reads_first or meta.get("text_reads_first")))
     if args.memory and convkv is None:
         convkv = ConvKV.for_dit(model).cuda().eval()          # the mean: an untrained memory
     if head is not None:
@@ -134,7 +140,16 @@ def main() -> None:
     results = []
     for index, item in enumerate(held[:args.prompts]):
         x0, text = load_clip(item, rng, "cuda", 22)
-        if tuple(x0.shape[-2:]) != (lat_h, lat_w):
+        if args.text_file is not None:
+            from safetensors import safe_open
+
+            texts = []
+            for path in args.text_file:
+                with safe_open(str(path), "pt") as handle:
+                    hidden, mask = handle.get_tensor("hidden_states"), handle.get_tensor("attention_mask")
+                texts.append(hidden[mask].unsqueeze(0).to(device=text.device, dtype=text.dtype))
+            text = texts[0] if len(texts) == 1 else (lambda block, texts=texts: texts[min(block, len(texts) - 1)])
+        if tuple(x0.shape[-2:]) != (lat_h, lat_w) and args.ref != "none":
             raise SystemExit(f"clip latent {tuple(x0.shape[-2:])} is smaller than --size {lat_h}x{lat_w} latent")
         first = x0[:, :, :1].contiguous() if args.ref == "first" else None
         audio_mode = args.audio or meta.get("audio", "silent")

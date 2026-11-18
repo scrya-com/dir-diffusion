@@ -25,7 +25,9 @@ H3 is not Wan, so three things have no counterpart in the paper and are decided 
 * H3 is single-stream: text, audio and video rows share one self-attention. Text rows (and the FL2VA
   ``first`` rows, the reference image ``x_ref`` of eq. 1) form a *prefix* every block can read and that
   reads only itself, which is what cross-attention to text gives Wan and what makes the prefix
-  cacheable. Each audio row belongs to the block that contains its time and is visible inside that
+  cacheable. ``NFConfig(text_reads_first=True)`` instead lets the prefix also read block 0 (as dense H3's
+  text rows read the video): the cached prefix then carries block 0, still cacheable, and a one-block
+  clip equals the dense forward. Each audio row belongs to the block that contains its time and is visible inside that
   block only. By default audio rows are silent noise, as everywhere in this repo; with driving audio
   (``audio=..., audio_t=AUDIO_CLEAN``) they are the clip's clean H3 audio latent, which is this port's
   ``c_audio``: H3 has no audio cross-attention, its audio is rows of the same attention.
@@ -83,6 +85,7 @@ class NFConfig:
     ref: int = REF_FRAMES
     long: int = LONG_SLOTS
     short: int = SHORT_FRAMES
+    text_reads_first: bool = False      # prefix rows also read block 0 (dense H3's text reads the video; deviation 3)
 
     def __post_init__(self) -> None:
         if self.first_block < 1 or self.next_block < 1:
@@ -386,6 +389,7 @@ class Call:
     prefix_rotation: torch.Tensor | None
     blocks: list = field(default_factory=list)
     dense_rotation: torch.Tensor | None = None
+    prefix_reads_block: bool = False    # the prefix's queries also read the first block of ``blocks``
 
 
 def _rope(states: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
@@ -427,7 +431,12 @@ def nf_attention(attn, hidden: torch.Tensor, call: Call, state: LayerState, conv
         prefix_k, prefix_v = key[:, :count], value[:, :count]
         state.set_prefix(prefix_k, prefix_v)
         rotated = _rope(prefix_k, call.prefix_rotation)
-        out[:, :count] = _attend(_rope(query[:, :count], call.prefix_rotation).to(value), rotated, prefix_v)
+        keys, values = rotated, prefix_v
+        if call.prefix_reads_block:         # the prefix also reads the block computed with it (block 0, or
+            block = call.blocks[0]          # the block at which a stream switches prompt); its cached keys and
+            keys = torch.cat([rotated, _rope(key[:, block.rows], block.rotation)], dim=1)    # values carry that read
+            values = torch.cat([prefix_v, value[:, block.rows]], dim=1)
+        out[:, :count] = _attend(_rope(query[:, :count], call.prefix_rotation).to(value), keys.to(value), values)
     else:
         prefix_k, prefix_v = (t.to(value.device) for t in state.prefix)
         rotated = _rope(prefix_k, call.prefix_rotation)
@@ -607,7 +616,7 @@ def nf_forward(dit, latent: torch.Tensor, t, text: torch.Tensor, *, config: NFCo
                                geometry.video_positions(0, latent_t)])
         call = Call(0, None, dense_rotation=_rotation(dit, positions, dtype))
     else:
-        call = Call(count, _rotation(dit, geometry.prefix_positions(), dtype))
+        call = Call(count, _rotation(dit, geometry.prefix_positions(), dtype), prefix_reads_block=config.text_reads_first)
         for index, (start, stop) in enumerate(config.spans(latent_t)):
             a0, a1 = geometry.audio_span(start, stop, latent_t)
             shift = geometry.window_shift(config, index)
@@ -691,7 +700,8 @@ class NFStream:
         shift = geometry.window_shift(config, index)
         own = torch.cat([geometry.audio_positions(a0, a1, shift), geometry.video_positions(start, stop, shift)])
         dtype = hidden.dtype
-        call = Call(count, _rotation(dit, geometry.prefix_positions(), dtype))
+        call = Call(count, _rotation(dit, geometry.prefix_positions(), dtype),
+                    prefix_reads_block=config.text_reads_first and bool(count))
         call.blocks.append(BlockCall(index, torch.arange(count, hidden.shape[1], device=device),
                                      (stop - start) * rows_per_frame, _rotation(dit, own, dtype),
                                      _rotation(dit, geometry.context_positions(config, index), dtype)))

@@ -1631,6 +1631,51 @@ def test_nf_trainer_updates_on_cpu():
         assert grad_sum(gen_params) == 0.0 and grad_sum(list(convkv.parameters())) == 0.0
 
 
+def test_nf_text_reads_first():
+    """``text_reads_first``: one causal block is the dense forward; with more blocks the stream still equals the
+    parallel pass (memory on and off), nothing leaks backwards, and the switch changes the output."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_text_reads_first: musubi_tuner not importable", flush=True)
+        return
+    from h3_musubi import _silence, audio_sigma
+    from nf_h3 import ConvKV, Geometry, NFConfig, NFStream, NoiseBank, few_step_sigmas, nf_forward, parallel_noise
+
+    text = torch.randn(1, 5, 16)
+    with torch.no_grad():
+        for frames in (7, 12):
+            z = torch.randn(1, 24, frames, 4, 6)
+            audio = _silence(frames, 0.7, "cpu", torch.Generator().manual_seed(3))
+            for first in (None, torch.randn(1, 24, 1, 4, 6)):
+                dense = nf_forward(dit, z, 0.4, text, first=first, audio=audio)
+                one = nf_forward(dit, z, 0.4, text, config=NFConfig(frames, 8, text_reads_first=True), first=first, audio=audio)
+                cut = nf_forward(dit, z, 0.4, text, config=NFConfig(frames, 8), first=first, audio=audio)
+                assert float((one - dense).abs().max()) < 1e-5, (frames, first is None)
+                assert float((cut - dense).abs().max()) > 1e-3          # the isolated prefix is a different model
+        convkv = ConvKV.for_dit(dit)
+        for layer in convkv.layers:
+            layer.memory_proj_k.weight.normal_(0.2, 0.2)
+        frames, sigma = NFConfig().frames(4), few_step_sigmas()[1]
+        for memory in (False, True):
+            config = NFConfig(memory=memory, text_reads_first=True)
+            conv = convkv if memory else None
+            noise = NoiseBank(11, "cpu")
+            x, unit = parallel_noise(noise, config, frames, 1, 4, 6)
+            audio = float(audio_sigma(sigma)) * unit
+            whole = nf_forward(dit, x, 1.0 - sigma, text, config=config, convkv=conv, audio=audio)
+            off = nf_forward(dit, x, 1.0 - sigma, text, config=NFConfig(memory=memory), convkv=conv, audio=audio)
+            assert float((whole - off).abs().max()) > 1e-3
+            stream = NFStream(dit, lat_h=4, lat_w=6, steps=3, config=config, convkv=conv, total_frames=frames)
+            for index, (start, stop) in enumerate(config.spans(frames)):
+                a0, a1 = Geometry.audio_span(start, stop, frames)
+                got = stream.velocity(index, 1, x[:, :, start:stop], 1.0 - sigma, text, audio[..., a0:a1])
+                assert float((got - whole[:, :, start:stop]).abs().max()) < 1e-5, (memory, index)
+            moved = x.clone()
+            moved[:, :, 6:] += torch.randn_like(moved[:, :, 6:])
+            out = nf_forward(dit, moved, 1.0 - sigma, text, config=config, convkv=conv, audio=audio)
+            assert torch.equal(out[:, :, :6], whole[:, :, :6])          # later blocks never reach block 0 or the text
+
+
 def test_nf_memory_independent_reference():
     """The reviewer's independent re-derivation of the ConvKV forward (stock layout and position grid, own
     index arithmetic, einsum instead of Conv1d, the release's recursive fold) against ``nf_forward``, 8 blocks."""
@@ -1881,7 +1926,7 @@ def test_nf_dir_trainer_on_cpu():
             for r in (0, 3):
                 zero_grads(lora_params + fake_params + head_params + conv_params)
                 loss, sample, stats = run.dir_generator_update(x0, text, r)
-                assert math.isfinite(stats["loss"]) and stats["match"] < 1e-5 and stats["gap"] > 0 and stats["r"] == r
+                assert math.isfinite(stats["loss"]) and stats["match"] < 1e-5 and stats["gap"] > 0 and stats["r"] == r, stats
                 assert grad_sum(lora_params) > 0 and grad_sum(conv_params) > 0 and grad_sum(fake_params) == 0.0
                 assert grad_sum(head_params) > 0
                 x0_hat, real, fake, target = recorded[-1]
@@ -1955,6 +2000,7 @@ def main():
         test_nf_causal_is_eq5_mask,
         test_nf_convkv_memory,
         test_nf_stream_equals_parallel,
+        test_nf_text_reads_first,
         test_nf_trainer_updates_on_cpu,
         test_nf_memory_independent_reference,
         test_nf_dir_hooks_and_samplers,
