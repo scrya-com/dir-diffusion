@@ -488,11 +488,25 @@ def refit(args) -> None:
     for path in held:                                            # held-out features, kept on the CPU
         d = load(path, dev)
         cached[str(path)] = tokens(d).half().cpu()
-    del dit, net, lora, gen_head
-    torch.cuda.empty_cache()
     args.out.mkdir(parents=True, exist_ok=True)
+    moments = args.out / "refit_moments.pt"
+    tmp = moments.with_suffix(".tmp")
+    torch.save({"xtx": xtx.cpu(), "xty": xty.cpu(), "sx": sx.cpu(), "sy": sy.cpu(), "n": n.cpu(), "mean": mean.cpu(),
+                "scale": scale.cpu(), "held": cached, "out": out, "train_samples": len(train)}, tmp)
+    tmp.replace(moments)                                          # the DiT pass is never lost to a failed solve
+    print(f"LOT_H3 kind=dwd_refit_moments out={moments} min={(time.time() - t0) / 60:.1f}", flush=True)
+
+
+def refit_solve(args) -> None:
+    """Solve the head from ``refit_moments.pt`` in a process with no DiT on the card."""
+    dev = torch.device("cuda")
+    m = torch.load(args.out / "refit_moments.pt", map_location="cpu", weights_only=False)
+    xtx, xty, sx, sy, n = m["xtx"].to(dev), m["xty"], m["sx"].to(dev), m["sy"].to(dev), m["n"].to(dev)
+    mean, scale, cached, out = m["mean"].to(dev), m["scale"].to(dev), m["held"], m["out"]
+    C, d_in = xtx.shape[0], xtx.shape[1]
+    held = [Path(k) for k in cached]
     folders = {dd.name: [p for p in held if p.parent == dd] for dd in args.data}
-    best, report = None, {"train_samples": len(train), "lora": str(args.lora), "lambdas": {}}
+    best, report = None, {"train_samples": m["train_samples"], "lora": str(args.lora), "lambdas": {}}
     for lam in args.lambdas:
         head = DWDHead(classes=C, out=out).to(dev)
         head.blend = args.blend
@@ -501,23 +515,26 @@ def refit(args) -> None:
         for c in range(C):
             mc, my = sx[c] / n[c], sy[c] / n[c]
             cxx = xtx[c] - n[c] * torch.outer(mc, mc)
-            cxy = xty[c].double() - n[c] * torch.outer(mc, my)
+            cxy = xty[c].to(dev).double() - n[c] * torch.outer(mc, my)
             w = torch.linalg.solve(cxx + lam * n[c] * torch.eye(d_in, dtype=torch.float64, device=dev), cxy)
             head.weight.data[c].copy_(w.T.float())
             head.bias.data[c].copy_((my - mc @ w).float())
             del cxy, w
+            torch.cuda.empty_cache()
         parts = {}
         for name, files in folders.items():
-            rows = []
-            for path in files:
-                rows.append(evaluate(head, [path], dev, tokens_fn=lambda _d, p=path: cached[str(p)].to(dev))["mean"])
+            rows = [evaluate(head, [path], dev, tokens_fn=lambda _d, p=path: cached[str(p)].to(dev))["mean"]
+                    for path in files]
             parts[name] = summarise(rows)
-        mean_psnr = sum(m["psnr"] for m in parts.values()) / len(parts)
+        mean_psnr = sum(v["psnr"] for v in parts.values()) / len(parts)
         report["lambdas"][str(lam)] = parts
         print(f"LOT_H3 kind=dwd_refit lambda={lam:g} psnr={mean_psnr:.3f} "
-              + " ".join(f"psnr@{k}={m['psnr']:.3f}" for k, m in parts.items()), flush=True)
+              + " ".join(f"psnr@{k}={v['psnr']:.3f}" for k, v in parts.items()), flush=True)
         if best is None or mean_psnr > best[0]:
             best = (mean_psnr, lam, head)
+        else:
+            del head
+        torch.cuda.empty_cache()
     _p, lam, head = best
     torch.save(head_state(head), args.out / "dwd_head_ridge.pt")
     report["best_lambda"] = lam
@@ -942,6 +959,7 @@ def main() -> None:
     q.add_argument("--stat-samples", type=int, default=256)
     q.add_argument("--max-samples", type=int, default=0, help="0: every training sample")
     q.add_argument("--swap", type=int, default=0)
+    q.add_argument("--solve-only", action="store_true", help="solve from OUT/refit_moments.pt (no DiT)")
 
     t = sub.add_parser("targets", help="VAE-decode light samples' latents to mp4 targets (follows a running collect)")
     t.add_argument("--data", type=Path, required=True)
@@ -988,7 +1006,8 @@ def main() -> None:
         setproctitle(" ".join(x for x in (f"dwd:{args.phase}", tag, args.out.name) if x))
     except ImportError:
         pass
-    {"collect": collect, "ridge": ridge, "sgd": sgd, "ft": ft, "targets": targets, "refit": refit}[args.phase](args)
+    {"collect": collect, "ridge": ridge, "sgd": sgd, "ft": ft, "targets": targets,
+     "refit": lambda a: (refit_solve if a.solve_only else refit)(a)}[args.phase](args)
 
 
 if __name__ == "__main__":
