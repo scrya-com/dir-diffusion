@@ -399,6 +399,130 @@ def ridge(args) -> None:
           flush=True)
 
 
+def refit(args) -> None:
+    """Ridge refit of the head on features from the DiT WITH a fine-tuned LoRA on (light or full samples).
+
+    One DiT pass over the training samples: the mean and spread come from the first ``--stat-samples``, the
+    per-class moments of the standardised features from all of them (inputs in float64, the wide target sums
+    in float32 so the DiT still fits beside them). Held-out features are kept on the CPU; the solve and the
+    choice of lambda happen after the DiT is freed. Writes OUT/dwd_head_ridge.pt (overwritten).
+    """
+    from gpu_guard import refuse_if_busy
+
+    refuse_if_busy("train_dwd_h3.py")
+    from dir_h3 import generator_step, load_dir_run, use_networks
+    from h3_musubi import load_dit, make_lora
+
+    dev = torch.device("cuda")
+    train = [p for d in args.data for p in samples(d, False)]
+    held = [p for d in args.data for p in samples(d, True)]
+    if "te" in torch.load(train[0], mmap=True, weights_only=True):
+        train = [p for p in train if p.with_suffix(".mp4").exists()]
+        held = [p for p in held if p.with_suffix(".mp4").exists()]
+    if args.max_samples:
+        train = random.Random(0).sample(train, min(args.max_samples, len(train)))
+    dit = load_dit(device=dev, swap=args.swap)
+    gen_head, net, _config = load_dir_run(args.run, dit)
+    saved = torch.load(args.lora, map_location="cpu", weights_only=True)
+    lora = make_lora(dit, saved["rank"])
+    if lora.load_state_dict(saved["lora"], strict=False).unexpected_keys:
+        raise SystemExit(f"{args.lora}: keys that are not in this LoRA")
+    lora.to(dev, torch.float32)
+    lora.requires_grad_(False)
+    for module in lora.unet_loras:
+        module.enabled = any(k.startswith(module.lora_name + ".") for k in saved["lora"])
+    store: dict = {}
+    dit.final_layer.video_out.register_forward_pre_hook(lambda _m, a: store.__setitem__("h", a[0][0]))
+
+    @torch.no_grad()
+    def tokens(d: dict) -> torch.Tensor:
+        with use_networks(net, None, gen=True, fake=False):
+            generator_step(dit, gen_head, d["state"], d["prev"], d["r"], d["text"], sigma=d["sigma"],
+                           audio_generator=torch.Generator(dev).manual_seed(d["audio_seed"]))
+        return store["h"].float()
+
+    C = CLASSES
+    d_in = HIDDEN + TOKEN_DIM
+    out = OUT if args.halo < 0 else ext_out(args.halo)
+    shape_head = DWDHead(classes=1, out=out, hidden=1, state_dim=1)
+    t0 = time.time()
+    s1 = torch.zeros(d_in, dtype=torch.float64, device=dev)
+    s2 = torch.zeros(d_in, dtype=torch.float64, device=dev)
+    count = 0
+    stat = train[:args.stat_samples]
+    cached: dict = {}
+    for path in stat:                                            # pass 1 on a subset: mean and spread
+        d = load(path, dev)
+        x = torch.cat([tokens(d), d["s"].float()], dim=1).double()
+        s1 += x.sum(0)
+        s2 += (x * x).sum(0)
+        count += x.shape[0]
+    mean = s1 / count
+    std = (s2 / count - mean * mean).clamp_min(0).sqrt()
+    scale = std.clamp_min(args.scale_floor * std.median().item())
+    print(f"LOT_H3 kind=dwd_refit stats_samples={len(stat)} min={(time.time() - t0) / 60:.1f}", flush=True)
+    xtx = torch.zeros(C, d_in, d_in, dtype=torch.float64, device=dev)
+    xty = torch.zeros(C, d_in, out, dtype=torch.float32, device=dev)
+    sx = torch.zeros(C, d_in, dtype=torch.float64, device=dev)
+    sy = torch.zeros(C, out, dtype=torch.float64, device=dev)
+    n = torch.zeros(C, dtype=torch.float64, device=dev)
+    for i, path in enumerate(train):                             # pass 2: per-class moments
+        d = load(path, dev)
+        z = (torch.cat([tokens(d), d["s"].float()], dim=1).double() - mean) / scale
+        y = shape_head.targets(from_uint8(d["y"]), *d["shape"])
+        cls = token_classes(*d["shape"], device=dev)
+        for c in range(C):
+            zc, yc = z[cls == c], y[cls == c]
+            for j in range(0, zc.shape[0], 1024):
+                zb, yb = zc[j:j + 1024], yc[j:j + 1024]
+                xtx[c] += zb.T @ zb
+                xty[c] += zb.float().T @ yb.float()
+                sx[c] += zb.sum(0)
+                sy[c] += yb.double().sum(0)
+            n[c] += zc.shape[0]
+        if (i + 1) % 100 == 0:
+            print(f"LOT_H3 kind=dwd_refit samples={i + 1}/{len(train)} min={(time.time() - t0) / 60:.1f} "
+                  f"peak_gb={torch.cuda.max_memory_allocated(dev) / 2**30:.1f}", flush=True)
+    for path in held:                                            # held-out features, kept on the CPU
+        d = load(path, dev)
+        cached[str(path)] = tokens(d).half().cpu()
+    del dit, net, lora, gen_head
+    torch.cuda.empty_cache()
+    args.out.mkdir(parents=True, exist_ok=True)
+    folders = {dd.name: [p for p in held if p.parent == dd] for dd in args.data}
+    best, report = None, {"train_samples": len(train), "lora": str(args.lora), "lambdas": {}}
+    for lam in args.lambdas:
+        head = DWDHead(classes=C, out=out).to(dev)
+        head.blend = args.blend
+        head.mean.copy_(mean.float())
+        head.scale.copy_(scale.float())
+        for c in range(C):
+            mc, my = sx[c] / n[c], sy[c] / n[c]
+            cxx = xtx[c] - n[c] * torch.outer(mc, mc)
+            cxy = xty[c].double() - n[c] * torch.outer(mc, my)
+            w = torch.linalg.solve(cxx + lam * n[c] * torch.eye(d_in, dtype=torch.float64, device=dev), cxy)
+            head.weight.data[c].copy_(w.T.float())
+            head.bias.data[c].copy_((my - mc @ w).float())
+            del cxy, w
+        parts = {}
+        for name, files in folders.items():
+            rows = []
+            for path in files:
+                rows.append(evaluate(head, [path], dev, tokens_fn=lambda _d, p=path: cached[str(p)].to(dev))["mean"])
+            parts[name] = summarise(rows)
+        mean_psnr = sum(m["psnr"] for m in parts.values()) / len(parts)
+        report["lambdas"][str(lam)] = parts
+        print(f"LOT_H3 kind=dwd_refit lambda={lam:g} psnr={mean_psnr:.3f} "
+              + " ".join(f"psnr@{k}={m['psnr']:.3f}" for k, m in parts.items()), flush=True)
+        if best is None or mean_psnr > best[0]:
+            best = (mean_psnr, lam, head)
+    _p, lam, head = best
+    torch.save(head_state(head), args.out / "dwd_head_ridge.pt")
+    report["best_lambda"] = lam
+    (args.out / "refit.json").write_text(json.dumps(report, indent=1))
+    print(f"LOT_H3 kind=dwd_refit_done best_lambda={lam:g} psnr={_p:.3f} out={args.out} ok=1", flush=True)
+
+
 def head_state(head: DWDHead) -> dict:
     """The head's state dict plus its temporal blend weight, so a saved head decodes as it was evaluated."""
     return {**head.state_dict(), "blend": torch.tensor(float(head.blend))}
@@ -797,6 +921,19 @@ def main() -> None:
     s.add_argument("--eval-every", type=int, default=250)
     s.add_argument("--device", default="cuda")
 
+    q = sub.add_parser("refit", help="ridge refit of the head on features with a fine-tuned LoRA on")
+    q.add_argument("--run", type=Path, required=True)
+    q.add_argument("--data", type=Path, nargs="+", required=True)
+    q.add_argument("--lora", type=Path, required=True, help="a dwd_ft_lora.pt")
+    q.add_argument("--out", type=Path, required=True)
+    q.add_argument("--halo", type=int, default=4)
+    q.add_argument("--blend", type=float, default=0.25)
+    q.add_argument("--lambdas", type=float, nargs="+", default=[1e-6, 1e-4])
+    q.add_argument("--scale-floor", type=float, default=1.0)
+    q.add_argument("--stat-samples", type=int, default=256)
+    q.add_argument("--max-samples", type=int, default=0, help="0: every training sample")
+    q.add_argument("--swap", type=int, default=0)
+
     t = sub.add_parser("targets", help="VAE-decode light samples' latents to mp4 targets (follows a running collect)")
     t.add_argument("--data", type=Path, required=True)
     t.add_argument("--device", default="cuda:1" if torch.cuda.device_count() > 1 else "cuda")
@@ -836,12 +973,12 @@ def main() -> None:
     args = parser.parse_args()
     try:
         from setproctitle import setproctitle
-        tag = {"collect": lambda: f"items={args.items}x{args.seeds}", "ridge": lambda: "", "targets": lambda: "",
+        tag = {"collect": lambda: f"items={args.items}x{args.seeds}", "ridge": lambda: "", "targets": lambda: "", "refit": lambda: "",
                "sgd": lambda: f"lr={args.lr:g}", "ft": lambda: f"k={args.k} r={args.rank} lr={args.lr:g}"}[args.phase]()
         setproctitle(" ".join(x for x in (f"dwd:{args.phase}", tag, args.out.name) if x))
     except ImportError:
         pass
-    {"collect": collect, "ridge": ridge, "sgd": sgd, "ft": ft, "targets": targets}[args.phase](args)
+    {"collect": collect, "ridge": ridge, "sgd": sgd, "ft": ft, "targets": targets, "refit": refit}[args.phase](args)
 
 
 if __name__ == "__main__":
