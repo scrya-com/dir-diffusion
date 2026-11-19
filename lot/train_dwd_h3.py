@@ -97,6 +97,8 @@ def collect(args) -> None:
             name = f"{'held' if held else 'train'}_{index:04d}_{seed}.pt"
             path = args.out / name
             existing = None
+            if path.exists() and args.light:
+                continue
             if path.exists():
                 existing = torch.load(path, map_location="cpu", weights_only=True)
                 if all(k in existing for k in INPUT_KEYS):
@@ -120,6 +122,15 @@ def collect(args) -> None:
                         prev = estimate
             inputs = {"state": state.float().cpu(), "prev": prev.float().cpu(), "text": text.cpu(),
                       "audio_seed": audio_seed, "sigma": sigmas[R - 1], "r": R - 1}
+            if args.light:                                        # about 4 MB: no tokens, no targets, text by path
+                latent_t, lat_h, lat_w = estimate.shape[2:]
+                torch.save({"state": state.half().cpu(), "prev": prev.half().cpu(), "latent": estimate.half().cpu(),
+                            "te": str(item[1]), "audio_seed": audio_seed, "sigma": sigmas[R - 1], "r": R - 1,
+                            "shape": (latent_t, lat_h // 2, lat_w // 2), "held": held, "item": index, "seed": seed,
+                            "dit_s": time.time() - t0}, path)
+                print(f"LOT_H3 kind=dwd_collect sample={name} light=1 dit_s={time.time() - t0:.1f} "
+                      f"peak_mb={torch.cuda.max_memory_allocated(dev) / 2**20:.0f}", flush=True)
+                continue
             if existing is not None:
                 s_rows = pack_rows(state.float()).half().cpu()
                 if not torch.equal(s_rows, existing["s"]):
@@ -152,6 +163,7 @@ def collect(args) -> None:
             }, path)
             print(f"LOT_H3 kind=dwd_collect sample={name} tokens={h.shape[0]} dit_s={dit_s:.1f} vae_ms={vae_ms:.0f} "
                   f"peak_mb={torch.cuda.max_memory_allocated(dev) / 2**20:.0f}", flush=True)
+    (args.out / "collect.done").write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
     print(f"LOT_H3 kind=dwd_collect_done out={args.out} samples={len(list(args.out.glob('*.pt')))} ok=1", flush=True)
 
 
@@ -171,8 +183,82 @@ def samples(data: Path, held: bool) -> list[Path]:
 
 def load(path: Path, device, keys=None) -> dict:
     d = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
+    if "te" in d:                                                 # light sample: fill text, input rows, targets
+        d = dict(d)
+        d["state"], d["prev"] = d["state"].float(), d["prev"].float()
+        d["text"] = load_text(d["te"])
+        d["s"] = pack_rows(d["state"]).half()
+        if keys is None or "y" in keys:
+            d["y"] = to_uint8(pixels_to_tokens(read_mp4(path.with_suffix(".mp4")), d["shape"][0]))
     keys = keys or d.keys()
     return {k: (d[k].to(device) if torch.is_tensor(d[k]) else d[k]) for k in keys if k in d}
+
+
+def load_text(te_path: str) -> torch.Tensor:
+    from safetensors import safe_open
+
+    with safe_open(te_path, "pt") as handle:
+        hidden, mask = handle.get_tensor("hidden_states"), handle.get_tensor("attention_mask")
+    return hidden[mask].unsqueeze(0).to(torch.bfloat16)
+
+
+def read_mp4(path: Path) -> torch.Tensor:
+    """``(1, 3, F, H, W)`` in [-1, 1], every frame."""
+    import subprocess
+
+    import numpy as np
+
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True)
+    w, h = map(int, probe.stdout.strip().split(","))
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                          "-"], capture_output=True, check=True).stdout
+    a = np.frombuffer(raw, np.uint8).reshape(-1, h, w, 3)
+    return torch.from_numpy(a.copy()).permute(3, 0, 1, 2).unsqueeze(0).float() / 127.5 - 1
+
+
+def write_mp4(path: Path, pixels: torch.Tensor) -> None:
+    """Near-lossless target video (x264 crf 8, 4:4:4), written atomically."""
+    import subprocess
+
+    frames = to_uint8(pixels[0]).permute(1, 2, 3, 0).contiguous().cpu().numpy()
+    f, h, w, _ = frames.shape
+    tmp = path.with_suffix(".tmp.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", "24",
+                    "-i", "-", "-c:v", "libx264", "-preset", "fast", "-crf", "8", "-pix_fmt", "yuv444p", str(tmp)],
+                   input=frames.tobytes(), check=True)
+    tmp.replace(path)
+
+
+def targets(args) -> None:
+    """Render the VAE decode of each light sample's latent to ``<sample>.mp4`` (on the second card), following a
+    collection that is still running until it writes ``collect.done``."""
+    from h3_musubi import load_vae
+    from lot_paths import LOT_H3_VAE
+
+    dev = torch.device(args.device)
+    vae = load_vae(LOT_H3_VAE, device=dev)
+    dtype = next(vae.parameters()).dtype
+    done_count = 0
+    while True:
+        pending = [p for p in sorted(args.data.glob("*.pt")) if not p.with_suffix(".mp4").exists()]
+        for path in pending:
+            d = torch.load(path, map_location="cpu", weights_only=True)
+            if "latent" not in d or "te" not in d:
+                continue
+            with torch.no_grad():
+                pixels = vae.decode(d["latent"].to(dev, dtype)).float()
+            if pixels.shape[2] != pixel_frame_count(d["shape"][0]):
+                raise RuntimeError(f"{path.name}: VAE gave {pixels.shape[2]} frames")
+            write_mp4(path.with_suffix(".mp4"), pixels)
+            done_count += 1
+            if done_count % 50 == 0:
+                print(f"LOT_H3 kind=dwd_targets done={done_count} pending={len(pending)}", flush=True)
+        if (args.data / "collect.done").exists() and not pending:
+            break
+        if not pending:
+            time.sleep(30)
+    print(f"LOT_H3 kind=dwd_targets_done out={args.data} rendered={done_count} ok=1", flush=True)
 
 
 def score(pred: torch.Tensor, target: torch.Tensor, latent_t: int) -> dict:
@@ -398,10 +484,17 @@ def ft(args) -> None:
     from h3_musubi import load_dit, make_lora
 
     dev = torch.device("cuda")
-    train, held = samples(args.data, False), samples(args.data, True)
+    train = [p for d in args.data for p in samples(d, False)]
+    held = [p for d in args.data for p in samples(d, True)]
     missing = [p.name for p in train[:1] + held[:1] if "prev" not in torch.load(p, mmap=True, weights_only=True)]
+    light = "te" in torch.load(train[0], mmap=True, weights_only=True)
+    if light:                                                     # only samples whose target video is rendered
+        train = [p for p in train if p.with_suffix(".mp4").exists()]
+        held = [p for p in held if p.with_suffix(".mp4").exists()]
+        if not train or not held:
+            raise SystemExit("no rendered targets yet; run the `targets` phase")
     if missing:
-        raise SystemExit(f"{missing}: no final-iteration inputs; run collect on {args.data} again to add them")
+        raise SystemExit(f"{missing}: no final-iteration inputs; run collect again to add them")
     dit = load_dit(device=dev, swap=0)
     gen_head, net, _config = load_dir_run(args.run, dit, tag=f"_{args.tag}" if args.tag else "", ema=False)
     lora = make_lora(dit, args.rank)
@@ -454,11 +547,11 @@ def ft(args) -> None:
 
     keys = ("state", "prev", "text", "audio_seed", "sigma", "r", "s", "y", "shape", "h")
     with torch.no_grad():                                          # the replay must reproduce the stored tokens
-        d0 = load(held[0], dev, keys)
+        d0 = load(held[0], dev, keys if not light else None)
         set_lora(False)
         replay = tokens(d0).float()
         set_lora(True)
-        rel = ((replay - d0["h"].float()).norm() / d0["h"].float().norm()).item()
+        rel = ((replay - d0["h"].float()).norm() / d0["h"].float().norm()).item() if "h" in d0 else 0.0
     print(f"LOT_H3 kind=dwd_ft trainable_modules={len(trained)} params={sum(p.numel() for p in lora_params)} "
           f"replay_rel_err={rel:.2e}", flush=True)
     if rel > 1e-2:
@@ -603,6 +696,8 @@ def main() -> None:
     c.add_argument("--max-latent-hw", type=int, nargs=2, default=[32, 48], metavar=("H", "W"))
     c.add_argument("--swap", type=int, default=4)
     c.add_argument("--vae-device", default="cuda:1" if torch.cuda.device_count() > 1 else "cuda")
+    c.add_argument("--light", action="store_true",
+                   help="store only the final iteration's inputs and latent (~4 MB); `targets` renders the VAE mp4s")
 
     r = sub.add_parser("ridge", help="least squares on the collected tokens")
     r.add_argument("--data", type=Path, required=True)
@@ -631,10 +726,15 @@ def main() -> None:
     s.add_argument("--eval-every", type=int, default=250)
     s.add_argument("--device", default="cuda")
 
+    t = sub.add_parser("targets", help="VAE-decode light samples' latents to mp4 targets (follows a running collect)")
+    t.add_argument("--data", type=Path, required=True)
+    t.add_argument("--device", default="cuda:1" if torch.cuda.device_count() > 1 else "cuda")
+    t.add_argument("--out", type=Path, default=Path("targets"), help=argparse.SUPPRESS)
+
     f = sub.add_parser("ft", help="final-iteration LoRA on the last K blocks, pixel loss through the head")
     f.add_argument("--run", type=Path, required=True)
     f.add_argument("--tag", default="")
-    f.add_argument("--data", type=Path, required=True)
+    f.add_argument("--data", type=Path, nargs="+", required=True, help="one or more collect folders")
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--init", type=Path, default=None, help="head to start from (default: OUT/dwd_head_ridge.pt)")
     f.add_argument("--resume", type=Path, default=None, help="a dwd_ft_lora.pt to continue from")
@@ -657,12 +757,12 @@ def main() -> None:
     args = parser.parse_args()
     try:
         from setproctitle import setproctitle
-        tag = {"collect": lambda: f"items={args.items}x{args.seeds}", "ridge": lambda: "",
+        tag = {"collect": lambda: f"items={args.items}x{args.seeds}", "ridge": lambda: "", "targets": lambda: "",
                "sgd": lambda: f"lr={args.lr:g}", "ft": lambda: f"k={args.k} r={args.rank} lr={args.lr:g}"}[args.phase]()
         setproctitle(" ".join(x for x in (f"dwd:{args.phase}", tag, args.out.name) if x))
     except ImportError:
         pass
-    {"collect": collect, "ridge": ridge, "sgd": sgd, "ft": ft}[args.phase](args)
+    {"collect": collect, "ridge": ridge, "sgd": sgd, "ft": ft, "targets": targets}[args.phase](args)
 
 
 if __name__ == "__main__":
