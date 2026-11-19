@@ -36,4 +36,41 @@ The target is the VAE decode of the generator's own estimate. So the head can at
 
 ## Results
 
-None yet.
+### Run 1 (2026-11-19)
+
+**Setup**
+- **Generator:** the published DiR checkpoint (`johndpope/dir-diffusion-h3`; per-iteration fake model, step 100, averaged weights). 4 iterations, sigmas 1 / 0.947 / 0.857 / 0.667.
+- **Data:** 12×32×48 latents (39 frames, 512×768) from the isometric-stills prompts, in clip-shaped noise.
+- **Samples:** 384 for training (192 prompts × 2 seeds), 8 held out with the yardstick's seeds.
+- **Hardware:** RTX 5090 with no block swap (22.7 GB peak); VAE on the RTX PRO 4000.
+- **Time:** collection about 10 s per sample, about 65 min in total.
+
+**Ridge** (PSNR against the VAE decode on the 8 held-out clips):
+
+| λ (relative to the mean feature variance) | PSNR | Flicker (VAE: 0.044) |
+|---|---|---|
+| 1e-6 | **21.04 dB** | 0.043 |
+| 1e-5 | 20.71 | 0.043 |
+| 1e-4 | 20.44 | 0.043 |
+| 1e-3 | 20.26 | 0.043 |
+| 1e-2 | 20.09 | 0.042 |
+
+**SGD:** 3000 steps from the ridge head, pseudo-Huber loss, lr 3e-5, 2048 tokens per step.
+- Gradient norm stayed between 0.27 and 0.32 (clip 1.0).
+- No non-finite steps.
+- Held-out PSNR stayed between 20.98 and 21.02, so the ridge head was kept (`dwd_head.pt` not written).
+
+**Decode time:** the head takes 15 ms per clip; the VAE takes 3.7 s.
+
+**Reading**
+- **Recognisable but soft.** The ridge head gives a frame with the right layout, people and colours, but it is soft and shows faint seams on the 32 px token grid.
+- **Underfitting, not overfitting.** PSNR falls steadily as λ grows, so a linear head on single tokens has hit its capacity limit.
+- **Flicker matches the VAE's.** The head adds no frame-to-frame flicker of its own.
+- **SGD adds nothing.** Pseudo-Huber on top of the least-squares optimum gives nothing on PSNR, which is MSE-based.
+
+**What would raise the ceiling (untested)**
+- **Context across tokens.** For example, a small conv refiner in pixel space after the linear head, or features from neighbouring tokens.
+- **The paper's own lever:** fine-tuning the last few blocks with a pixel loss, behind a LoRA that is on only at the final iteration.
+- **Real-pixel targets,** needed to go beyond matching the VAE.
+
+Data: `/media/2TB/lora-data/h3_lot/dwd/collect_v1`. Head, reports and comparison videos: `/media/2TB/lora-data/h3_lot/dwd/run_v1`. Log: `/media/2TB/lora-data/h3_lot/dwd/full_v1.log`.
