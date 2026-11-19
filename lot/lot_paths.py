@@ -11,6 +11,8 @@ export the variables instead of editing the scripts:
 | ``LOT_H3_TEXT_ENCODER`` | Qwen3-VL-32B MiniMax text encoder (only for caching captions) |
 | ``LOT_H3_STILLS_CACHE`` | H3 still cache with ``_te`` text (default training/render prompts) |
 | ``LOT_H3_STILLS_CAPTIONS`` | caption ``.txt`` files for that cache |
+| ``LOT_H3_CLIPS_SOURCE`` | the clip folders that cache was built from (``<source>/audio_latent.pt``), for ``train_nf_h3.py --audio driving`` |
+| ``LOT_H3_CLIPS_CACHE`` | H3 clip cache (``build_clip_cache_h3.py``; 22-latent-frame clips) for ``train_nf_h3.py`` |
 """
 
 from __future__ import annotations
@@ -34,3 +36,7 @@ LOT_H3_STILLS_CACHE = Path(os.environ.get(
     "LOT_H3_STILLS_CACHE", "/media/2TB/lora-data/h3_lot/cache_iso3d"))
 LOT_H3_STILLS_CAPTIONS = Path(os.environ.get(
     "LOT_H3_STILLS_CAPTIONS", "/media/2TB/lora-data/h3_lot/isometric_3d_stills"))
+LOT_H3_CLIPS_CACHE = Path(os.environ.get(
+    "LOT_H3_CLIPS_CACHE", "/media/2TB/lora-data/h3_lot/cache_atlas_clips"))
+LOT_H3_CLIPS_SOURCE = Path(os.environ.get(
+    "LOT_H3_CLIPS_SOURCE", "/home/johndpope/Documents/GitHub/h3-atlas/data"))
