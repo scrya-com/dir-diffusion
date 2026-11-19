@@ -769,7 +769,7 @@ def ft(args) -> None:
             continue
         lp = None
         if args.lpips_weight > 0:
-            lp, rows, g = lpips_h_grad(head, h.detach(), d["s"], d["y"], d["shape"], lpips_net, rng)
+            lp, rows, g = lpips_h_grad(head, h.detach(), d["s"], d["y"], d["shape"], lpips_net, rng, args.lpips_frames)
             h_grad = h_grad.clone()
             h_grad[rows] += args.lpips_weight * g.to(h_grad.dtype)
         if h_grad is None:
@@ -836,7 +836,7 @@ def ft(args) -> None:
 
 
 def lpips_h_grad(head: DWDHead, h: torch.Tensor, s: torch.Tensor, y: torch.Tensor, shape, net,
-                 rng: random.Random) -> tuple[float, torch.Tensor, torch.Tensor]:
+                 rng: random.Random, frames: int = 1) -> tuple[float, torch.Tensor, torch.Tensor]:
     """LPIPS of one random latent frame's decoded frames and its gradient with respect to ``h``.
 
     Autograd runs through the frozen head only for that latent frame and its two neighbours (whose overlaps
@@ -860,9 +860,10 @@ def lpips_h_grad(head: DWDHead, h: torch.Tensor, s: torch.Tensor, y: torch.Tenso
         pixels = tokens_to_pixels(full, t, th, tw)
     start = sum(frames_of(t)[:k])
     n = frames_of(t)[k]
-    pred = pixels[:, :, start:start + n].clamp(-1, 1).permute(0, 2, 1, 3, 4).flatten(0, 1)
+    pick = sorted(rng.sample(range(start, start + n), min(frames, n)))   # VGG at 768 px: a frame or two fits
+    pred = pixels[:, :, pick].clamp(-1, 1).permute(0, 2, 1, 3, 4).flatten(0, 1)
     with torch.no_grad():
-        target = tokens_to_pixels(from_uint8(y), t, th, tw)[:, :, start:start + n].permute(0, 2, 1, 3, 4).flatten(0, 1)
+        target = tokens_to_pixels(from_uint8(y), t, th, tw)[:, :, pick].permute(0, 2, 1, 3, 4).flatten(0, 1)
     loss = net(pred, target).mean()
     (grad,) = torch.autograd.grad(loss, hr)
     return loss.item(), rows, grad
@@ -965,6 +966,7 @@ def main() -> None:
     f.add_argument("--best-videos", type=int, default=2, help="held-out clips rendered at each new best (0: none)")
     f.add_argument("--lpips-weight", type=float, default=0.0,
                    help="add LPIPS (VGG) on one random latent frame per step; needs a frozen head")
+    f.add_argument("--lpips-frames", type=int, default=1, help="frames of the chosen latent frame put through LPIPS")
     f.add_argument("--eval-lpips", action="store_true", help="report held-out LPIPS at every eval")
     f.add_argument("--gate-minutes", type=float, default=0, help="at the first eval after this, stop (exit 3) unless")
     f.add_argument("--gate-key", default="psnr", help="... this eval value (e.g. psnr@collect_w1_iso) ...")
