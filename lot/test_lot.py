@@ -1676,6 +1676,51 @@ def test_nf_text_reads_first():
             assert torch.equal(out[:, :, :6], whole[:, :, :6])          # later blocks never reach block 0 or the text
 
 
+def test_nf_drop_long():
+    """``drop_long`` (memory ablation): the output does not depend on the ConvKV weights (the long-term slots are
+    never read), the stream equals the parallel pass, block 0 is unchanged, and later blocks differ from full memory."""
+    dit = _tiny_h3()
+    if dit is None:
+        print("SKIPPED test_nf_drop_long: musubi_tuner not importable", flush=True)
+        return
+    from h3_musubi import audio_sigma
+    from nf_h3 import ConvKV, Geometry, NFConfig, NFStream, NoiseBank, few_step_sigmas, nf_forward, parallel_noise
+
+    text = torch.randn(1, 5, 16)
+    frames, sigma = NFConfig().frames(5), few_step_sigmas()[1]
+    noise = NoiseBank(5, "cpu")
+    with torch.no_grad():
+        convs = []
+        for seed in (0, 1):
+            torch.manual_seed(seed)
+            convkv = ConvKV.for_dit(dit)
+            for layer in convkv.layers:
+                layer.memory_proj_k.weight.normal_(0.2, 0.2)
+            convs.append(convkv)
+        for reads_first in (False, True):
+            config = NFConfig(memory=True, drop_long=True, text_reads_first=reads_first)
+            full = NFConfig(memory=True, text_reads_first=reads_first)
+            x, unit = parallel_noise(noise, config, frames, 1, 4, 6)
+            audio = float(audio_sigma(sigma)) * unit
+            a = nf_forward(dit, x, 1.0 - sigma, text, config=config, convkv=convs[0], audio=audio)
+            b = nf_forward(dit, x, 1.0 - sigma, text, config=config, convkv=convs[1], audio=audio)
+            assert float((a - b).abs().max()) < 1e-6                       # long-term slots unread
+            m = nf_forward(dit, x, 1.0 - sigma, text, config=full, convkv=convs[0], audio=audio)
+            assert float((a[:, :, :6] - m[:, :, :6]).abs().max()) < 1e-6   # block 0 is the same model
+            for start, stop in config.spans(frames)[1:]:
+                assert float((a[:, :, start:stop] - m[:, :, start:stop]).abs().max()) > 1e-4, start
+            stream = NFStream(dit, lat_h=4, lat_w=6, steps=3, config=config, convkv=convs[0], total_frames=frames)
+            for index, (start, stop) in enumerate(config.spans(frames)):
+                a0, a1 = Geometry.audio_span(start, stop, frames)
+                got = stream.velocity(index, 1, x[:, :, start:stop], 1.0 - sigma, text, audio[..., a0:a1])
+                assert float((got - a[:, :, start:stop]).abs().max()) < 1e-5, (reads_first, index)
+        try:
+            NFConfig(drop_long=True)
+            raise AssertionError("drop_long without memory must be refused")
+        except ValueError:
+            pass
+
+
 def test_nf_memory_independent_reference():
     """The reviewer's independent re-derivation of the ConvKV forward (stock layout and position grid, own
     index arithmetic, einsum instead of Conv1d, the release's recursive fold) against ``nf_forward``, 8 blocks."""
@@ -2001,6 +2046,7 @@ def main():
         test_nf_convkv_memory,
         test_nf_stream_equals_parallel,
         test_nf_text_reads_first,
+        test_nf_drop_long,
         test_nf_trainer_updates_on_cpu,
         test_nf_memory_independent_reference,
         test_nf_dir_hooks_and_samplers,

@@ -86,10 +86,14 @@ class NFConfig:
     long: int = LONG_SLOTS
     short: int = SHORT_FRAMES
     text_reads_first: bool = False      # prefix rows also read block 0 (dense H3's text reads the video; deviation 3)
+    drop_long: bool = False             # ablation: from block 1 on read only the reference and short-term frames
+                                        # (no long-term ConvKV slots; the window still folds, unread)
 
     def __post_init__(self) -> None:
         if self.first_block < 1 or self.next_block < 1:
             raise ValueError("block sizes must be positive")
+        if self.drop_long and not self.memory:
+            raise ValueError("drop_long is a memory ablation (memory=True)")
         if self.memory:
             if not self.causal:
                 raise ValueError("memory needs causal blocks")
@@ -98,6 +102,8 @@ class NFConfig:
             if self.first_block != self.context_slots:
                 raise ValueError(f"memory needs first_block == ref + long + short = {self.context_slots}, "
                                  f"got {self.first_block}")
+            if self.short < 1 and self.drop_long:
+                raise ValueError("drop_long needs short-term frames")
             if self.long + self.short + self.next_block != self.ratio * self.long + self.short:
                 raise ValueError(f"memory needs next_block == long * (ratio - 1) = {self.long * (self.ratio - 1)}, "
                                  f"got {self.next_block}")
@@ -231,10 +237,13 @@ class Geometry:
         start, _stop = config.span(index)
         if index == 0 or not config.causal:
             return None
-        if not config.memory or index < 2:
+        if not config.memory or (index < 2 and not config.drop_long):
             return self.video_positions(0, start)
+        if index == 1:      # drop_long: reference + the last short-term frames, at their true times
+            return torch.cat([self.video_positions(0, config.ref), self.video_positions(start - config.short, start)])
         shift = self.window_shift(config, index)
-        return torch.cat([self.video_positions(0, config.ref + config.long),              # reference + long-term slots
+        slots = config.ref if config.drop_long else config.ref + config.long
+        return torch.cat([self.video_positions(0, slots),                                 # reference (+ long-term slots)
                           self.video_positions(start - config.short, start, shift)])      # short-term frames
 
 
@@ -344,7 +353,10 @@ class LayerState:
         if not self.config.memory:
             return k, v
         ref_k, ref_v = (self.ref if device is None else tuple(t.to(device) for t in self.ref))
+        tail = self.config.short * self.frame_rows      # drop_long: the short-term frames only
         if index == 1:
+            if self.config.drop_long:
+                k, v = k[:, -tail:], v[:, -tail:]
             return torch.cat([ref_k, k], dim=1), torch.cat([ref_v, v], dim=1)
         if conv is None:
             raise ValueError("memory=True needs a ConvKV module from block 2 on")
@@ -352,6 +364,8 @@ class LayerState:
         folded_k = torch.cat([conv.compress(k[:, :cut], self.frame_rows, "k"), k[:, cut:]], dim=1)
         folded_v = torch.cat([conv.compress(v[:, :cut], self.frame_rows, "v"), v[:, cut:]], dim=1)
         self.pending = (folded_k, folded_v)
+        if self.config.drop_long:
+            folded_k, folded_v = folded_k[:, -tail:], folded_v[:, -tail:]
         return torch.cat([ref_k, folded_k], dim=1), torch.cat([ref_v, folded_v], dim=1)
 
     def push(self, index: int, k: torch.Tensor, v: torch.Tensor) -> None:
