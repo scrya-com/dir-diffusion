@@ -791,6 +791,11 @@ def ft(args) -> None:
                   flush=True)
         if time.time() - t_start > next_eval:
             next_eval += args.eval_minutes * 60
+            if light:                                             # targets still rendering: pick up new ones
+                fresh = [p for d in args.data for p in samples(d, False) if p.with_suffix(".mp4").exists()]
+                if len(fresh) > len(train):
+                    print(f"LOT_H3 kind=dwd_ft_data step={step} train={len(fresh)} (was {len(train)})", flush=True)
+                    train = fresh
             with torch.no_grad():
                 m = probe()
             log.append({"step": step, **m})
