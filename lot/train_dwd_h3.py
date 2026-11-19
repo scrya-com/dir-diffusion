@@ -235,6 +235,27 @@ def ridge(args) -> None:
         raise SystemExit(f"{args.data}: need train_*.pt and held_*.pt from collect")
     C = 1 if args.shared else CLASSES
     d = HIDDEN + TOKEN_DIM
+    # Pass 1: per-dimension mean and spread. Centring and scaling BEFORE the second moments are accumulated
+    # matters: the last-layer dimensions have means far larger than their spread, and E[xx] - n m m^T then
+    # loses the spread to cancellation.
+    s1 = torch.zeros(d, dtype=torch.float64, device=dev)
+    s2 = torch.zeros(d, dtype=torch.float64, device=dev)
+    total = 0
+    for path in train:
+        s = load(path, dev, ("h", "s"))
+        x = torch.cat([s["h"].float(), s["s"].float()], dim=1).double()
+        s1 += x.sum(0)
+        total += x.shape[0]
+    mean = s1 / total
+    for path in train:
+        s = load(path, dev, ("h", "s"))
+        x = torch.cat([s["h"].float(), s["s"].float()], dim=1).double() - mean
+        s2 += (x * x).sum(0)
+    std = (s2 / total).sqrt()
+    # floor the spread: a dimension that barely varies would otherwise get a huge weight, and fine-tuning the
+    # blocks underneath would then swing the pixels through it (seen: grad norm 1e3 and a 1e12 loss spike)
+    scale = std.clamp_min(args.scale_floor * std.median().item())
+    # Pass 2: per-class moments of the standardised features z = (x - mean) / scale.
     xtx = torch.zeros(C, d, d, dtype=torch.float64, device=dev)
     xty = torch.zeros(C, d, OUT, dtype=torch.float64, device=dev)
     sx = torch.zeros(C, d, dtype=torch.float64, device=dev)
@@ -242,22 +263,18 @@ def ridge(args) -> None:
     n = torch.zeros(C, dtype=torch.float64, device=dev)
     for path in train:
         s = load(path, dev, ("h", "s", "y", "shape"))
-        x = torch.cat([s["h"].float(), s["s"].float()], dim=1)
+        z = (torch.cat([s["h"].float(), s["s"].float()], dim=1).double() - mean) / scale
         y = from_uint8(s["y"])
         cls = token_classes(*s["shape"], device=dev) % C
         for c in range(C):
-            xc, yc = x[cls == c].double(), y[cls == c].double()
-            for i in range(0, xc.shape[0], 2048):
-                xb, yb = xc[i:i + 2048], yc[i:i + 2048]
-                xtx[c] += xb.T @ xb
-                xty[c] += xb.T @ yb
-                sx[c] += xb.sum(0)
+            zc, yc = z[cls == c], y[cls == c].double()
+            for i in range(0, zc.shape[0], 2048):
+                zb, yb = zc[i:i + 2048], yc[i:i + 2048]
+                xtx[c] += zb.T @ zb
+                xty[c] += zb.T @ yb
+                sx[c] += zb.sum(0)
                 sy[c] += yb.sum(0)
-            n[c] += xc.shape[0]
-    total = n.sum()
-    mean = sx.sum(0) / total
-    var = (xtx.diagonal(dim1=1, dim2=2).sum(0) / total - mean ** 2).clamp_min(0)
-    scale = var.sqrt().clamp_min(1e-12)
+            n[c] += zc.shape[0]
     args.out.mkdir(parents=True, exist_ok=True)
     report = {"train_samples": len(train), "train_tokens": int(total), "held_samples": len(held), "classes": C,
               "lambdas": {}}
@@ -267,13 +284,11 @@ def ridge(args) -> None:
         head.mean.copy_(mean.float())
         head.scale.copy_(scale.float())
         for c in range(C):
-            mc, my = sx[c] / n[c], sy[c] / n[c]
-            # centred, standardised moments of class c: (x - mc) / scale
-            cxx = (xtx[c] - n[c] * torch.outer(mc, mc)) / torch.outer(scale, scale)
-            cxy = (xty[c] - n[c] * torch.outer(mc, my)) / scale[:, None]
+            mc, my = sx[c] / n[c], sy[c] / n[c]                    # class means, standardised space
+            cxx = xtx[c] - n[c] * torch.outer(mc, mc)
+            cxy = xty[c] - n[c] * torch.outer(mc, my)
             w = torch.linalg.solve(cxx + lam * n[c] * torch.eye(d, dtype=torch.float64, device=dev), cxy)  # (d, OUT)
-            # forward uses (x - mean) / scale; the class mean mc enters through the bias
-            b = my - ((mc - mean) / scale) @ w
+            b = my - mc @ w                                         # forward: z @ w + b
             head.weight.data[c].copy_(w.T.float())
             head.bias.data[c].copy_(b.float())
         result = evaluate(head, held, dev)
@@ -451,6 +466,12 @@ def ft(args) -> None:
             if skipped > args.max_skips:
                 raise SystemExit(f"{skipped} non-finite losses: stopping")
             continue
+        if ema is not None and step >= args.spike_warmup and loss.item() > args.spike_factor * ema:
+            skipped += 1
+            print(f"LOT_H3 kind=dwd_spike step={step} loss={loss.item():.4g} ema={ema:.4g} skipped={skipped}", flush=True)
+            if skipped > args.max_skips:
+                raise SystemExit(f"{skipped} skipped steps (spikes or non-finite): stopping")
+            continue
         loss.backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip))
         if not math.isfinite(grad_norm):
@@ -523,6 +544,8 @@ def main() -> None:
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--lambdas", type=float, nargs="+", default=[1e-8, 1e-6, 1e-4, 1e-3])
     r.add_argument("--shared", action="store_true", help="one map for every token class")
+    r.add_argument("--scale-floor", type=float, default=1.0,
+                   help="floor on each feature's spread, as a fraction of the median spread")
     r.add_argument("--device", default="cuda")
 
     s = sub.add_parser("sgd", help="refine the head (pseudo-Huber)")
@@ -553,6 +576,8 @@ def main() -> None:
     f.add_argument("--eval-minutes", type=float, default=15)
     f.add_argument("--grad-clip", type=float, default=1.0)
     f.add_argument("--max-skips", type=int, default=20)
+    f.add_argument("--spike-factor", type=float, default=20.0, help="skip a step whose loss exceeds this times the running mean")
+    f.add_argument("--spike-warmup", type=int, default=10)
     f.add_argument("--log-every", type=int, default=20)
 
     args = parser.parse_args()
