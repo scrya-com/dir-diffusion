@@ -276,7 +276,7 @@ def summarise(rows: list[dict]) -> dict:
 
 @torch.no_grad()
 def evaluate(head: DWDHead, files: list[Path], device, *, videos: Path | None = None, limit_videos: int = 2,
-             tokens_fn=None) -> dict:
+             tokens_fn=None, lpips_net=None) -> dict:
     """Score the head on the probe set. ``tokens_fn(d)`` overrides where ``h`` comes from (``ft``)."""
     rows = []
     for k, path in enumerate(files):
@@ -288,7 +288,12 @@ def evaluate(head: DWDHead, files: list[Path], device, *, videos: Path | None = 
         t0 = time.time()
         pred = head.decode(h, d["s"], t, th, tw)
         sync(device)
-        rows.append({"file": path.name, **score(pred, target, t), "head_ms": 1000 * (time.time() - t0)})
+        row = {"file": path.name, **score(pred, target, t), "head_ms": 1000 * (time.time() - t0)}
+        if lpips_net is not None:                                 # perceptual distance on every 6th frame
+            a = pred[:, :, ::6].permute(0, 2, 1, 3, 4).flatten(0, 1)
+            b = target[:, :, ::6].permute(0, 2, 1, 3, 4).flatten(0, 1)
+            row["lpips"] = lpips_net(a.float(), b.float()).mean().item()
+        rows.append(row)
         if videos is not None and k < limit_videos:
             write_compare(videos / f"{path.stem}.mp4", target, pred)
     return {"mean": summarise(rows), "rows": rows}
@@ -527,6 +532,19 @@ def ft(args) -> None:
     opt = torch.optim.Adam(groups, betas=(0.9, 0.99))
     store: dict = {}
     hook = dit.final_layer.video_out.register_forward_pre_hook(lambda _m, a: store.__setitem__("h", a[0][0]))
+    lpips_net = None
+    if args.lpips_weight > 0 or args.eval_lpips:
+        import lpips
+
+        lpips_net = lpips.LPIPS(net="vgg", verbose=False).to(dev).eval().requires_grad_(False)
+    if args.lpips_weight > 0 and args.head_lr > 0:
+        raise SystemExit("--lpips-weight needs a frozen head (--head-lr 0)")
+    held_by_folder = {d.name: [p for p in held if p.parent == d] for d in args.data}
+    if args.select == "lpips" and lpips_net is None:
+        raise SystemExit("--select lpips needs --eval-lpips")
+
+    def score_of(m: dict) -> float:                             # higher is better
+        return m["psnr"] if args.select == "psnr" else -m["lpips"]
 
     def set_lora(on: bool) -> None:
         for module in trained:
@@ -539,11 +557,19 @@ def ft(args) -> None:
         return store["h"]
 
     def probe(on: bool = True) -> dict:
+        """Mean over held-out folders (each folder weighted equally), with each folder's PSNR and LPIPS too."""
         set_lora(on)
         try:
-            return evaluate(head, held, dev, tokens_fn=tokens)["mean"]
+            parts = {name: evaluate(head, files, dev, tokens_fn=tokens, lpips_net=lpips_net)["mean"]
+                     for name, files in held_by_folder.items() if files}
         finally:
             set_lora(True)
+        mean = {k: sum(m[k] for m in parts.values()) / len(parts) for k in next(iter(parts.values()))}
+        for name, m in parts.items():
+            mean[f"psnr@{name}"] = m["psnr"]
+            if "lpips" in m:
+                mean[f"lpips@{name}"] = m["lpips"]
+        return mean
 
     keys = ("state", "prev", "text", "audio_seed", "sigma", "r", "s", "y", "shape", "h")
     with torch.no_grad():                                          # the replay must reproduce the stored tokens
@@ -571,10 +597,10 @@ def ft(args) -> None:
         step, best, log, elapsed, ema = last["step"], last["best"], last["log"], last["elapsed"], last["ema"]
         rng.setstate(last["rng"])
         base = log[0]
-        print(f"LOT_H3 kind=dwd_ft_resume step={step} elapsed_min={elapsed:.1f} best_psnr={best:.3f}", flush=True)
+        print(f"LOT_H3 kind=dwd_ft_resume step={step} elapsed_min={elapsed:.1f} best_{args.select}_score={best:.4f}", flush=True)
     else:
         base = probe()
-        best, log = base["psnr"], [{"step": 0, **base}]
+        best, log = score_of(base), [{"step": 0, **base}]
         print(f"LOT_H3 kind=dwd_ft_eval step=0 {fmt(base)}", flush=True)
     t_start = time.time() - elapsed * 60
     next_eval = (math.floor(elapsed / args.eval_minutes) + 1) * args.eval_minutes * 60
@@ -614,6 +640,11 @@ def ft(args) -> None:
             if skipped > args.max_skips:
                 raise SystemExit(f"{skipped} skipped steps (spikes or non-finite): stopping")
             continue
+        lp = None
+        if args.lpips_weight > 0:
+            lp, rows, g = lpips_h_grad(head, h.detach(), d["s"], d["y"], d["shape"], lpips_net, rng)
+            h_grad = h_grad.clone()
+            h_grad[rows] += args.lpips_weight * g.to(h_grad.dtype)
         if h_grad is None:
             loss.backward()
         else:
@@ -631,6 +662,7 @@ def ft(args) -> None:
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % args.log_every == 0:
             print(f"LOT_H3 kind=dwd_ft_train step={step} loss={loss.item():.5f} ema={ema:.5f} grad_norm={grad_norm:.4f} "
+                  + (f"lpips={lp:.4f} " if lp is not None else "") +
                   f"min={(time.time() - t_start) / 60:.1f} peak_gb={torch.cuda.max_memory_allocated(dev) / 2**30:.1f}",
                   flush=True)
         if time.time() - t_start > next_eval:
@@ -639,8 +671,14 @@ def ft(args) -> None:
                 m = probe()
             log.append({"step": step, **m})
             print(f"LOT_H3 kind=dwd_ft_eval step={step} {fmt(m)}", flush=True)
-            if m["psnr"] > best:
-                best = m["psnr"]
+            if (args.gate_minutes and (time.time() - t_start) / 60 >= args.gate_minutes
+                    and m.get(args.gate_key, -math.inf) < args.gate_min):
+                checkpoint()
+                print(f"LOT_H3 kind=dwd_ft_gate_failed step={step} {args.gate_key}={m.get(args.gate_key)} "
+                      f"needed={args.gate_min} out={args.out}", flush=True)
+                raise SystemExit(3)
+            if score_of(m) > best:
+                best = score_of(m)
                 save_ft(args.out, lora, trained, head, args, step)
                 if args.best_videos > 0:                          # something to watch at every new best
                     with torch.no_grad():
@@ -654,15 +692,48 @@ def ft(args) -> None:
     with torch.no_grad():
         final, off = probe(), probe(on=False)
     log.append({"step": step, **final})
-    if final["psnr"] > best:
-        best = final["psnr"]
+    if score_of(final) > best:
+        best = score_of(final)
         save_ft(args.out, lora, trained, head, args, step)
     hook.remove()
     (args.out / "ft.json").write_text(json.dumps({"args": {k: str(v) for k, v in vars(args).items()}, "log": log,
                                                   "best_psnr": best, "start_psnr": base["psnr"],
                                                   "lora_off": off}, indent=1))
-    print(f"LOT_H3 kind=dwd_ft_done steps={step} start_psnr={base['psnr']:.3f} best_psnr={best:.3f} "
+    print(f"LOT_H3 kind=dwd_ft_done steps={step} start_psnr={base["psnr"]:.3f} best_{args.select}_score={best:.4f} "
           f"lora_off_psnr={off['psnr']:.3f} out={args.out} ok=1", flush=True)
+
+
+def lpips_h_grad(head: DWDHead, h: torch.Tensor, s: torch.Tensor, y: torch.Tensor, shape, net,
+                 rng: random.Random) -> tuple[float, torch.Tensor, torch.Tensor]:
+    """LPIPS of one random latent frame's decoded frames and its gradient with respect to ``h``.
+
+    Autograd runs through the frozen head only for that latent frame and its two neighbours (whose overlaps
+    blend into it); every other row is a constant. Returns ``(loss, rows, grad of those rows)``.
+    """
+    from dwd_h3 import blend_tokens, frames_of
+
+    t, th, tw = shape
+    per = th * tw
+    k = rng.randrange(t)
+    lo, hi = max(0, k - 1), min(t, k + 2)
+    rows = torch.arange(lo * per, hi * per, device=h.device)
+    cls = token_classes(t, th, tw, h.device)
+    with torch.no_grad():
+        full = head(h, s, cls)
+    hr = h[rows].detach().float().requires_grad_(True)
+    full = full.index_copy(0, rows, head(hr, s[rows], cls[rows]))
+    if head.halo is not None:
+        pixels = blend_tokens(full, t, th, tw, head.halo, head.blend)
+    else:
+        pixels = tokens_to_pixels(full, t, th, tw)
+    start = sum(frames_of(t)[:k])
+    n = frames_of(t)[k]
+    pred = pixels[:, :, start:start + n].clamp(-1, 1).permute(0, 2, 1, 3, 4).flatten(0, 1)
+    with torch.no_grad():
+        target = tokens_to_pixels(from_uint8(y), t, th, tw)[:, :, start:start + n].permute(0, 2, 1, 3, 4).flatten(0, 1)
+    loss = net(pred, target).mean()
+    (grad,) = torch.autograd.grad(loss, hr)
+    return loss.item(), rows, grad
 
 
 def save_ft(out: Path, lora, trained, head: DWDHead, args, step: int) -> None:
@@ -747,6 +818,14 @@ def main() -> None:
     f.add_argument("--checkpoint-minutes", type=float, default=30, help="save dwd_ft_last.pt (LoRA, optimiser, step)")
     f.add_argument("--auto-resume", action="store_true", help="continue from OUT/dwd_ft_last.pt when it exists")
     f.add_argument("--best-videos", type=int, default=2, help="held-out clips rendered at each new best (0: none)")
+    f.add_argument("--lpips-weight", type=float, default=0.0,
+                   help="add LPIPS (VGG) on one random latent frame per step; needs a frozen head")
+    f.add_argument("--eval-lpips", action="store_true", help="report held-out LPIPS at every eval")
+    f.add_argument("--gate-minutes", type=float, default=0, help="at the first eval after this, stop (exit 3) unless")
+    f.add_argument("--gate-key", default="psnr", help="... this eval value (e.g. psnr@collect_w1_iso) ...")
+    f.add_argument("--gate-min", type=float, default=-math.inf, help="... is at least this")
+    f.add_argument("--select", choices=["psnr", "lpips"], default="psnr",
+                   help="what a new best means: higher PSNR, or lower LPIPS")
     f.add_argument("--eval-minutes", type=float, default=15)
     f.add_argument("--grad-clip", type=float, default=1.0)
     f.add_argument("--max-skips", type=int, default=20)
