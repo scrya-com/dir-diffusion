@@ -13,8 +13,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "third_party"))
 
-from dwd_h3 import (OUT, PATCH, DWDHead, frames_of, pack_rows, pixel_frame_count, pixels_to_tokens,  # noqa: E402
-                    pseudo_huber, psnr, tokens_to_pixels)
+from dwd_h3 import (OUT, PATCH, DWDHead, flicker_split, frames_of, pack_rows, pixel_frame_count,  # noqa: E402
+                    pixels_to_tokens, pseudo_huber, psnr, seam_ratio, slot_mask, token_classes, tokens_to_pixels)
 
 
 def test_frame_counts():
@@ -65,17 +65,47 @@ def test_token_order_matches_latent_rows():
 
 
 def test_head_and_losses():
-    head = DWDHead(hidden=8, state_dim=4, out=6)
+    head = DWDHead(hidden=8, state_dim=4, out=6, classes=5)
     h, s = torch.randn(5, 8), torch.randn(5, 4)
-    assert torch.equal(head(h, s), torch.zeros(5, 6))
+    cls = torch.tensor([0, 1, 2, 3, 4])
+    assert torch.equal(head(h, s, cls), torch.zeros(5, 6))
+    head.bias.data[:, :] = torch.arange(5.0)[:, None]
+    assert torch.equal(head(h, s, cls)[:, 0], torch.arange(5.0))          # each token uses its class's map
     head.mean.copy_(torch.randn(12))
-    head.linear.bias.data.fill_(0.5)
-    assert torch.allclose(head(h, s), torch.full((5, 6), 0.5))
+    head.scale.fill_(2.0)
+    head.weight.data[2, 0, 0] = 1.0
+    x = (torch.cat([h, s], 1) - head.mean) / 2.0
+    assert torch.allclose(head(h, s, cls)[2, 0], x[2, 0] + 2.0)
     a = torch.rand(10, 100)
     assert pseudo_huber(a, a).abs().item() < 1e-6
     assert pseudo_huber(a, a + 1).item() > 9.0
     assert psnr(a, a) == float("inf")
     assert abs(psnr(torch.zeros(4), torch.full((4,), 0.2)) - 20.0) < 1e-4
+
+
+def test_classes_and_mask():
+    cls = token_classes(7, 2, 3)
+    assert cls.tolist() == [k % 5 for k in range(7) for _ in range(6)]
+    m = slot_mask(cls)
+    assert m[cls == 0, OUT // 4:].sum() == 0 and m[cls == 0, :OUT // 4].min() == 1 and m[cls == 1].min() == 1
+
+
+def test_metrics():
+    t = 6                                                     # frames 1 + 4 + 1 = 6 pixel frames... (1,4,4,4,4,1)
+    f = pixel_frame_count(t)
+    flat = torch.zeros(1, 3, f, 64, 64)
+    assert flicker_split(flat, t) == (0.0, 0.0)
+    steps = torch.zeros(1, 3, f, 64, 64)
+    group = [k for k, n in enumerate(frames_of(t)) for _ in range(n)]
+    for i, g in enumerate(group):
+        steps[:, :, i] = g * 0.1                              # constant inside a latent frame, jumps between
+    inside, across = flicker_split(steps, t)
+    assert inside == 0.0 and abs(across - 0.1) < 1e-6
+    grid = torch.zeros(1, 3, 1, 64, 64)
+    grid[..., 32:, :] = 1.0                                   # a jump exactly on a token edge
+    assert seam_ratio(grid) > 10
+    smooth = torch.linspace(0, 1, 64).view(1, 1, 1, 1, 64).expand(1, 3, 1, 64, 64)
+    assert abs(seam_ratio(smooth) - 1.0) < 0.05
 
 
 if __name__ == "__main__":

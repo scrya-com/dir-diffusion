@@ -87,28 +87,55 @@ def tokens_to_pixels(tokens: torch.Tensor, latent_t: int, token_h: int, token_w:
     return torch.cat(frames, dim=1).unsqueeze(0)
 
 
-class DWDHead(nn.Module):
-    """``pixels = W [h, s] + b``, centred on the training features' mean (kept as a buffer)."""
+CLASSES = 5        # one head per latent frame position k % 5 (k % 5 == 0 covers one pixel frame)
 
-    def __init__(self, hidden: int = HIDDEN, state_dim: int = TOKEN_DIM, out: int = OUT):
+
+def token_classes(latent_t: int, token_h: int, token_w: int, device=None) -> torch.Tensor:
+    """``(N,)`` class of each token: its latent frame's ``k % 5``, in packed row order."""
+    return (torch.arange(latent_t, device=device) % CLASSES).repeat_interleave(token_h * token_w)
+
+
+def slot_mask(classes: torch.Tensor) -> torch.Tensor:
+    """``(N, OUT)`` 1 where a target value is real; one-frame tokens (class 0) only have slot 0."""
+    mask = torch.ones(classes.shape[0], OUT, device=classes.device)
+    mask[classes == 0, OUT // SLOTS:] = 0
+    return mask
+
+
+class DWDHead(nn.Module):
+    """``pixels = W_c ((x - mean) / scale) + b_c`` for ``x = [h, s]`` and ``c`` the token's class.
+
+    Features are standardised per dimension (the buffers ``mean`` and ``scale``): the last-layer state's
+    dimensions differ in spread by about three orders of magnitude, so an unscaled ridge penalty shrinks most
+    of them. ``classes=1`` is a single shared map.
+    """
+
+    def __init__(self, hidden: int = HIDDEN, state_dim: int = TOKEN_DIM, out: int = OUT, classes: int = CLASSES):
         super().__init__()
-        self.inputs = hidden + state_dim
-        self.linear = nn.Linear(self.inputs, out)
-        nn.init.zeros_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
+        self.inputs, self.classes = hidden + state_dim, classes
+        self.weight = nn.Parameter(torch.zeros(classes, out, self.inputs))
+        self.bias = nn.Parameter(torch.zeros(classes, out))
         self.register_buffer("mean", torch.zeros(self.inputs))
+        self.register_buffer("scale", torch.ones(self.inputs))
 
     def features(self, h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        return torch.cat([h.float(), s.float()], dim=-1) - self.mean
+        return (torch.cat([h.float(), s.float()], dim=-1) - self.mean) / self.scale
 
-    def forward(self, h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
-        return self.linear(self.features(h, s))
+    def forward(self, h: torch.Tensor, s: torch.Tensor, classes: torch.Tensor) -> torch.Tensor:
+        x = self.features(h, s)
+        if self.classes == 1:
+            return x @ self.weight[0].T + self.bias[0]
+        out = x.new_empty(x.shape[0], self.weight.shape[1])
+        for c in range(self.classes):
+            index = (classes % self.classes) == c
+            if index.any():
+                out[index] = x[index] @ self.weight[c].T + self.bias[c]
+        return out
 
     @torch.no_grad()
-    def decode(self, h: torch.Tensor, s: torch.Tensor, latent_t: int, token_h: int, token_w: int,
-               chunk: int = 4096) -> torch.Tensor:
+    def decode(self, h: torch.Tensor, s: torch.Tensor, latent_t: int, token_h: int, token_w: int) -> torch.Tensor:
         """Pixels in [-1, 1], ``(1, 3, F, 32*token_h, 32*token_w)``."""
-        out = torch.cat([self(h[i:i + chunk], s[i:i + chunk]) for i in range(0, h.shape[0], chunk)])
+        out = self(h, s, token_classes(latent_t, token_h, token_w, h.device))
         return tokens_to_pixels(out, latent_t, token_h, token_w).clamp(-1, 1)
 
 
@@ -143,6 +170,36 @@ def psnr(a: torch.Tensor, b: torch.Tensor) -> float:
     """PSNR in dB of two [-1, 1] tensors (peak-to-peak 2)."""
     mse = ((a.float() - b.float()) ** 2).mean().item()
     return float("inf") if mse == 0 else 10.0 * torch.log10(torch.tensor(4.0 / mse)).item()
+
+
+def flicker_split(pixels: torch.Tensor, latent_t: int) -> tuple[float, float]:
+    """Mean |frame t+1 - frame t| for pairs inside one latent frame, and for pairs that cross into the next.
+
+    A per-token head can be smooth inside a latent frame and jump between them; the overall mean hides that.
+    """
+    diff = (pixels[:, :, 1:].float() - pixels[:, :, :-1].float()).abs().mean(dim=(0, 1, 3, 4))
+    group = torch.tensor([k for k, n in enumerate(frames_of(latent_t)) for _ in range(n)])
+    across = group[1:] != group[:-1]
+    inside = diff[~across.to(diff.device)]
+    cross = diff[across.to(diff.device)]
+    return (inside.mean().item() if inside.numel() else 0.0, cross.mean().item() if cross.numel() else 0.0)
+
+
+def seam_ratio(pixels: torch.Tensor) -> float:
+    """Mean |jump| across 32-pixel token edges over the mean |jump| between other neighbouring pixels.
+
+    About 1 for an image with no grid; a per-token decoder with visible seams scores well above 1.
+    """
+    x = pixels.float()
+    dx = (x[..., 1:] - x[..., :-1]).abs()
+    dy = (x[..., 1:, :] - x[..., :-1, :]).abs()
+    ex = torch.zeros(dx.shape[-1], dtype=torch.bool, device=x.device)
+    ex[PATCH - 1::PATCH] = True
+    ey = torch.zeros(dy.shape[-2], dtype=torch.bool, device=x.device)
+    ey[PATCH - 1::PATCH] = True
+    edge = torch.cat([dx[..., ex].flatten(), dy[..., ey, :].flatten()]).mean()
+    inner = torch.cat([dx[..., ~ex].flatten(), dy[..., ~ey, :].flatten()]).mean()
+    return (edge / inner.clamp_min(1e-12)).item()
 
 
 def flicker(pixels: torch.Tensor) -> float:
