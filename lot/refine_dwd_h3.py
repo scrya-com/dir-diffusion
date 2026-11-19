@@ -34,7 +34,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dwd_h3 import flicker_split, psnr, seam_ratio  # noqa: E402
+from dwd_h3 import flicker_split, frames_of, pixel_frame_count, psnr, seam_ratio  # noqa: E402
 from train_dwd_h3 import load, load_head, read_mp4, samples, to_uint8, write_mp4  # noqa: E402
 
 
@@ -54,10 +54,11 @@ class Refiner(nn.Module):
     """``(N, 9, H, W)`` (previous, current, next frame) -> residual for the current frame. Zero-initialised
     output, so an untrained refiner returns the DWD frame unchanged."""
 
-    def __init__(self, base: int = 48):
+    def __init__(self, base: int = 48, latent: bool = False):
         super().__init__()
         b = base
-        self.inp = nn.Conv2d(9, b, 3, padding=1)
+        self.latent = latent                                   # also read the frame's 24-channel latent (1/16 res)
+        self.inp = nn.Conv2d(9 + (24 if latent else 0), b, 3, padding=1)
         self.e1 = Block(b)
         self.d1 = nn.Conv2d(b, 2 * b, 4, stride=2, padding=1)
         self.e2 = Block(2 * b)
@@ -71,8 +72,10 @@ class Refiner(nn.Module):
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
-    def forward(self, x):
-        h1 = self.e1(self.inp(x))
+    def forward(self, x, lat=None):
+        """``lat`` ``(N, 24, H/16, W/16)``: the current frame's latent, for a ``latent=True`` refiner."""
+        inp = x if not self.latent else torch.cat([x, F.interpolate(lat.to(x.dtype), scale_factor=16, mode="nearest")], 1)
+        h1 = self.e1(self.inp(inp))
         h2 = self.e2(self.d1(h1))
         h = self.mid(self.d2(h2))
         h = self.m2(self.u2(h) + h2)
@@ -87,13 +90,50 @@ def neighbours(frames: torch.Tensor) -> torch.Tensor:
     return torch.cat([prev, frames, nxt], dim=1)
 
 
+def latent_frames(pixel_frames: int) -> int:
+    """Latent frames of a clip with this many pixel frames (39 -> 12)."""
+    for t in range(1, pixel_frames + 1):
+        if pixel_frame_count(t) == pixel_frames:
+            return t
+    raise ValueError(f"{pixel_frames} pixel frames is not a whole number of latent frames")
+
+
+def frame_groups(latent_t: int) -> list[int]:
+    """Latent frame index of every pixel frame."""
+    return [k for k, n in enumerate(frames_of(latent_t)) for _ in range(n)]
+
+
 @torch.no_grad()
-def refine_clip(model: Refiner, clip: torch.Tensor, chunk: int = 8) -> torch.Tensor:
-    """``(1, 3, F, H, W)`` in [-1, 1] -> refined clip, same shape. H and W must be multiples of 4."""
+def refine_clip(model: Refiner, clip: torch.Tensor, latent: torch.Tensor | None = None, chunk: int = 8) -> torch.Tensor:
+    """``(1, 3, F, H, W)`` in [-1, 1] -> refined clip, same shape. H and W must be multiples of 4 (16 with a
+    latent). ``latent`` ``(1, 24, T, H/16, W/16)`` for a ``latent=True`` refiner."""
     frames = clip[0].permute(1, 0, 2, 3)
     x = neighbours(frames)
-    out = torch.cat([model(x[i:i + chunk]) for i in range(0, x.shape[0], chunk)])
+    lat = None
+    if model.latent:
+        lat = latent[0][:, frame_groups(latent.shape[2])].permute(1, 0, 2, 3).float()          # (F, 24, h, w)
+    out = torch.cat([model(x[i:i + chunk], None if lat is None else lat[i:i + chunk])
+                     for i in range(0, x.shape[0], chunk)])
     return out.clamp(-1, 1).permute(1, 0, 2, 3).unsqueeze(0)
+
+
+def read_mp4_u8(path: Path) -> torch.Tensor:
+    """``(F, H, W, 3)`` uint8, every frame (``read_mp4`` without the float copy)."""
+    import subprocess
+
+    import numpy as np
+
+    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                            "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True)
+    w, h = map(int, probe.stdout.strip().split(","))
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                          "-"], capture_output=True, check=True).stdout
+    return torch.from_numpy(np.frombuffer(raw, np.uint8).reshape(-1, h, w, 3).copy())
+
+
+def clip_latent(pair: dict) -> torch.Tensor:
+    """The clip's stored final latent ``(1, 24, T, H/16, W/16)`` (beside its VAE target)."""
+    return torch.load(Path(pair["vae"]).with_suffix(".pt"), map_location="cpu", mmap=True, weights_only=True)["latent"]
 
 
 # ------------------------------------------------------------------------------------------- cache
@@ -150,54 +190,73 @@ def cache(args) -> None:
 # ------------------------------------------------------------------------------------------- train
 
 class Crops(torch.utils.data.IterableDataset):
-    """Endless random (DWD triple, VAE middle frame) crops; one mp4 pair decoded per ``per_clip`` crops."""
+    """Endless random crops of two consecutive frames: ``x`` ``(2, 9, c, c)`` uint8 (each frame with its
+    neighbours), ``y`` ``(2, 3, c, c)`` uint8, and with ``latent`` the two frames' latents ``(2, 24, c/16, c/16)``.
 
-    def __init__(self, pairs: list[dict], crop: int, per_clip: int, seed: int):
-        self.pairs, self.crop, self.per_clip, self.seed = pairs, crop, per_clip, seed
+    Two frames per sample let the loss compare the refined frame-to-frame change with the VAE's. Decoding is the
+    cost (about 0.25 s a pair), so each decoded clip gives ``per_clip`` crops, cut while still uint8, and a
+    shuffle pool mixes clips so a batch is not two clips' worth of crops.
+    """
+
+    def __init__(self, pairs: list[dict], crop: int, per_clip: int, seed: int, pool: int = 128, latent: bool = False):
+        self.pairs, self.crop, self.per_clip, self.seed, self.pool, self.latent = pairs, crop, per_clip, seed, pool, latent
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         rng = random.Random(self.seed + (info.id if info else 0) * 9973 + int(time.time()))
+        c, grid, pool = self.crop, (16 if self.latent else 4), []
         while True:
             p = rng.choice(self.pairs)
-            a = read_mp4(Path(p["dwd"]))[0].permute(1, 0, 2, 3)          # (F, 3, H, W)
-            b = read_mp4(Path(p["vae"]))[0].permute(1, 0, 2, 3)
-            if a.shape != b.shape:
+            a, b = read_mp4_u8(Path(p["dwd"])), read_mp4_u8(Path(p["vae"]))          # (F, H, W, 3)
+            f, h, w, _ = a.shape
+            if a.shape != b.shape or f < 2 or h < c or w < c:
                 continue
-            x = neighbours(a)
-            f, _, h, w = x.shape
+            lat = group = None
+            if self.latent:
+                lat = clip_latent(p)[0]                                               # (24, T, h/16, w/16)
+                if pixel_frame_count(lat.shape[1]) != f:
+                    continue
+                group = frame_groups(lat.shape[1])
             for _ in range(self.per_clip):
-                t = rng.randrange(f)
-                top, left = rng.randrange(0, h - self.crop + 1, 4), rng.randrange(0, w - self.crop + 1, 4)
-                yield (x[t, :, top:top + self.crop, left:left + self.crop],
-                       b[t, :, top:top + self.crop, left:left + self.crop])
+                t = rng.randrange(f - 1)
+                top, left = rng.randrange(0, h - c + 1, grid), rng.randrange(0, w - c + 1, grid)
+                index = [max(t - 1, 0), t, t + 1, min(t + 2, f - 1)]
+                win = a[index, top:top + c, left:left + c].permute(0, 3, 1, 2)       # (4, 3, c, c)
+                x = torch.stack([win[0:3].reshape(9, c, c), win[1:4].reshape(9, c, c)])
+                y = b[t:t + 2, top:top + c, left:left + c].permute(0, 3, 1, 2).contiguous()
+                item = (x, y)
+                if self.latent:
+                    item += (lat[:, [group[t], group[t + 1]], top // 16:(top + c) // 16,
+                                 left // 16:(left + c) // 16].permute(1, 0, 2, 3).float(),)
+                pool.append(item)
+            while len(pool) > self.pool:
+                yield pool.pop(rng.randrange(len(pool)))
 
 
-def evaluate(model: Refiner, pairs: list[dict], net, dev, videos: Path | None = None, limit: int = 2) -> dict:
-    """Full held-out clips: PSNR, LPIPS (every 6th frame), flicker inside / across latent frames, seam ratio;
-    for the refined output and, once, for the plain DWD output it starts from."""
-    rows, base = {}, {}
+def evaluate(model: Refiner, pairs: list[dict], net, dev, limit: int = 2) -> tuple[dict, list]:
+    """Full held-out clips: PSNR, LPIPS (every 6th frame), flicker inside / across latent frames, seam ratio and
+    the error of the frame-to-frame change (``tde``), for the refined output and for the plain DWD output it
+    starts from. Also returns ``(name, frames)`` of the first ``limit`` clips, VAE | DWD | refined, for videos."""
+    rows, base, keep = {}, {}, []
     model.eval()
     for k, p in enumerate(pairs):
         dwd = read_mp4(Path(p["dwd"])).to(dev)
         vae = read_mp4(Path(p["vae"])).to(dev)
-        ref = refine_clip(model, dwd)
-        t = 12                                                         # 39 frames = 12 latent frames
+        ref = refine_clip(model, dwd, clip_latent(p).to(dev) if model.latent else None)
+        t = latent_frames(dwd.shape[2])
+        dv = vae[:, :, 1:] - vae[:, :, :-1]
         for name, clip, store in (("refined", ref, rows), ("dwd", dwd, base)):
             a, b = clip[0].permute(1, 0, 2, 3)[::6], vae[0].permute(1, 0, 2, 3)[::6]
             with torch.no_grad():
                 lp = sum(net(a[i:i + 1], b[i:i + 1]).item() for i in range(a.shape[0])) / a.shape[0]
             fi, fa = flicker_split(clip, t)
+            tde = (clip[:, :, 1:] - clip[:, :, :-1] - dv).abs().mean().item()
             store.setdefault(p["folder"], []).append({"psnr": psnr(clip, vae), "lpips": lp, "flicker_in": fi,
-                                                      "flicker_across": fa, "seam": seam_ratio(clip)})
-        if videos is not None and k < limit:
-            videos.mkdir(parents=True, exist_ok=True)
+                                                      "flicker_across": fa, "seam": seam_ratio(clip), "tde": tde})
+        if k < limit:
             wide = torch.cat([vae, dwd, ref], dim=-1)[0]
-            frames = to_uint8(wide).permute(1, 2, 3, 0).cpu().numpy()
-            import imageio
-            imageio.mimwrite(videos / f"{p['folder']}__{Path(p['dwd']).stem.split('__')[-1]}.mp4", list(frames),
-                             fps=24, quality=8, macro_block_size=16)
-            imageio.imwrite(videos / f"{p['folder']}__{Path(p['dwd']).stem.split('__')[-1]}_f20.jpg", frames[20])
+            keep.append((f"{p['folder']}__{Path(p['dwd']).stem.split('__')[-1]}",
+                         to_uint8(wide).permute(1, 2, 3, 0).cpu().numpy()))
     model.train()
 
     def mean(d):
@@ -206,7 +265,16 @@ def evaluate(model: Refiner, pairs: list[dict], net, dev, videos: Path | None = 
         for f, m in per.items():
             overall[f"psnr@{f}"], overall[f"lpips@{f}"] = m["psnr"], m["lpips"]
         return overall
-    return {"refined": mean(rows), "dwd": mean(base)}
+    return {"refined": mean(rows), "dwd": mean(base)}, keep
+
+
+def write_videos(keep: list, videos: Path) -> None:
+    import imageio
+
+    videos.mkdir(parents=True, exist_ok=True)
+    for name, frames in keep:
+        imageio.mimwrite(videos / f"{name}.mp4", list(frames), fps=24, quality=8, macro_block_size=16)
+        imageio.imwrite(videos / f"{name}_f20.jpg", frames[min(20, len(frames) - 1)])
 
 
 def train(args) -> None:
@@ -218,24 +286,27 @@ def train(args) -> None:
     pairs = json.loads((args.out / "cache" / "pairs.json").read_text())
     train_pairs = [p for p in pairs if not p["held"]]
     held = [p for p in pairs if p["held"]]
-    model = Refiner(args.base).to(dev)
+    model = Refiner(args.base, latent=args.latent).to(dev)
     net = lpips.LPIPS(net="vgg", verbose=False).to(dev).eval().requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     last_path = args.out / "refiner_last.pt"
     step, best, elapsed, log = 0, math.inf, 0.0, []
     if last_path.exists():
         last = torch.load(last_path, map_location="cpu", weights_only=False)
+        if last.get("base", args.base) != args.base or last.get("latent", False) != args.latent:
+            raise SystemExit(f"{last_path} is a base={last.get('base')} latent={last.get('latent', False)} refiner")
         model.load_state_dict(last["model"])
         opt.load_state_dict(last["opt"])
         step, best, elapsed, log = last["step"], last["best"], last["elapsed"], last["log"]
         print(f"LOT_H3 kind=refine_resume step={step} elapsed_min={elapsed:.1f} best_lpips={best:.4f}", flush=True)
     else:
-        m = evaluate(model, held, net, dev)
+        m, _keep = evaluate(model, held, net, dev, limit=0)
         log.append({"step": 0, **m})
         print("LOT_H3 kind=refine_eval step=0 " + " ".join(f"{k}={v:.4f}" for k, v in m["dwd"].items()), flush=True)
     print(f"LOT_H3 kind=refine params={sum(p.numel() for p in model.parameters())} train_pairs={len(train_pairs)} "
           f"held={len(held)}", flush=True)
-    loader = torch.utils.data.DataLoader(Crops(train_pairs, args.crop, args.per_clip, seed=step), batch_size=args.batch,
+    loader = torch.utils.data.DataLoader(Crops(train_pairs, args.crop, args.per_clip, seed=step, pool=args.pool,
+                                               latent=args.latent), batch_size=args.batch,
                                          num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
     t_start = time.time() - elapsed * 60
     next_eval = (math.floor(elapsed / args.eval_minutes) + 1) * args.eval_minutes * 60
@@ -244,17 +315,23 @@ def train(args) -> None:
     def checkpoint():
         tmp = last_path.with_suffix(".tmp")
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best": best,
-                    "elapsed": (time.time() - t_start) / 60, "log": log, "base": args.base}, tmp)
+                    "elapsed": (time.time() - t_start) / 60, "log": log, "base": args.base,
+                    "latent": args.latent}, tmp)
         tmp.replace(last_path)
 
-    for x, y in loader:
+    for batch in loader:
         if time.time() - t_start > args.minutes * 60:
             break
-        x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True)
-        pred = model(x)
+        x = batch[0].to(dev, non_blocking=True).flatten(0, 1).float() / 127.5 - 1      # (2B, 9, c, c): frame pairs
+        y = batch[1].to(dev, non_blocking=True).flatten(0, 1).float() / 127.5 - 1
+        lat = batch[2].to(dev, non_blocking=True).flatten(0, 1) if args.latent else None
+        pred = model(x, lat)
         l1 = (pred - y).abs().mean()
         lp = net(pred.clamp(-1, 1), y).mean()
-        loss = l1 + args.lpips_weight * lp
+        pp, yy = pred.unflatten(0, (-1, 2)), y.unflatten(0, (-1, 2))
+        # the refined frame-to-frame change should be the VAE's: detail invented per frame would flicker
+        td = ((pp[:, 1] - pp[:, 0]) - (yy[:, 1] - yy[:, 0])).abs().mean()
+        loss = l1 + args.lpips_weight * lp + args.temporal_weight * td
         if not torch.isfinite(loss) or (ema is not None and step > 50 and loss.item() > 20 * ema):
             skipped += 1
             print(f"LOT_H3 kind=refine_skip step={step} loss={loss.item():.4g} skipped={skipped}", flush=True)
@@ -270,19 +347,21 @@ def train(args) -> None:
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % args.log_every == 0:
             print(f"LOT_H3 kind=refine_train step={step} loss={loss.item():.4f} ema={ema:.4f} l1={l1.item():.4f} "
-                  f"lpips={lp.item():.4f} grad_norm={grad_norm:.3f} min={(time.time() - t_start) / 60:.1f} "
+                  f"lpips={lp.item():.4f} td={td.item():.4f} grad_norm={grad_norm:.3f} min={(time.time() - t_start) / 60:.1f} "
                   f"peak_gb={torch.cuda.max_memory_allocated(dev) / 2**30:.1f}", flush=True)
         if time.time() - t_start > next_eval:
             next_eval += args.eval_minutes * 60
-            m = evaluate(model, held, net, dev)
+            m, keep = evaluate(model, held, net, dev)
             log.append({"step": step, **m})
             print(f"LOT_H3 kind=refine_eval step={step} " + " ".join(f"{k}={v:.4f}" for k, v in m["refined"].items()),
                   flush=True)
             if m["refined"]["lpips"] < best:
                 best = m["refined"]["lpips"]
-                torch.save({"model": model.state_dict(), "base": args.base, "step": step}, args.out / "refiner_best.pt")
-                evaluate(model, held, net, dev, videos=args.out / "videos")
+                torch.save({"model": model.state_dict(), "base": args.base, "latent": args.latent, "step": step},
+                           args.out / "refiner_best.pt")
+                write_videos(keep, args.out / "videos")
                 print(f"LOT_H3 kind=refine_save step={step} lpips={best:.4f} out={args.out}", flush=True)
+            del keep
             checkpoint()
     checkpoint()
     print(f"LOT_H3 kind=refine_done steps={step} best_lpips={best:.4f} out={args.out} ok=1", flush=True)
@@ -304,9 +383,14 @@ def main() -> None:
     t.add_argument("--eval-minutes", type=float, default=20)
     t.add_argument("--base", type=int, default=48)
     t.add_argument("--lr", type=float, default=2e-4)
-    t.add_argument("--batch", type=int, default=16)
+    t.add_argument("--batch", type=int, default=8, help="frame pairs per step (two frames each)")
     t.add_argument("--crop", type=int, default=256)
-    t.add_argument("--per-clip", type=int, default=8, help="crops taken from each decoded clip pair")
+    t.add_argument("--per-clip", type=int, default=24, help="crops taken from each decoded clip pair")
+    t.add_argument("--pool", type=int, default=128, help="shuffle pool per worker, in samples")
+    t.add_argument("--temporal-weight", type=float, default=1.0,
+                   help="weight of the L1 between the refined and the VAE frame-to-frame change")
+    t.add_argument("--latent", action="store_true",
+                   help="also feed each frame's stored latent (24 channels at 1/16 resolution) to the refiner")
     t.add_argument("--workers", type=int, default=6)
     t.add_argument("--lpips-weight", type=float, default=0.5)
     t.add_argument("--log-every", type=int, default=100)
