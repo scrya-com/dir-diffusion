@@ -576,7 +576,11 @@ def save_ft(out: Path, lora, trained, head: DWDHead, args, step: int) -> None:
     state = {k: v for k, v in lora.state_dict().items()
              if any(k.startswith(m.lora_name + ".") for m in trained)}
     torch.save({"lora": state, "k": args.k, "rank": args.rank, "step": step}, out / "dwd_ft_lora.pt")
-    torch.save(head_state(head), out / "dwd_ft_head.pt")
+    if args.head_lr > 0:                                          # a frozen head is its init file; no 1-3 GB copy
+        torch.save(head_state(head), out / "dwd_ft_head.pt")
+    else:
+        (out / "dwd_ft_head.json").write_text(json.dumps({"head": str(args.init or out / "dwd_head_ridge.pt"),
+                                                          "blend": head.blend}))
     print(f"LOT_H3 kind=dwd_ft_save step={step} out={out}", flush=True)
 
 
