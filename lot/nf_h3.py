@@ -319,6 +319,12 @@ class ConvKV(nn.Module):
 
 # ------------------------------------------------------------------------------ KV state
 
+def _own(t: torch.Tensor) -> torch.Tensor:
+    """``t`` without the rest of its storage: a cached slice of the layer's whole ``qkv_proj`` output would keep
+    all of it alive (about 12 GB over a 50-layer, 4-iteration stream at 512x512 when the cache is on the GPU)."""
+    return t.clone() if t.untyped_storage().nbytes() > t.numel() * t.element_size() else t
+
+
 @dataclass
 class LayerState:
     """One DiT block's keys and values at ONE diffusion step: the prefix, and the video frames a later
@@ -340,7 +346,9 @@ class LayerState:
     frames: int = 0                             # video frames pushed so far (bookkeeping, tests)
 
     def _keep(self, k: torch.Tensor, v: torch.Tensor) -> tuple:
-        return (k, v) if self.store is None else (k.detach().to(self.store), v.detach().to(self.store))
+        if self.store is None:
+            return k, v
+        return _own(k.detach().to(self.store)), _own(v.detach().to(self.store))
 
     def set_prefix(self, k: torch.Tensor, v: torch.Tensor) -> None:
         self.prefix = self._keep(k, v)

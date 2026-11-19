@@ -1,7 +1,8 @@
 """Long-stream Neighbor Forcing test: does the ConvKV memory hold a character over 16 chunks, and does Stage 2 help?
 
-Streams (``nf_dir_stream_sample``, one KV cache per DiR iteration kept in CPU RAM; with memory the cache is a
-fixed window, so RAM does not grow with length) every (arm, clip, seed) at 960x544, ``--blocks`` chunks
+Streams (``nf_dir_stream_sample``, one KV cache per DiR iteration, about 12 GB at 512x512, kept on the GPU with
+most DiT blocks streamed from CPU; with memory the cache is a fixed window, so it does not grow with length) every
+(arm, clip, seed) at 512x512 (Stage 2's training size; 960x544 needs about 23 GB of cache and did not fit), ``--blocks`` chunks
 (16 = 126 latent frames, about 21 s), and saves the clean latent. Arms:
 
   fix        DiR-Turbo (dir_turbo_clip_iter, step 100 EMA, the Stage 2 init), untrained mean ConvKV, text_reads_first
@@ -30,7 +31,6 @@ DIR_RUN = "/run/media/johndpope/2TB/lora-data/h3_lot/runs/dir_turbo_clip_iter"
 # six held-out clips, six different characters (all had faces in every frame of the held-out test)
 STEMS = ("MiniMax_H3_01080", "MiniMax_H3_00620", "MiniMax_H3_00653", "MiniMax_H3_01408", "MiniMax_H3_01449",
          "MiniMax_H3_01571")
-W, H = 960, 544
 
 
 def text_of(path):
@@ -47,8 +47,9 @@ def sample(args) -> None:
     from lot_paths import LOT_H3_CHECKPOINT
     from nf_h3 import ConvKV, NFConfig, NoiseBank, load_nf_dir_head, load_nf_run, nf_dir_stream_sample
 
+    W, H = args.size
     held = {item["stem"]: item for item in json.loads(HELD.read_text())}
-    items = [held[stem] for stem in STEMS]
+    items = [held[stem] for stem in (args.stems or STEMS)]
     for arm in args.arms:
         todo = [(item, seed) for item in items for seed in args.seeds
                 if not (args.out / arm / f"{item['stem']}_s{seed}.pt").is_file()]
@@ -65,18 +66,22 @@ def sample(args) -> None:
             convkv = ConvKV.for_dit(dit).cuda().eval()
             config = NFConfig(memory=True, text_reads_first=True, drop_long=arm == "nolong")
         (args.out / arm).mkdir(parents=True, exist_ok=True)
+        print(f"{arm}: model loaded gpu={torch.cuda.memory_allocated() / 2**30:.1f}G", flush=True)
         for item, seed in todo:
             t0 = time.time()
             times = []
 
             def on_block(index, _latent, start=t0):
                 times.append(round(time.time() - start, 1))
+                if index < 4 or index % 4 == 3:
+                    print(f"  block {index} t={times[-1]}s gpu={torch.cuda.memory_allocated() / 2**30:.1f}G "
+                          f"peak={torch.cuda.max_memory_allocated() / 2**30:.1f}G", flush=True)
 
             with torch.inference_mode():
                 x = nf_dir_stream_sample(dit, head, text_of(item["te"]), args.blocks, lat_h=H // 16, lat_w=W // 16,
                                          config=config, sigmas=meta["sigmas"], noise=NoiseBank(seed, "cuda"),
                                          mix_state=bool(meta.get("mix_state", False)), convkv=convkv,
-                                         cache_device="cpu", on_block=on_block)
+                                         cache_device=args.cache_device, on_block=on_block)
             path = args.out / arm / f"{item['stem']}_s{seed}.pt"
             torch.save({"latent": x.to(torch.float16).cpu(), "character": item["character"], "seed": seed,
                         "config": repr(config), "block_times": times}, path.with_suffix(".tmp"))
@@ -128,7 +133,12 @@ def main() -> None:
     parser.add_argument("--arms", nargs="+", default=["fix", "nolong", "s2_200", "s2_100"])
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
     parser.add_argument("--blocks", type=int, default=16)
-    parser.add_argument("--swap", type=int, default=8)
+    parser.add_argument("--stems", nargs="+", help="clip stems (default: the six of STEMS)")
+    parser.add_argument("--swap", type=int, default=30,
+                        help="DiT blocks streamed from CPU (about 0.42 GB each), so the KV caches fit on the GPU")
+    parser.add_argument("--cache-device", default="cuda",
+                        help="where the per-iteration KV caches live (512x512: about 12 GB for 3 iterations)")
+    parser.add_argument("--size", nargs=2, type=int, default=[512, 512], metavar=("W", "H"))
     args = parser.parse_args()
     if args.mode == "sample":
         if any(arm.startswith("s2_") for arm in args.arms) and args.s2_run is None:
