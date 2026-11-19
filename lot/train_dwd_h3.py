@@ -464,14 +464,38 @@ def ft(args) -> None:
     if rel > 1e-2:
         raise SystemExit(f"replaying the final iteration gives tokens {rel:.2e} away from the stored ones")
     args.out.mkdir(parents=True, exist_ok=True)
-    base = probe()
-    best, log = base["psnr"], [{"step": 0, **base}]
-    print(f"LOT_H3 kind=dwd_ft_eval step=0 {fmt(base)}", flush=True)
+    last_path = args.out / "dwd_ft_last.pt"
     rng = random.Random(0)
     step = skipped = 0
-    t_start = time.time()
-    next_eval = args.eval_minutes * 60
     ema = None
+    elapsed = 0.0                                                 # training minutes done before this process
+    if args.auto_resume and last_path.exists():                   # crash-safe: continue where the last run stopped
+        last = torch.load(last_path, map_location="cpu", weights_only=False)
+        lora.load_state_dict(last["lora"], strict=False)
+        opt.load_state_dict(last["opt"])
+        if last.get("head") is not None:
+            head.load_state_dict({k: v for k, v in last["head"].items() if k != "blend"})
+        step, best, log, elapsed, ema = last["step"], last["best"], last["log"], last["elapsed"], last["ema"]
+        rng.setstate(last["rng"])
+        base = log[0]
+        print(f"LOT_H3 kind=dwd_ft_resume step={step} elapsed_min={elapsed:.1f} best_psnr={best:.3f}", flush=True)
+    else:
+        base = probe()
+        best, log = base["psnr"], [{"step": 0, **base}]
+        print(f"LOT_H3 kind=dwd_ft_eval step=0 {fmt(base)}", flush=True)
+    t_start = time.time() - elapsed * 60
+    next_eval = (math.floor(elapsed / args.eval_minutes) + 1) * args.eval_minutes * 60
+    next_ckpt = time.time() + args.checkpoint_minutes * 60
+
+    def checkpoint() -> None:
+        state = {k: v for k, v in lora.state_dict().items() if any(k.startswith(m.lora_name + ".") for m in trained)}
+        tmp = last_path.with_suffix(".tmp")
+        torch.save({"lora": state, "opt": opt.state_dict(), "head": head_state(head) if args.head_lr > 0 else None,
+                    "step": step, "best": best, "log": log, "elapsed": (time.time() - t_start) / 60, "ema": ema,
+                    "rng": rng.getstate(), "k": args.k, "rank": args.rank}, tmp)
+        tmp.replace(last_path)                                    # atomic: a crash mid-save keeps the old one
+        print(f"LOT_H3 kind=dwd_ft_checkpoint step={step} out={last_path}", flush=True)
+
     while time.time() - t_start < args.minutes * 60:
         d = load(rng.choice(train), dev, keys)
         cls = token_classes(*d["shape"], device=dev)
@@ -525,6 +549,15 @@ def ft(args) -> None:
             if m["psnr"] > best:
                 best = m["psnr"]
                 save_ft(args.out, lora, trained, head, args, step)
+                if args.best_videos > 0:                          # something to watch at every new best
+                    with torch.no_grad():
+                        evaluate(head, held[:args.best_videos], dev, tokens_fn=tokens,
+                                 videos=args.out / "best_videos", limit_videos=args.best_videos)
+                    print(f"LOT_H3 kind=dwd_ft_videos step={step} out={args.out / 'best_videos'}", flush=True)
+        if time.time() > next_ckpt:
+            next_ckpt = time.time() + args.checkpoint_minutes * 60
+            checkpoint()
+    checkpoint()
     with torch.no_grad():
         final, off = probe(), probe(on=False)
     log.append({"step": step, **final})
@@ -606,7 +639,10 @@ def main() -> None:
     f.add_argument("--rank", type=int, default=32)
     f.add_argument("--lr", type=float, default=1e-4)
     f.add_argument("--head-lr", type=float, default=1e-5)
-    f.add_argument("--minutes", type=float, default=90)
+    f.add_argument("--minutes", type=float, default=90, help="total training minutes, counted across resumes")
+    f.add_argument("--checkpoint-minutes", type=float, default=30, help="save dwd_ft_last.pt (LoRA, optimiser, step)")
+    f.add_argument("--auto-resume", action="store_true", help="continue from OUT/dwd_ft_last.pt when it exists")
+    f.add_argument("--best-videos", type=int, default=2, help="held-out clips rendered at each new best (0: none)")
     f.add_argument("--eval-minutes", type=float, default=15)
     f.add_argument("--grad-clip", type=float, default=1.0)
     f.add_argument("--max-skips", type=int, default=20)
