@@ -355,6 +355,13 @@ def main() -> None:
     s.add_argument("--device", default="cuda")
 
     args = parser.parse_args()
+    try:
+        from setproctitle import setproctitle
+        tags = {"collect": f"items={args.items}x{args.seeds}" if args.phase == "collect" else "",
+                "ridge": "", "sgd": f"lr={args.lr:g}" if args.phase == "sgd" else ""}[args.phase]
+        setproctitle(f"dwd:{args.phase} {tags} {args.out.name}".replace("  ", " ").strip())
+    except ImportError:
+        pass
     {"collect": collect, "ridge": ridge, "sgd": sgd}[args.phase](args)
 
 
