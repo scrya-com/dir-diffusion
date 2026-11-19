@@ -152,7 +152,7 @@ One sample each, looked at as a contact sheet, so these are observations and not
 - The 35-update smoke model at 3 steps: a clean, nearly static 3-second clip with the same person through all three blocks.
 - The same render with `--cache-device cuda` ran out of memory (three step caches of about 5 GB each next to a resident model); `cpu` is the default.
 
-Outputs are under `lot/runs/` (gitignored, not committed; about 450 MB, mostly the three smoke LoRAs).
+Outputs were written under `lot/runs/` (gitignored, not committed; about 450 MB, mostly the three smoke LoRAs). All NF run outputs (checkpoints, renders, logs; 25 GB) have since moved to `/media/2TB/lora-data/h3_lot/runs/nf_worktree/` on the training machine.
 
 ## What was not run
 

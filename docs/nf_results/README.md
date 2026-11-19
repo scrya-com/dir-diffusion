@@ -35,6 +35,9 @@ Stage 2 drifts to tighter close-ups with harsher contrast; held-out motion 0.34 
 3. `nf_heldout_h3.py RENDER_OUT runs/nf_kc_s2 dense zeroshot_cut zeroshot_fix s2_100 s2_200 ...`
 4. `nf_heldout_score.py RENDER_OUT` (face scoring; needs `onnxruntime-gpu` to run on the GPU, see below).
 
+The run and renders used here (`nf_kc_s2`, `nf_kc_heldout`, `ace_textfix`) are not in git; on the training machine
+they are in `/media/2TB/lora-data/h3_lot/runs/nf_worktree/`.
+
 Face scoring on the GPU: conda's `onnxruntime` is CPU-only and saturates the machine. Use a venv with
 `--system-site-packages`, `pip install --ignore-installed --no-deps onnxruntime-gpu`, and `LD_LIBRARY_PATH` set to
 torch's `site-packages/nvidia/*/lib` plus an unversioned `libcudnn.so` symlink.
