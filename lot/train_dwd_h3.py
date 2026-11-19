@@ -293,7 +293,8 @@ def evaluate(head: DWDHead, files: list[Path], device, *, videos: Path | None = 
         if lpips_net is not None:                                 # perceptual distance on every 6th frame
             a = pred[:, :, ::6].permute(0, 2, 1, 3, 4).flatten(0, 1)
             b = target[:, :, ::6].permute(0, 2, 1, 3, 4).flatten(0, 1)
-            row["lpips"] = lpips_net(a.float(), b.float()).mean().item()
+            row["lpips"] = sum(lpips_net(a[i:i + 1].float(), b[i:i + 1].float()).item()   # one frame at a time:
+                               for i in range(a.shape[0])) / a.shape[0]                   # VGG at 768 px is large
         rows.append(row)
         if videos is not None and k < limit_videos:
             write_compare(videos / f"{path.stem}.mp4", target, pred)
@@ -683,6 +684,7 @@ def ft(args) -> None:
 
     def probe(on: bool = True) -> dict:
         """Mean over held-out folders (each folder weighted equally), with each folder's PSNR and LPIPS too."""
+        torch.cuda.empty_cache()
         set_lora(on)
         try:
             parts = {name: evaluate(head, files, dev, tokens_fn=tokens, lpips_net=lpips_net)["mean"]
