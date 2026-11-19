@@ -241,7 +241,8 @@ def targets(args) -> None:
     dtype = next(vae.parameters()).dtype
     done_count = 0
     while True:
-        pending = [p for p in sorted(args.data.glob("*.pt")) if not p.with_suffix(".mp4").exists()]
+        pending = sorted((p for p in args.data.glob("*.pt") if not p.with_suffix(".mp4").exists()),
+                         key=lambda p: (not p.name.startswith("held"), p.name))   # held-out first: evals need them
         for path in pending:
             d = torch.load(path, map_location="cpu", weights_only=True)
             if "latent" not in d or "te" not in d:
