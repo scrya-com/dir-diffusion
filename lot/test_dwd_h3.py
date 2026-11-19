@@ -90,6 +90,37 @@ def test_classes_and_mask():
     assert m[cls == 0, OUT // 4:].sum() == 0 and m[cls == 0, :OUT // 4].min() == 1 and m[cls == 1].min() == 1
 
 
+def test_extended_head():
+    from dwd_h3 import blend_tokens, ext_halo, ext_out, ext_slot_mask, pixels_to_tokens_ext
+    assert ext_halo(OUT) is None and ext_halo(6) is None and ext_halo(ext_out(4)) == 4 and ext_halo(ext_out(0)) == 0
+    t, th, tw = 7, 2, 3
+    pixels = torch.rand(1, 3, pixel_frame_count(t), th * PATCH, tw * PATCH)
+    for halo in (0, 4):
+        ext = pixels_to_tokens_ext(pixels, t, halo)
+        assert ext.shape == (t * th * tw, ext_out(halo))
+        side = PATCH + 2 * halo                                # the own slots' centre is the plain target
+        own = ext.reshape(-1, 6, 3, side, side)[:, 1:5, :, halo:halo + PATCH, halo:halo + PATCH]
+        assert torch.equal(own.reshape(ext.shape[0], -1), pixels_to_tokens(pixels, t))
+        for blend in (0.0, 0.25, 0.5):                          # exact targets blend back to the picture
+            assert (blend_tokens(ext, t, th, tw, halo, blend) - pixels).abs().max() < 1e-5
+        m = ext_slot_mask(token_classes(t, th, tw), th * tw, halo).reshape(-1, 6, 3 * side * side)[:, :, 0]
+        assert m[0].tolist() == [0, 1, 0, 0, 0, 1] and m[th * tw].tolist() == [1] * 6 and m[-1].tolist() == [1, 1, 1, 1, 1, 0]
+    # the chunked gradient of a frozen head equals autograd's
+    head = DWDHead(hidden=8, state_dim=4, out=ext_out(0), classes=5)
+    head.weight.data.normal_(std=0.1)
+    head.bias.data.normal_()
+    head.scale.fill_(2.0)
+    n = t * th * tw
+    h, s, cls = torch.randn(n, 8, requires_grad=True), torch.randn(n, 4), token_classes(t, th, tw)
+    y = head.targets(pixels_to_tokens(pixels, t), t, th, tw)
+    mask = head.target_mask(cls, th * tw)
+    loss = (((head(h, s, cls) - y) ** 2) * mask).sum() / mask.sum()
+    loss.backward()
+    value, grad = head.masked_mse_grad(h.detach(), s, y, mask, cls, chunk=5)
+    assert abs(value - loss.item()) < 1e-5 and torch.allclose(grad, h.grad, atol=1e-6)
+    assert head.decode(h.detach(), s, t, th, tw).shape == pixels.shape
+
+
 def test_metrics():
     t = 6                                                     # frames 1 + 4 + 1 = 6 pixel frames... (1,4,4,4,4,1)
     f = pixel_frame_count(t)

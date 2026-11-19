@@ -102,17 +102,114 @@ def slot_mask(classes: torch.Tensor) -> torch.Tensor:
     return mask
 
 
+# ------------------------------------------------------------------------ overlapping patches
+# A per-token head has no say over its neighbours, so its errors change abruptly at every 32 px token edge
+# and at every latent-frame boundary (measured: the error step is mostly detail finer than 8 px, not a bias).
+# An "extended" head also predicts a halo of ``halo`` pixels around its token and the pixel frame before and
+# after its own; decoding cross-fades the overlaps, which turns each jump into a ramp.
+
+ESLOTS = SLOTS + 2      # [the frame before, own slot 0..3, the frame after]
+
+
+def ext_out(halo: int) -> int:
+    return ESLOTS * 3 * (PATCH + 2 * halo) ** 2
+
+
+def ext_halo(out: int) -> int | None:
+    """The halo of an extended head with ``out`` outputs; ``None`` for a plain head."""
+    side = round((out / (ESLOTS * 3)) ** 0.5)
+    if out == OUT or side < PATCH or (side - PATCH) % 2 or ESLOTS * 3 * side * side != out:
+        return None
+    return (side - PATCH) // 2
+
+
+def pixels_to_tokens_ext(pixels: torch.Tensor, latent_t: int, halo: int) -> torch.Tensor:
+    """``(1, 3, F, H, W)`` pixels -> ``(N, ext_out(halo))`` targets, slot order ``(slot, channel, y, x)``.
+
+    The picture is edge-replicated in space and time. One-frame tokens repeat their frame in own slots 1-3.
+    """
+    x = pixels[0]
+    f, side = x.shape[1], PATCH + 2 * halo
+    if f != pixel_frame_count(latent_t):
+        raise ValueError(f"{f} pixel frames, expected {pixel_frame_count(latent_t)} for {latent_t} latent frames")
+    if halo:
+        x = nn.functional.pad(x, (halo, halo, halo, halo), mode="replicate")
+    chunks, start = [], 0
+    for n in frames_of(latent_t):
+        index = [max(start - 1, 0)] + [start + min(i, n - 1) for i in range(SLOTS)] + [min(start + n, f - 1)]
+        tiles = x[:, index].unfold(2, side, PATCH).unfold(3, side, PATCH)      # (3, ESLOTS, th, tw, side, side)
+        chunks.append(tiles.permute(2, 3, 1, 0, 4, 5).reshape(tiles.shape[2] * tiles.shape[3], -1))
+        start += n
+    return torch.cat(chunks, dim=0)
+
+
+def ext_slot_mask(classes: torch.Tensor, per_frame: int, halo: int) -> torch.Tensor:
+    """``(N, ext_out(halo))`` 1 where an extended target is real: not the repeats of a one-frame token, and
+    not the frame before the clip's first latent frame or after its last."""
+    mask = torch.ones(classes.shape[0], ESLOTS, device=classes.device)
+    mask[classes == 0, 2:1 + SLOTS] = 0
+    mask[:per_frame, 0] = 0
+    mask[-per_frame:, ESLOTS - 1] = 0
+    return mask.repeat_interleave(3 * (PATCH + 2 * halo) ** 2, dim=1)
+
+
+def blend_tokens(tokens: torch.Tensor, latent_t: int, token_h: int, token_w: int, halo: int,
+                 blend: float = 0.25) -> torch.Tensor:
+    """Overlap-add decode of extended tokens -> ``(1, 3, F, 32*token_h, 32*token_w)``.
+
+    In space each token's ``32 + 2*halo`` patch is weighted by a window that ramps linearly over the
+    ``2*halo`` pixels it shares with a neighbour. In time a boundary frame is ``1 - blend`` its own token and
+    ``blend`` the neighbouring latent frame's prediction of it (``blend=0``: no temporal blending).
+    """
+    side, per, dev = PATCH + 2 * halo, token_h * token_w, tokens.device
+    height, width = token_h * PATCH + 2 * halo, token_w * PATCH + 2 * halo
+    ramp = (torch.arange(2 * halo, device=dev) + 0.5) / max(2 * halo, 1)
+    window = torch.cat([ramp, torch.ones(side - 4 * halo, device=dev), ramp.flip(0)])
+    window = torch.outer(window, window)
+
+    def fold(values: torch.Tensor) -> torch.Tensor:                           # (B, C*side*side, per)
+        return nn.functional.fold(values, (height, width), kernel_size=side, stride=PATCH)
+
+    cover = fold(window.reshape(1, -1, 1).expand(1, -1, per))
+    counts = frames_of(latent_t)
+    f = sum(counts)
+    out = torch.zeros(f, 3, height, width, device=dev)
+    weight = torch.zeros(f, device=dev)
+    start = 0
+    for k, n in enumerate(counts):
+        tiles = tokens[k * per:(k + 1) * per].reshape(per, ESLOTS, 3, side, side).float() * window
+        frames = fold(tiles.permute(1, 2, 3, 4, 0).reshape(ESLOTS, 3 * side * side, per))   # (ESLOTS, 3, H, W)
+        for i in range(n):
+            on_boundary = (i == 0 and start > 0) or (i == n - 1 and start + n < f)
+            w = 1.0 - blend if on_boundary else 1.0
+            out[start + i] += w * frames[1 + i]
+            weight[start + i] += w
+        if blend > 0 and start > 0:
+            out[start - 1] += blend * frames[0]
+            weight[start - 1] += blend
+        if blend > 0 and start + n < f:
+            out[start + n] += blend * frames[ESLOTS - 1]
+            weight[start + n] += blend
+        start += n
+    out = out / weight[:, None, None, None] / cover
+    return out[:, :, halo:height - halo, halo:width - halo].permute(1, 0, 2, 3).unsqueeze(0)
+
+
 class DWDHead(nn.Module):
     """``pixels = W_c ((x - mean) / scale) + b_c`` for ``x = [h, s]`` and ``c`` the token's class.
 
     Features are standardised per dimension (the buffers ``mean`` and ``scale``): the last-layer state's
     dimensions differ in spread by about three orders of magnitude, so an unscaled ridge penalty shrinks most
     of them. ``classes=1`` is a single shared map.
+
+    With ``out = ext_out(halo)`` the head is extended (``halo`` is not ``None``): it predicts overlapping
+    patches and ``decode`` cross-fades them (``blend`` is the temporal weight, see ``blend_tokens``).
     """
 
     def __init__(self, hidden: int = HIDDEN, state_dim: int = TOKEN_DIM, out: int = OUT, classes: int = CLASSES):
         super().__init__()
         self.inputs, self.classes = hidden + state_dim, classes
+        self.halo, self.blend = ext_halo(out), 0.25
         self.weight = nn.Parameter(torch.zeros(classes, out, self.inputs))
         self.bias = nn.Parameter(torch.zeros(classes, out))
         self.register_buffer("mean", torch.zeros(self.inputs))
@@ -136,7 +233,37 @@ class DWDHead(nn.Module):
     def decode(self, h: torch.Tensor, s: torch.Tensor, latent_t: int, token_h: int, token_w: int) -> torch.Tensor:
         """Pixels in [-1, 1], ``(1, 3, F, 32*token_h, 32*token_w)``."""
         out = self(h, s, token_classes(latent_t, token_h, token_w, h.device))
+        if self.halo is not None:
+            return blend_tokens(out, latent_t, token_h, token_w, self.halo, self.blend).clamp(-1, 1)
         return tokens_to_pixels(out, latent_t, token_h, token_w).clamp(-1, 1)
+
+    def targets(self, y: torch.Tensor, latent_t: int, token_h: int, token_w: int) -> torch.Tensor:
+        """Per-token targets for this head from the plain ``(N, OUT)`` ones."""
+        if self.halo is None:
+            return y
+        return pixels_to_tokens_ext(tokens_to_pixels(y, latent_t, token_h, token_w), latent_t, self.halo)
+
+    def target_mask(self, classes: torch.Tensor, per_frame: int) -> torch.Tensor:
+        return slot_mask(classes) if self.halo is None else ext_slot_mask(classes, per_frame, self.halo)
+
+    @torch.no_grad()
+    def masked_mse_grad(self, h: torch.Tensor, s: torch.Tensor, y: torch.Tensor, mask: torch.Tensor,
+                        classes: torch.Tensor, chunk: int = 1024) -> tuple[float, torch.Tensor]:
+        """Masked MSE of a frozen head and its gradient with respect to ``h``, in chunks and without autograd,
+        so the ``(N, out)`` prediction and its graph are never held (an extended head would not fit)."""
+        z = self.features(h, s)
+        grad = torch.zeros_like(z)
+        count = mask.sum()
+        total = torch.zeros((), device=z.device)
+        for c in range(self.classes):
+            rows = ((classes % self.classes) == c).nonzero()[:, 0]
+            for i in range(0, rows.shape[0], chunk):
+                r = rows[i:i + chunk]
+                err = (z[r] @ self.weight[c].T + self.bias[c] - y[r]) * mask[r]
+                total += (err * err).sum()
+                grad[r] = (2.0 / count) * (err @ self.weight[c])
+        width = h.shape[-1]
+        return (total / count).item(), grad[:, :width] / self.scale[:width]
 
 
 @contextlib.contextmanager

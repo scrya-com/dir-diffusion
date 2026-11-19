@@ -40,7 +40,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dwd_h3 import (CLASSES, HIDDEN, OUT, TOKEN_DIM, DWDHead, capture_last_layer, flicker_split,  # noqa: E402
+from dwd_h3 import (CLASSES, HIDDEN, OUT, TOKEN_DIM, DWDHead, ext_out, capture_last_layer, flicker_split,  # noqa: E402
                     pack_rows, pixel_frame_count, pixels_to_tokens, pseudo_huber, psnr, seam_ratio, slot_mask,
                     token_classes, tokens_to_pixels)
 
@@ -235,6 +235,8 @@ def ridge(args) -> None:
         raise SystemExit(f"{args.data}: need train_*.pt and held_*.pt from collect")
     C = 1 if args.shared else CLASSES
     d = HIDDEN + TOKEN_DIM
+    out = OUT if args.halo < 0 else ext_out(args.halo)             # --halo >= 0: overlapping output patches
+    shape_head = DWDHead(classes=1, out=out, hidden=1, state_dim=1)  # only for its targets()
     # Pass 1: per-dimension mean and spread. Centring and scaling BEFORE the second moments are accumulated
     # matters: the last-layer dimensions have means far larger than their spread, and E[xx] - n m m^T then
     # loses the spread to cancellation.
@@ -257,14 +259,14 @@ def ridge(args) -> None:
     scale = std.clamp_min(args.scale_floor * std.median().item())
     # Pass 2: per-class moments of the standardised features z = (x - mean) / scale.
     xtx = torch.zeros(C, d, d, dtype=torch.float64, device=dev)
-    xty = torch.zeros(C, d, OUT, dtype=torch.float64, device=dev)
+    xty = torch.zeros(C, d, out, dtype=torch.float64, device=dev)
     sx = torch.zeros(C, d, dtype=torch.float64, device=dev)
-    sy = torch.zeros(C, OUT, dtype=torch.float64, device=dev)
+    sy = torch.zeros(C, out, dtype=torch.float64, device=dev)
     n = torch.zeros(C, dtype=torch.float64, device=dev)
     for path in train:
         s = load(path, dev, ("h", "s", "y", "shape"))
         z = (torch.cat([s["h"].float(), s["s"].float()], dim=1).double() - mean) / scale
-        y = from_uint8(s["y"])
+        y = shape_head.targets(from_uint8(s["y"]), *s["shape"])
         cls = token_classes(*s["shape"], device=dev) % C
         for c in range(C):
             zc, yc = z[cls == c], y[cls == c].double()
@@ -280,7 +282,8 @@ def ridge(args) -> None:
               "lambdas": {}}
     best = None
     for lam in args.lambdas:
-        head = DWDHead(classes=C).to(dev)
+        head = DWDHead(classes=C, out=out).to(dev)
+        head.blend = args.blend
         head.mean.copy_(mean.float())
         head.scale.copy_(scale.float())
         for c in range(C):
@@ -297,7 +300,7 @@ def ridge(args) -> None:
         if best is None or result["mean"]["psnr"] > best[0]:
             best = (result["mean"]["psnr"], lam, head)
     _p, lam, head = best
-    torch.save(head.state_dict(), args.out / "dwd_head_ridge.pt")
+    torch.save(head_state(head), args.out / "dwd_head_ridge.pt")
     final = evaluate(head, held, dev, videos=args.out / "ridge_videos")
     report.update({"best_lambda": lam, "best": final["mean"], "rows": final["rows"]})
     (args.out / "ridge.json").write_text(json.dumps(report, indent=1))
@@ -305,10 +308,18 @@ def ridge(args) -> None:
           flush=True)
 
 
+def head_state(head: DWDHead) -> dict:
+    """The head's state dict plus its temporal blend weight, so a saved head decodes as it was evaluated."""
+    return {**head.state_dict(), "blend": torch.tensor(float(head.blend))}
+
+
 def load_head(path: Path, device) -> DWDHead:
     state = torch.load(path, map_location=device, weights_only=True)
-    head = DWDHead(classes=state["weight"].shape[0]).to(device)
+    blend = state.pop("blend", None)
+    head = DWDHead(classes=state["weight"].shape[0], out=state["weight"].shape[1]).to(device)
     head.load_state_dict(state)
+    if blend is not None:
+        head.blend = float(blend)
     return head
 
 
@@ -322,6 +333,8 @@ def sgd(args) -> None:
     train, held = samples(args.data, False), samples(args.data, True)
     init = args.init or args.out / "dwd_head_ridge.pt"
     head = load_head(init, dev)
+    if head.halo is not None:
+        raise SystemExit("sgd trains a plain head only (ridge without --halo)")
     opt = torch.optim.AdamW([head.weight, head.bias], lr=args.lr, weight_decay=0.0)
     rng = random.Random(0)
     base = evaluate(head, held, dev)["mean"]
@@ -362,7 +375,7 @@ def sgd(args) -> None:
                 print(f"LOT_H3 kind=dwd_eval step={step} {fmt(m)}", flush=True)
                 if m["psnr"] > best:
                     best = m["psnr"]
-                    torch.save(head.state_dict(), args.out / "dwd_head.pt")
+                    torch.save(head_state(head), args.out / "dwd_head.pt")
             if step >= args.steps:
                 break
     (args.out / "sgd.json").write_text(json.dumps({"init": str(init), "log": log, "best_psnr": best,
@@ -406,6 +419,13 @@ def ft(args) -> None:
             trained.append(module)
     lora_params = [p for m in trained for p in m.parameters() if p.requires_grad]
     head = load_head(args.init or args.out / "dwd_head_ridge.pt", dev)
+    head.blend = args.blend
+    if args.resume is not None:                                    # continue a saved ft LoRA (same k and rank)
+        saved = torch.load(args.resume, map_location="cpu", weights_only=True)
+        if saved["k"] != args.k or saved["rank"] != args.rank:
+            raise SystemExit(f"{args.resume}: k={saved['k']} rank={saved['rank']}, not k={args.k} rank={args.rank}")
+        if lora.load_state_dict(saved["lora"], strict=False).unexpected_keys:
+            raise SystemExit(f"{args.resume}: keys that are not in this LoRA")
     groups = [{"params": lora_params, "lr": args.lr}]
     if args.head_lr > 0:
         groups.append({"params": [head.weight, head.bias], "lr": args.head_lr})
@@ -455,10 +475,15 @@ def ft(args) -> None:
     while time.time() - t_start < args.minutes * 60:
         d = load(rng.choice(train), dev, keys)
         cls = token_classes(*d["shape"], device=dev)
-        mask = slot_mask(cls)
-        y = from_uint8(d["y"])
-        pred = head(tokens(d), d["s"], cls)
-        loss = (((pred - y) ** 2) * mask).sum() / mask.sum()
+        mask = head.target_mask(cls, d["shape"][1] * d["shape"][2])
+        y = head.targets(from_uint8(d["y"]), *d["shape"])
+        h = tokens(d)
+        if args.head_lr > 0:
+            loss = (((head(h, d["s"], cls) - y) ** 2) * mask).sum() / mask.sum()
+            h_grad = None
+        else:                                                      # frozen head: no (N, out) graph to hold
+            value, h_grad = head.masked_mse_grad(h, d["s"], y, mask, cls)
+            loss = torch.tensor(value)
         opt.zero_grad(set_to_none=True)
         if not torch.isfinite(loss):
             skipped += 1
@@ -472,7 +497,10 @@ def ft(args) -> None:
             if skipped > args.max_skips:
                 raise SystemExit(f"{skipped} skipped steps (spikes or non-finite): stopping")
             continue
-        loss.backward()
+        if h_grad is None:
+            loss.backward()
+        else:
+            h.backward(h_grad.to(h.dtype))
         grad_norm = float(torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip))
         if not math.isfinite(grad_norm):
             skipped += 1
@@ -515,7 +543,7 @@ def save_ft(out: Path, lora, trained, head: DWDHead, args, step: int) -> None:
     state = {k: v for k, v in lora.state_dict().items()
              if any(k.startswith(m.lora_name + ".") for m in trained)}
     torch.save({"lora": state, "k": args.k, "rank": args.rank, "step": step}, out / "dwd_ft_lora.pt")
-    torch.save(head.state_dict(), out / "dwd_ft_head.pt")
+    torch.save(head_state(head), out / "dwd_ft_head.pt")
     print(f"LOT_H3 kind=dwd_ft_save step={step} out={out}", flush=True)
 
 
@@ -544,6 +572,10 @@ def main() -> None:
     r.add_argument("--out", type=Path, required=True)
     r.add_argument("--lambdas", type=float, nargs="+", default=[1e-8, 1e-6, 1e-4, 1e-3])
     r.add_argument("--shared", action="store_true", help="one map for every token class")
+    r.add_argument("--halo", type=int, default=-1,
+                   help="overlapping output patches: halo pixels around each token, plus the frame before and "
+                        "after (-1: plain per-token patches; 4 removes the seams)")
+    r.add_argument("--blend", type=float, default=0.25, help="temporal cross-fade weight of an extended head")
     r.add_argument("--scale-floor", type=float, default=1.0,
                    help="floor on each feature's spread, as a fraction of the median spread")
     r.add_argument("--device", default="cuda")
@@ -568,6 +600,8 @@ def main() -> None:
     f.add_argument("--data", type=Path, required=True)
     f.add_argument("--out", type=Path, required=True)
     f.add_argument("--init", type=Path, default=None, help="head to start from (default: OUT/dwd_head_ridge.pt)")
+    f.add_argument("--resume", type=Path, default=None, help="a dwd_ft_lora.pt to continue from")
+    f.add_argument("--blend", type=float, default=0.25, help="temporal cross-fade weight of an extended head")
     f.add_argument("--k", type=int, default=4, help="last K DiT blocks get the LoRA")
     f.add_argument("--rank", type=int, default=32)
     f.add_argument("--lr", type=float, default=1e-4)
