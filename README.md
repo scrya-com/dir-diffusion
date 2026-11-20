@@ -18,6 +18,7 @@ Explainers: [scrya.com/dir_diffusion](https://scrya.com/dir_diffusion) and [scry
 
 ## News
 
+- **2026-11-20: DiR + DWD at any resolution (branch `feat/accel`, experimental).** The published DWD stack decodes sizes it was not trained on (LPIPS 0.14–0.18 against the VAE from 384×256 to 1344×768). With DWD the DiT is over 90% of the time, so the next gains are fewer tokens and fewer iterations: half resolution + DWD is 1.0 s for a 1.6 s clip at 768×512. [`docs/ACCEL.md`](docs/ACCEL.md).
 - **2026-11-20: DiR + MPEG two-track.** About 2× faster end to end (768×512: 2.7 s against 5.5 s per 39-frame clip), as a different video, not the same one sooner. [`docs/TWO_TRACK.md`](docs/TWO_TRACK.md).
 - **2026-11-20: DWD.** LPIPS against the VAE goes 0.466 → 0.115, at 0.27 s per clip against the VAE's 1.8 s. [Results with pictures](https://github.com/scrya-com/dir-diffusion/issues/6) · [`docs/DWD.md`](docs/DWD.md).
 - **2026-11-19: Neighbor Forcing + ConvKV memory** for streaming H3. [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md) · [issue #5](https://github.com/scrya-com/dir-diffusion/issues/5).

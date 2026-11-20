@@ -5,6 +5,9 @@ acceleration run (collect, cache, quality, bench, check).
     # GPU parity of the DWD tail (blocks K.. run twice) against a full forward with the LoRA on
     python3 accel_h3.py check --lora LORA --head HEAD
 
+    # refiner pairs for the two-track composite (DWD on both tracks), one forward each
+    python3 accel_h3.py tt-pairs --sizes 768x512:150 1344x768:100 --lora LORA --head HEAD --refiner REF --out OUT
+
     # multi-resolution rollouts with VAE targets; one folder per size and per exit iteration
     python3 accel_h3.py collect --out DATA --sizes 768x512:600 1344x768:300 672x384:400 --exits 3 2
 
@@ -781,24 +784,25 @@ def upscale_px(pixels: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def region_decode(stack: DwdStack, h_hr: torch.Tensor, state_hr: torch.Tensor, hr_index: torch.Tensor,
-                  latent: torch.Tensor, weight: torch.Tensor, lr_px: torch.Tensor, latent_t: int,
-                  margin: int = 4) -> torch.Tensor:
-    """Two-track composite with no VAE: the region's HR tokens through the DWD head and refiner, pasted on the
-    LR track's DWD pixels (x2). ``(1, 3, F, H, W)`` at full resolution.
+def region_compose(stack: DwdStack, h_hr: torch.Tensor, state_hr: torch.Tensor, hr_index: torch.Tensor,
+                   weight: torch.Tensor, lr_px: torch.Tensor, latent_t: int, margin: int = 4):
+    """The two-track composite before the region's refiner: ``(up, px, box, w_px)``.
 
-    ``h_hr`` are the DWD tokens of the region's HR rows (``hr_index`` order), ``state_hr`` the HR state the last
-    forward read, ``latent`` the composite HR latent ``dir_two_track_sample`` returns (the region's estimate
-    inside, the LR latent x2 outside) and ``weight`` its paste weight on the HR latent grid. Every HR token
-    outside the region takes its patch from the x2 LR picture, so the head's overlap-add needs no special case
-    at the region's edge. The refiner runs on the region's bounding box only (plus ``margin`` latent pixels)."""
+    ``up`` is the LR track's pixels x2; ``px`` the same picture with the region's HR tokens decoded by the DWD
+    head in place (every HR token outside the region takes its patch from ``up``, so the head's overlap-add needs
+    no special case at the region's edge); ``box`` the region's bounding box plus ``margin`` latent pixels, as
+    ``(y0, y1, x0, x1)`` on the HR latent grid (``None`` for an empty region); ``w_px`` ``(1, 1, F, h, w)`` the
+    paste weight over the box in pixels."""
     from dwd_h3 import blend_tokens, frames_of, pixels_to_tokens, pixels_to_tokens_ext, token_classes, tokens_to_pixels
-    from refine_dwd_h3 import refine_clip
 
     head = stack.head
     up = upscale_px(lr_px)
     height, width = up.shape[-2:]
     token_h, token_w = height // 32, width // 32
+    w = weight[0, 0].float()                                      # (T, H / 16, W / 16)
+    ys, xs = torch.nonzero(w.amax(0) > 0, as_tuple=True)
+    if len(ys) == 0:
+        return up, up, None, None
     rows = pack_rows(state_hr.float())[hr_index]
     pred = head(h_hr, rows, token_classes(latent_t, token_h, token_w, h_hr.device)[hr_index])
     if head.halo is None:
@@ -810,24 +814,144 @@ def region_decode(stack: DwdStack, h_hr: torch.Tensor, state_hr: torch.Tensor, h
         tokens[hr_index] = pred
         px = blend_tokens(tokens, latent_t, token_h, token_w, head.halo, head.blend).clamp(-1, 1)
     del tokens
-    w = weight[0, 0].float()                                      # (T, H / 16, W / 16)
-    ys, xs = torch.nonzero(w.amax(0) > 0, as_tuple=True)
-    if len(ys) == 0:
-        return up
     y0, y1 = max(0, int(ys.min()) - margin), min(w.shape[1], int(ys.max()) + 1 + margin)
     x0, x1 = max(0, int(xs.min()) - margin), min(w.shape[2], int(xs.max()) + 1 + margin)
-    box = (slice(None), slice(None), slice(None), slice(16 * y0, 16 * y1), slice(16 * x0, 16 * x1))
-    crop = px[box]
+    frame_of = [k for k, n in enumerate(frames_of(latent_t)) for _ in range(n)]
+    w_px = F.interpolate(w[frame_of, y0:y1, x0:x1][:, None], scale_factor=16, mode="bilinear", align_corners=False)
+    return up, px, (y0, y1, x0, x1), w_px.transpose(0, 1).unsqueeze(0)
+
+
+def box_px(box: tuple[int, int, int, int]) -> tuple:
+    y0, y1, x0, x1 = box
+    return (Ellipsis, slice(16 * y0, 16 * y1), slice(16 * x0, 16 * x1))
+
+
+@torch.no_grad()
+def region_decode(stack: DwdStack, h_hr: torch.Tensor, state_hr: torch.Tensor, hr_index: torch.Tensor,
+                  latent: torch.Tensor, weight: torch.Tensor, lr_px: torch.Tensor, latent_t: int,
+                  margin: int = 4) -> torch.Tensor:
+    """Two-track composite with no VAE: the region's HR tokens through the DWD head and refiner, pasted on the
+    LR track's DWD pixels (x2). ``(1, 3, F, H, W)`` at full resolution.
+
+    ``h_hr`` are the DWD tokens of the region's HR rows (``hr_index`` order), ``state_hr`` the HR state the last
+    forward read, ``latent`` the composite HR latent ``dir_two_track_sample`` returns (the region's estimate
+    inside, the LR latent x2 outside) and ``weight`` its paste weight on the HR latent grid. The refiner runs on
+    the region's bounding box only (``region_compose``)."""
+    from refine_dwd_h3 import refine_clip
+
+    up, px, box, w_px = region_compose(stack, h_hr, state_hr, hr_index, weight, lr_px, latent_t, margin)
+    if box is None:
+        return up
+    y0, y1, x0, x1 = box
+    crop = px[box_px(box)]
     if stack.refiner is not None:
         with torch.autocast(crop.device.type, dtype=torch.bfloat16, enabled=stack.amp):
             crop = refine_clip(stack.refiner, crop.contiguous(), latent[..., y0:y1, x0:x1].contiguous(),
                                chunk=stack.chunk or refiner_chunk(*crop.shape[-2:])).float()
-    frame_of = [k for k, n in enumerate(frames_of(latent_t)) for _ in range(n)]
-    w_px = F.interpolate(w[frame_of, y0:y1, x0:x1][:, None], scale_factor=16, mode="bilinear", align_corners=False)
-    w_px = w_px.transpose(0, 1).unsqueeze(0)                      # (1, 1, F, h, w)
     out = up.clone()
-    out[box] = w_px * crop + (1.0 - w_px) * up[box]
+    out[box_px(box)] = w_px * crop + (1.0 - w_px) * up[box_px(box)]
     return out
+
+
+def load_two_track(args) -> dict:
+    """The K/V maps and the region head of MPEG-Diffusion's two-track sampler (downloaded when not given)."""
+    from dir_two_track_h3 import MPEG_MAPS, MPEG_REGION, mpeg_file
+    from mixed_res import RegionHead
+    from two_track_h3 import load_maps, load_region
+
+    saved = load_region(mpeg_file(args.region, "LOT_TT_REGION", MPEG_REGION))
+    region = RegionHead(saved["hidden"]).cuda().eval()
+    region.load_state_dict(saved["state"])
+    return {"maps": load_maps(mpeg_file(args.maps, "LOT_TT_MAPS", MPEG_MAPS)), "region": region, "block": saved["block"]}
+
+
+@torch.no_grad()
+def tt_pairs(args) -> None:
+    """Refiner pairs from two-track rollouts, each made in ONE forward (no replay, so the tokens, the latent and
+    the target agree): over the region's box, the DWD composite before its refiner (``region_compose``), the
+    composite HR latent the refiner reads there, and the VAE composite of the same two latents as the target.
+    Writes ``OUT/cache/pairs.json`` in ``cache``'s format (folder ``tt_<WxH>``); existing clips are skipped."""
+    from dir_h3 import use_networks
+    from dir_two_track_h3 import dir_two_track_sample, pixel_compose_crop
+    from h3_musubi import load_vae
+    from lot_paths import LOT_H3_VAE
+    from train_dwd_h3 import load_text, write_mp4
+
+    gpu_setup("accel_h3.py")
+    models = load_models(args)
+    dit, gen_head, net, sigmas, mix = (models[k] for k in ("dit", "gen_head", "net", "sigmas", "mix"))
+    stack = load_stack(args, dit)
+    vae = load_vae(LOT_H3_VAE, device="cpu")
+    two_track = load_two_track(args)
+    train_te, held_te = prompt_lists(args.caches or default_caches(), args.holdout)
+    out = args.out / "cache"
+    out.mkdir(parents=True, exist_ok=True)
+    groups = []
+    for size_id, spec in enumerate(args.sizes):
+        width, height, count, frames = parse_job(spec, args.frames)
+        check_size(width, height, 64)
+        name = "tt_" + folder_name(width, height, frames, args.frames)
+        groups.append([(name, width, height, frames, True, i, held_te[i % len(held_te)]) for i in range(args.held)]
+                      + [(name, width, height, frames, False, i, train_te[(i + 499 * size_id) % len(train_te)])
+                         for i in range(count)])
+    pairs, t0, new, empty, late = [], time.time(), 0, 0, False
+    for name, width, height, frames, held, index, te in spread(groups):
+        stem = out / f"{name}__{'held' if held else 'train'}_{index:04d}"
+        files = {"dwd": stem.with_suffix(".mp4"), "vae": stem.with_suffix(".vae.mp4"), "lat": stem.with_suffix(".lat.pt")}
+        skip = stem.with_suffix(".noregion")
+        if not all(p.exists() for p in files.values()) and not skip.exists():
+            late = late or bool(args.minutes and time.time() - t0 > args.minutes * 60)
+            if late:
+                continue
+            latent_t = clip_latent_frames(frames)
+            shape = (latent_t, height // 64, width // 64)
+            seed, _audio = sample_seeds(held, index, 0)
+            vae.to("cpu")
+            torch.cuda.empty_cache()
+            stack.to("cuda")
+            tap = {"first": stack.first, "lora": stack.on}
+            with use_networks(net, None, gen=True, fake=False):
+                latent, info = dir_two_track_sample(
+                    dit, gen_head, load_text(str(te)).cuda(), lambda x: x, height=height, width=width, sigmas=sigmas,
+                    mix_state=mix, switch=args.switch, seed=seed, latent_t=latent_t, maps=two_track["maps"],
+                    region=two_track["region"], block=two_track["block"] or 25, switch_upscale="latent", final="pixel",
+                    dwd=tap)
+            box = None
+            if "weight" in info:
+                count = shape[0] * shape[1] * shape[2]
+                lr_px, _head = stack.decode(tap["h"][:count], info["state_lr"], info["lr"], shape)
+                _up, px, box, _w = region_compose(stack, tap["h"][count:], info["state_hr"], info["hr_index"],
+                                                  info["weight"], lr_px, latent_t)
+            if box is None or min(box[1] - box[0], box[3] - box[2]) < 4:      # no region, or one too small to crop
+                skip.touch()
+                empty += 1
+                continue
+            crop = px[box_px(box)].cpu()
+            del px, lr_px, _up, _w, tap
+            stack.to("cpu")
+            torch.cuda.empty_cache()
+            vae.to("cuda")
+            target = pixel_compose_crop(vae, latent, info["lr"], info["weight"])[box_px(box)].float()
+            tmp = files["lat"].with_suffix(".tmp")
+            torch.save({"latent": latent[..., box[0]:box[1], box[2]:box[3]].half().cpu(), "box": box,
+                        "size": (width, height), "share": float(info["mask"].float().mean())}, tmp)
+            tmp.replace(files["lat"])
+            write_mp4(files["vae"], target)
+            write_mp4(files["dwd"], crop)
+            new += 1
+            if new % 20 == 0 or new <= 2:
+                print(f"LOT_H3 kind=accel_tt_pairs clip={stem.name} new={new} box={box} min={(time.time() - t0) / 60:.1f} "
+                      f"peak_gb={torch.cuda.max_memory_allocated() / 2**30:.1f}", flush=True)
+        if skip.exists():
+            continue
+        pairs.append({"dwd": str(files["dwd"]), "vae": str(files["vae"]), "lat": str(files["lat"]), "held": held,
+                      "folder": name})
+    (out / "pairs.json").write_text(json.dumps(pairs, indent=1))
+    total = sum(len(g) for g in groups)
+    print(f"LOT_H3 kind=accel_tt_pairs_done pairs={len(pairs)} of={total} new={new} no_region={empty} "
+          f"held={sum(p['held'] for p in pairs)} out={out} ok=1", flush=True)
+    if late:
+        raise SystemExit(4)
 
 
 def bench_table(root: Path) -> str:
@@ -884,17 +1008,7 @@ def bench(args) -> None:
     early = load_stack(args, dit, prefix="early_") if "dir_dwd_early" in wanted else None
     vae = load_vae(LOT_H3_VAE, device="cpu")
     vae_dtype = next(vae.parameters()).dtype
-    two_track = None
-    if any(v.startswith("tt_") for v in wanted):
-        from dir_two_track_h3 import MPEG_MAPS, MPEG_REGION, mpeg_file
-        from mixed_res import RegionHead
-        from two_track_h3 import load_maps, load_region
-
-        saved = load_region(mpeg_file(args.region, "LOT_TT_REGION", MPEG_REGION))
-        region = RegionHead(saved["hidden"]).cuda().eval()
-        region.load_state_dict(saved["state"])
-        two_track = {"maps": load_maps(mpeg_file(args.maps, "LOT_TT_MAPS", MPEG_MAPS)), "region": region,
-                     "block": saved["block"]}
+    two_track = load_two_track(args) if any(v.startswith("tt_") for v in wanted) else None
     lp = None
     if args.score:
         import lpips
@@ -1088,6 +1202,16 @@ def main() -> None:
                    help="held-out clips per size the refiner run evaluates on (every eval scores all of them)")
     k.add_argument("--minutes", type=float, default=0, help="stop (exit 4) after this long; a rerun resumes")
 
+    w = sub.add_parser("tt-pairs", help="refiner pairs from two-track rollouts (the region's box)")
+    common(w)
+    add_stack(w)
+    w.add_argument("--out", type=Path, required=True)
+    w.add_argument("--held", type=int, default=3, help="held-out clips per size")
+    w.add_argument("--switch", type=int, default=2)
+    w.add_argument("--maps", default=None)
+    w.add_argument("--region", default=None)
+    w.add_argument("--minutes", type=float, default=0, help="stop (exit 4) after this long; a rerun resumes")
+
     m = sub.add_parser("merge-pairs", help="join pairs.json files for one refiner run")
     m.add_argument("--pairs", type=Path, nargs="+", required=True)
     m.add_argument("--out", type=Path, required=True)
@@ -1150,7 +1274,8 @@ def main() -> None:
         setproctitle(" ".join(x for x in (f"accel:{args.phase}", getattr(args, "out", Path("")).name, what) if x))
     except ImportError:
         pass
-    {"collect": collect, "cache": cache, "quality": quality, "bench": bench, "check": check}[args.phase](args)
+    {"collect": collect, "cache": cache, "quality": quality, "bench": bench, "check": check,
+     "tt-pairs": tt_pairs}[args.phase](args)
 
 
 if __name__ == "__main__":

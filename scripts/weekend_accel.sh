@@ -12,10 +12,13 @@
 # Phases (minutes are budgets, cut to what the deadline leaves; a gate that fails skips only its own branch):
 #   preflight   disk, weights, CPU tests, GPU parity of the DWD tail
 #   baseline    published stack: quality per size, the "skip iterations and VAE-decode" floors, speed table
-#   collect     multi-resolution rollouts, inputs of the last iteration (r3) and of earlier exits (r2, r1), VAE targets
-#   e2          early exit after iteration 3: head refit -> last-8-blocks LoRA -> refit -> cache -> refiner -> quality gate
-#   mr          multi-resolution refiner for the full rollout: cache -> refiner from the published one -> quality gate
-#   e1          early exit after iteration 2, only when e2 passed, its floor allows it and 14 h are left
+#   collect     multi-resolution rollouts: inputs of the last iteration (r3) and of the one before (r2), VAE targets
+#   mr          one refiner for every size and for the two-track composite: cache + two-track pairs -> refiner from
+#               the published one -> gate (must beat the published refiner on the new sizes)
+#   e2          early exit after iteration 3 of 4: head refit -> last-8-blocks LoRA (gated at 90 min) -> refit ->
+#               cache -> refiner -> gate. Measured floor: the VAE on iteration 3's own estimate is LPIPS 0.31 from the
+#               full rollout, so this is the long shot; if it is gated out, its hours go to the mr refiner.
+#   e1          exit after iteration 2 (floor 0.46): only with E1=1, and only when e2 passed
 #   final       speed and quality tables with every stack that passed -> accel/FINAL.md
 set -u
 D=${D:-/media/2TB/lora-data/h3_lot/dwd}
@@ -32,6 +35,8 @@ BASE_HEAD=${BASE_HEAD:-$D/wB_head/dwd_head_ridge.pt}
 BASE_REFINER=${BASE_REFINER:-$D/wG/refiner_best.pt}
 BASE_PAIRS=${BASE_PAIRS:-$D/wC/cache/pairs.json}                      # the published refiner's own training pairs
 SMOKE=${SMOKE:-0}
+E1=${E1:-0}                                                           # 1: also try the exit after iteration 2
+EARLY_EXITS=$([ "$E1" = 1 ] && echo "2 1" || echo "2")
 
 if [ "$SMOKE" = 1 ]; then
   W=${W:-$D/accel_smoke/w}; HOURS=${HOURS:-2}; TRIES=2; MIN_FREE_GB=20; MARGIN=6
@@ -39,7 +44,8 @@ if [ "$SMOKE" = 1 ]; then
   SMALL="768x512 512x512 672x384 384x256"; HELD=2; CACHE_HELD=2; PER_FOLDER=8
   QSIZES="768x512 1024x576"; UNSEEN="640x384"; FLOOR_SIZES="768x512"; BENCH_SIZES="768x512"; PROMPTS=2
   B_COLLECT=4; B_REFIT=20; REFIT_MAX=10; STAT=6; B_FT=3; FT_GATE_MIN=0; B_CACHE=10; B_REF_E=3; B_REF_MR=3; EVAL_MIN=1
-  B_FINAL=15; E1_NEEDS=${E1_NEEDS:-9999}; MIN_CLIPS=10; ACCEPT_LPIPS=9; FT_GATE_MAX=9; FLOOR_MAX=9; MR_MARGIN=-9
+  B_TT=4; TT_SIZES="768x512:3"; TT_HELD=1; B_MORE=2
+  B_FINAL=15; E1_NEEDS=20; MIN_CLIPS=10; ACCEPT_LPIPS=9; USABLE_LPIPS=9; FT_GATE_MAX=9; FLOOR_MAX=9; MR_MARGIN=-9
 else
   W=${W:-$D/accel}; HOURS=${HOURS:-58}; TRIES=4; MIN_FREE_GB=120; MARGIN=45
   # training clips per size (8.4 h at the measured rates); every size also gets $HELD held-out clips
@@ -49,11 +55,14 @@ else
   QSIZES="768x512 512x768 512x512 1024x576 576x1024 1344x768 672x384 384x256"
   UNSEEN="960x544 544x960 896x512 448x448"                            # never trained on: does it hold between sizes?
   FLOOR_SIZES="768x512 1024x576 672x384"; BENCH_SIZES="768x512 1344x768"; PROMPTS=3
-  B_COLLECT=510; B_REFIT=100; REFIT_MAX=1200; STAT=256; B_FT=300; FT_GATE_MIN=90; B_CACHE=180; B_REF_E=600; B_REF_MR=420
+  B_COLLECT=510; B_REFIT=100; REFIT_MAX=1200; STAT=256; B_FT=300; FT_GATE_MIN=90; B_CACHE=180; B_REF_E=720; B_REF_MR=600
+  # two-track pairs (canvases are multiples of 64): about 11 s a clip
+  B_TT=110; TT_SIZES="768x512:150 512x768:100 1024x576:120 1280x704:80 1344x768:100 640x640:50"; TT_HELD=3; B_MORE=600
   EVAL_MIN=30; B_FINAL=80; E1_NEEDS=840; MIN_CLIPS=1200
-  ACCEPT_LPIPS=${ACCEPT_LPIPS:-0.16}      # an early exit ships when head + refiner reach this against the full rollout's VAE
+  ACCEPT_LPIPS=${ACCEPT_LPIPS:-0.16}      # an early exit is "accepted" at this against the full rollout's VAE decode ...
+  USABLE_LPIPS=${USABLE_LPIPS:-0.24}      # ... and a "usable trade" (benchmarked, labelled) up to this; the floor is 0.31
   FT_GATE_MAX=${FT_GATE_MAX:-0.42}        # head-level LPIPS the early-exit LoRA must be under after 90 min (r3's LoRA: 0.27)
-  FLOOR_MAX=${FLOOR_MAX:-0.30}            # the VAE on the exit's own estimate must be this close to the full rollout
+  FLOOR_MAX=${FLOOR_MAX:-0.40}            # skip an exit whose own estimate, VAE-decoded, is further than this from the full rollout
   MR_MARGIN=${MR_MARGIN:-0.002}           # the multi-res refiner must beat the published one by this (mean LPIPS)
 fi
 DATA=$W/data
@@ -124,7 +133,7 @@ baseline() {
   say phase=baseline event=quality lpips=$(num "$W/baseline/quality/quality.json" overall.lpips) \
       worst=$(num "$W/baseline/quality/quality.json" worst_lpips)
   local e
-  for e in 2 1; do      # what skipping iterations costs with the real VAE: the floor of an early exit
+  for e in $EARLY_EXITS; do      # what skipping iterations costs with the real VAE: the floor of an early exit
     step base_floor_e$e 20 $PY -u accel_h3.py quality $STACK --exit $e --vae-exit --sizes $FLOOR_SIZES --held 4 --videos 0 \
       --out "$W/baseline/floor_e$e"
     $PY - "$W/baseline/floor_e$e/quality.json" > "$W/state/floor_e$e" 2>/dev/null <<'EOF'
@@ -135,11 +144,11 @@ EOF
     say phase=baseline event=floor exit=$e vae_on_exit_estimate_lpips=$(cat "$W/state/floor_e$e")
   done
   step base_speed 30 env PY=$PY RUN=$RUN LORA=$BASE_LORA HEAD=$BASE_HEAD REFINER=$BASE_REFINER SIZES="$BENCH_SIZES" \
-    PROMPTS=$PROMPTS OUT="$W/baseline" VARIANTS=dir_vae,dir_dwd,lr_vae,lr_dwd,tt_vae,tt_dwd bash ../scripts/bench_accel.sh speed
+    PROMPTS=$PROMPTS OUT="$W/baseline" VARIANTS=dir_vae,dir_dwd,lr_vae,lr_dwd,tt_vae,tt_dwd,tt_dwd2 bash ../scripts/bench_accel.sh speed
 }
 
 collect() {
-  step collect $(fit $B_COLLECT) $PY -u accel_h3.py collect --run $RUN --sizes $TRAIN_SIZES --exits 3 2 1 --held $HELD \
+  step collect $(fit $B_COLLECT) $PY -u accel_h3.py collect --run $RUN --sizes $TRAIN_SIZES --exits 3 $EARLY_EXITS --held $HELD \
     --minutes $(fit $B_COLLECT) --min-free-gb $((MIN_FREE_GB / 2)) --out "$DATA"
   CLIPS=$(ls "$DATA"/r3/*/train_*.pt 2>/dev/null | wc -l)
   say phase=collect event=count train_clips=$CLIPS need=$MIN_CLIPS disk_gb=$(du -s --block-size=1G "$DATA" 2>/dev/null | cut -f1)
@@ -193,37 +202,62 @@ early() {
     --exit $e --vae-exit --data "$DATA"/r$e/* --held $HELD --out "$X/quality" || return 1
   local got=$(num "$X/quality/quality.json" overall.lpips)
   printf 'LORA=%s\nHEAD=%s\nREFINER=%s\nEXIT=%s\nLPIPS=%s\n' "$lora" "$head" "$X/ref/refiner_best.pt" "$e" "$got" > "$X/stack.env"
+  local floor_now=$($PY -c "import json,sys; r=json.load(open(sys.argv[1]))['results']; print(f\"{sum(v['VAE of the exit estimate']['lpips'] for v in r.values())/len(r):.4f}\")" "$X/quality/quality.json" 2>/dev/null)
   if le "${got:-9}" $ACCEPT_LPIPS; then
-    cp "$X/stack.env" "$W/state/e$e.accepted"; say phase=e$e event=accepted lpips=$got max=$ACCEPT_LPIPS
+    cp "$X/stack.env" "$W/state/e$e.usable"; cp "$X/stack.env" "$W/state/e$e.accepted"
+    say phase=e$e event=accepted lpips=$got max=$ACCEPT_LPIPS vae_on_exit_estimate=$floor_now
+  elif le "${got:-9}" $USABLE_LPIPS; then
+    cp "$X/stack.env" "$W/state/e$e.usable"
+    say phase=e$e event=usable_trade lpips=$got accept=$ACCEPT_LPIPS usable=$USABLE_LPIPS vae_on_exit_estimate=$floor_now
   else
-    say phase=e$e event=gate_failed gate=final_lpips lpips=${got:-none} max=$ACCEPT_LPIPS; return 1
+    say phase=e$e event=gate_failed gate=final_lpips lpips=${got:-none} usable=$USABLE_LPIPS vae_on_exit_estimate=$floor_now; return 1
   fi
 }
 
-mr() {                                                                # the full rollout's refiner on every size
-  local X=$W/mr
+mr_gate() {                                                           # mr_gate TAG: score the refiner, keep it if it wins
+  local X=$W/mr tag=$1
+  step mr_quality_base 40 $PY -u accel_h3.py quality $STACK --data "$DATA"/r3/* --held $HELD --videos 0 --out "$X/quality_base"
+  step mr_quality_$tag 40 $PY -u accel_h3.py quality --run $RUN --lora "$BASE_LORA" --head "$BASE_HEAD" \
+    --refiner "$X/ref/refiner_best.pt" --data "$DATA"/r3/* --held $HELD --out "$X/quality_$tag" || return 1
+  local got=$(num "$X/quality_$tag/quality.json" overall.lpips) was=$(num "$X/quality_base/quality.json" overall.lpips)
+  if $PY -c "import sys; a,b,m=map(float,sys.argv[1:4]); sys.exit(0 if a<=b-m else 1)" "${got:-9}" "${was:-0}" $MR_MARGIN; then
+    cp "$X/ref/refiner_best.pt" "$X/refiner_$tag.pt"                  # 33 MB: later training cannot overwrite it
+    echo "$X/refiner_$tag.pt" > "$W/state/mr.accepted"
+    say phase=mr event=accepted tag=$tag lpips=$got published=$was worst=$(num "$X/quality_$tag/quality.json" worst_lpips)
+  else
+    say phase=mr event=gate_failed tag=$tag lpips=${got:-none} published=${was:-none} margin=$MR_MARGIN keeping=$(cat "$W/state/mr.accepted" 2>/dev/null || echo published)
+  fi
+}
+
+mr() {                                                                # one refiner: every size, and the two-track composite
+  local X=$W/mr pairs
   step mr_cache $(fit $B_CACHE) $PY -u accel_h3.py cache $STACK --data "$DATA"/r3/* --out "$X/new" \
     --train-per-folder $PER_FOLDER --held-per-folder $CACHE_HELD --minutes $(fit $B_CACHE)
   [ -f "$X/new/cache/pairs.json" ] || { say phase=mr event=failed at=cache; return 1; }
-  step mr_merge 5 $PY -u accel_h3.py merge-pairs --pairs "$X/new/cache/pairs.json" "$BASE_PAIRS" --out "$X/ref" || return 1
+  pairs="$X/new/cache/pairs.json"
+  step mr_tt $(fit $B_TT) $PY -u accel_h3.py tt-pairs $STACK --sizes $TT_SIZES --held $TT_HELD --minutes $(fit $B_TT) --out "$X/tt"
+  [ -f "$X/tt/cache/pairs.json" ] && pairs="$pairs $X/tt/cache/pairs.json" || say phase=mr event=note two_track_pairs=none
+  step mr_merge 5 $PY -u accel_h3.py merge-pairs --pairs $pairs "$BASE_PAIRS" --out "$X/ref" || return 1
   step mr_refiner $(fit $B_REF_MR) $PY -u refine_dwd_h3.py train --out "$X/ref" --init "$BASE_REFINER" --latent-context \
     --latent-grid 256 --ema 0.999 --crop 384 --minutes $(fit $B_REF_MR) --eval-minutes $EVAL_MIN --device cuda:0 --workers 6
   [ -f "$X/ref/refiner_best.pt" ] || { say phase=mr event=failed at=refiner; return 1; }
-  step mr_quality_base 40 $PY -u accel_h3.py quality $STACK --data "$DATA"/r3/* --held $HELD --videos 0 --out "$X/quality_base"
-  step mr_quality 40 $PY -u accel_h3.py quality --run $RUN --lora "$BASE_LORA" --head "$BASE_HEAD" \
-    --refiner "$X/ref/refiner_best.pt" --data "$DATA"/r3/* --held $HELD --out "$X/quality" || return 1
-  local got=$(num "$X/quality/quality.json" overall.lpips) was=$(num "$X/quality_base/quality.json" overall.lpips)
-  if $PY -c "import sys; a,b,m=map(float,sys.argv[1:4]); sys.exit(0 if a<=b-m else 1)" "${got:-9}" "${was:-0}" $MR_MARGIN; then
-    echo "$X/ref/refiner_best.pt" > "$W/state/mr.accepted"; say phase=mr event=accepted lpips=$got published=$was
-  else
-    say phase=mr event=gate_failed lpips=${got:-none} published=${was:-none} margin=$MR_MARGIN keeping=published
-  fi
+  mr_gate first
+}
+
+mr_more() {                                                           # spare hours: the same run on at a lower rate, as run G's late phase
+  local X=$W/mr extra=$(fit $B_MORE 60) spent
+  [ -f "$X/ref/refiner_last.pt" ] || return 0
+  if [ "$extra" -lt $([ "$SMOKE" = 1 ] && echo 1 || echo 90) ]; then say phase=mr_more event=no_time left_min=$(left); return 0; fi
+  spent=$($PY -c "import torch,sys; print(int(torch.load(sys.argv[1], map_location='cpu', weights_only=False)['elapsed']))" "$X/ref/refiner_last.pt" 2>/dev/null)
+  step mr_more $extra $PY -u refine_dwd_h3.py train --out "$X/ref" --latent-context --latent-grid 256 --ema 0.999 --crop 384 \
+    --lr 5e-5 --lpips-weight 1.0 --minutes $(( ${spent:-$B_REF_MR} + extra )) --eval-minutes $EVAL_MIN --device cuda:0 --workers 6
+  mr_gate late
 }
 
 final() {
   local refiner=$BASE_REFINER early="" e
   [ -f "$W/state/mr.accepted" ] && refiner=$(cat "$W/state/mr.accepted")
-  for e in 2 1; do [ -f "$W/state/e$e.accepted" ] && early=$W/state/e$e.accepted; done    # the earliest exit that passed
+  for e in 2 1; do [ -f "$W/state/e$e.usable" ] && early=$W/state/e$e.usable; done        # the earliest exit that is usable
   local env="PY=$PY RUN=$RUN LORA=$BASE_LORA HEAD=$BASE_HEAD REFINER=$refiner PROMPTS=$PROMPTS OUT=$W/final"
   if [ -n "$early" ]; then
     . "$early"; env="$env EARLY_LORA=$LORA EARLY_HEAD=$HEAD EARLY_REFINER=$REFINER EARLY_EXIT=$EXIT"
@@ -234,10 +268,11 @@ final() {
   {
     echo "# DiR + DWD acceleration run, $(date '+%F %T')"
     echo; echo "Stacks: refiner \`$refiner\`; early exit \`${early:-none}\`."
-    echo; echo "## Events"; echo; echo '```'; grep -a "event=\(quality\|floor\|count\|head_level\|accepted\|gate_failed\|failed\|gave_up\|no_time\|skipped\)" "$W/events.log"; echo '```'
+    echo; echo "## Events"; echo; echo '```'; grep -a "event=\(quality\|floor\|count\|head_level\|accepted\|usable_trade\|gate_failed\|failed\|gave_up\|no_time\|skipped\|note\)" "$W/events.log"; echo '```'
     local t
     for t in baseline/speed/BENCH.md final/speed/BENCH.md baseline/quality/QUALITY.md final/quality/QUALITY.md \
-             final/quality_early/QUALITY.md e2/quality/QUALITY.md e1/quality/QUALITY.md mr/quality/QUALITY.md; do
+             final/quality_early/QUALITY.md e2/quality/QUALITY.md e1/quality/QUALITY.md mr/quality_first/QUALITY.md \
+             mr/quality_late/QUALITY.md mr/quality_base/QUALITY.md; do
       [ -f "$W/$t" ] && { echo; echo "## $t"; echo; cat "$W/$t"; }
     done
   } > "$W/FINAL.md"
@@ -250,13 +285,15 @@ say event=launch dir=$W smoke=$SMOKE hours=$HOURS left_min=$(left) repo=$(git -C
 preflight
 baseline
 if collect; then
-  early 2 "$BASE_REFINER"
   mr
-  if [ -f "$W/state/e2.accepted" ] && [ "$(left)" -ge "$E1_NEEDS" ]; then
+  init=$BASE_REFINER; [ -f "$W/state/mr.accepted" ] && init=$(cat "$W/state/mr.accepted")
+  early 2 "$init"
+  if [ "$E1" = 1 ] && [ -f "$W/state/e2.accepted" ] && [ "$(left)" -ge "$E1_NEEDS" ]; then
     early 1 "$W/e2/ref/refiner_best.pt"
   else
-    say phase=e1 event=skipped e2_accepted=$([ -f "$W/state/e2.accepted" ] && echo 1 || echo 0) left_min=$(left) needs_min=$E1_NEEDS
+    say phase=e1 event=skipped asked=$E1 e2_accepted=$([ -f "$W/state/e2.accepted" ] && echo 1 || echo 0) left_min=$(left)
   fi
+  mr_more                                                             # whatever the gates left over
 else
   say phase=collect event=gate_failed why=too_few_clips
 fi
