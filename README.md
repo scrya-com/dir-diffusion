@@ -9,6 +9,17 @@ Few-step generation by data-space iteration (DiR) with DMD distillation for the 
 > [!WARNING]
 > **Experimental.** The paper's form (σ pinned to 1) trains on H3 but its generators ignore the estimate they are fed, so iterations 2–4 do not refine. A variant that is not in the paper (`--sigmas grid:6 --mix-state`) does refine: after 200 steps from base H3, 4 iterations give sharp images where base H3 at 4 steps is blurred, at 4–5× less DiT time than 20 steps. That is one short run on one single-style dataset, judged by eye on 8 held-out prompts. Trained on clip-shaped noise, the same recipe gives moving clips at step 50 (three prompts checked). No weights are published. See [Results](#results-2026-11-17-what-works-on-h3-and-what-it-costs).
 
+## News
+
+- **2026-11-20: DWD, decoding without a decoder.** A linear head reads pixels straight from H3's last layer at DiR's final iteration, after Hansheng Chen, Shengqu Cai, Jan Ackermann, Rayhan Zirvi, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas, ["Decoding Without a Decoder"](https://arxiv.org/abs/2611.22287).
+  - **Pipeline:** a final-iteration LoRA, then a small refiner that also reads the latent.
+  - **Results:** against the VAE decode, held-out LPIPS goes 0.466 → **0.115**. PSNR is 27.0 dB on isometric scenes, 33.1 dB on portraits, and 27.7 dB on known-character prompts the refiner never saw.
+  - **Speed:** about 0.27 s per 39-frame 512×768 clip on an RTX 5090, against 1.8 s for the VAE.
+  - **Links:** [`docs/DWD.md`](docs/DWD.md), [issue #6](https://github.com/scrya-com/dir-diffusion/issues/6) (with pictures), [scrya.com/dwd_diffusion](https://scrya.com/dwd_diffusion).
+  - **Code:** `lot/dwd_h3.py`, `lot/train_dwd_h3.py`, `lot/refine_dwd_h3.py`. No weights are published yet.
+- **2026-11-19: Neighbor Forcing + ConvKV memory for H3** (SoulX-LiveAct). The text-prefix fix restores character likeness in streamed H3. See [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md), [issue #5](https://github.com/scrya-com/dir-diffusion/issues/5) and [scrya.com/neighbor_forcing](https://scrya.com/neighbor_forcing).
+- **2026-11-17: DiR research checkpoint** on [Hugging Face](https://huggingface.co/johndpope/dir-diffusion-h3) (per-iteration fake model, step 100, averaged weights). It trades Turbo's over-motion for over-detail.
+
 Dense H3 walks a 20-step noise schedule. DiR replaces the walk with a few refinements of the clean estimate: `x̂0⁽⁰⁾ = 0`, then `x̂0⁽ʳ⁺¹⁾ = G(x̂0⁽ʳ⁾, z, r)` for `r = 0 .. R−1` (R = 4). The same noise `z` is used at every iteration, there is no renoising and no sigma schedule. `G` is H3 at the noise end with three small additions:
 
 - a zero-initialised projection of the previous estimate, summed into the target-video rows;
