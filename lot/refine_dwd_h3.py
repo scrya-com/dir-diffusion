@@ -229,7 +229,11 @@ def read_mp4_u8(path: Path) -> torch.Tensor:
 
 
 def clip_latent(pair: dict) -> torch.Tensor:
-    """The clip's stored final latent ``(1, 24, T, H/16, W/16)`` (beside its VAE target)."""
+    """The latent the refiner reads for this clip, ``(1, 24, T, H/16, W/16)``: ``pair["lat"]`` when the cache wrote
+    one (``accel_h3.py cache``: an early exit's or a one-pass decode's own estimate), else the stored final latent
+    beside the VAE target."""
+    if pair.get("lat"):
+        return torch.load(pair["lat"], map_location="cpu", mmap=True, weights_only=True)["latent"]
     return torch.load(Path(pair["vae"]).with_suffix(".pt"), map_location="cpu", mmap=True, weights_only=True)["latent"]
 
 
@@ -293,23 +297,29 @@ class Crops(torch.utils.data.IterableDataset):
     Two frames per sample let the loss compare the refined frame-to-frame change with the VAE's. Decoding is the
     cost (about 0.25 s a pair), so each decoded clip gives ``per_clip`` crops, cut while still uint8, and a
     shuffle pool mixes clips so a batch is not two clips' worth of crops.
+
+    Any resolution: a clip with a side shorter than ``crop`` gives its largest square on the crop grid instead
+    (``crop_side``). Each crop size has its own pool, and samples leave a pool ``group`` at a time, so with
+    ``group`` equal to the loader's batch size every batch holds one size.
     """
 
     def __init__(self, pairs: list[dict], crop: int, per_clip: int, seed: int, pool: int = 128, latent: bool = False,
-                 context: bool = False):
-        self.pairs, self.crop, self.per_clip, self.seed, self.pool = pairs, crop, per_clip, seed, pool
-        self.latent, self.context = latent or context, context
+                 context: bool = False, group: int = 1):
+        self.pairs, self.crop, self.per_clip, self.seed, self.pool = pairs, crop, per_clip, seed, max(pool, group)
+        self.latent, self.context, self.group = latent or context, context, group
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
         rng = random.Random(self.seed + (info.id if info else 0) * 9973 + int(time.time()))
-        c, grid, pool = self.crop, (16 if self.latent else 4), []
+        grid, pools = (16 if self.latent else 4), {}
         while True:
             p = rng.choice(self.pairs)
             a, b = read_mp4_u8(Path(p["dwd"])), read_mp4_u8(Path(p["vae"]))          # (F, H, W, 3)
             f, h, w, _ = a.shape
-            if a.shape != b.shape or f < 2 or h < c or w < c:
+            c = crop_side(self.crop, h, w, grid)
+            if a.shape != b.shape or f < 2 or c < 4 * grid:
                 continue
+            pool = pools.setdefault(c, [])
             lat = group = None
             if self.latent:
                 lat = clip_latent(p)[0]                                               # (24, T, h/16, w/16)
@@ -332,7 +342,14 @@ class Crops(torch.utils.data.IterableDataset):
                                  left // 16:(left + c) // 16].permute(1, 0, 2, 3).float(),)
                 pool.append(item)
             while len(pool) > self.pool:
-                yield pool.pop(rng.randrange(len(pool)))
+                for _ in range(self.group):
+                    yield pool.pop(rng.randrange(len(pool)))
+
+
+def crop_side(crop: int, height: int, width: int, grid: int) -> int:
+    """Side of the square training crop for a ``height x width`` clip: ``crop``, or the clip's shorter side
+    rounded down to ``grid`` when that is smaller."""
+    return min(crop, height // grid * grid, width // grid * grid)
 
 
 def evaluate(model: Refiner, pairs: list[dict], net, dev, limit: int = 2) -> tuple[dict, list]:
@@ -426,7 +443,8 @@ def train(args) -> None:
     print(f"LOT_H3 kind=refine params={sum(p.numel() for p in model.parameters())} train_pairs={len(train_pairs)} "
           f"held={len(held)}", flush=True)
     loader = torch.utils.data.DataLoader(Crops(train_pairs, args.crop, args.per_clip, seed=step, pool=args.pool,
-                                               latent=args.latent, context=args.latent_context), batch_size=args.batch,
+                                               latent=args.latent, context=args.latent_context, group=args.batch),
+                                         batch_size=args.batch,
                                          num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
     t_start = time.time() - elapsed * 60
     next_eval = (math.floor(elapsed / args.eval_minutes) + 1) * args.eval_minutes * 60

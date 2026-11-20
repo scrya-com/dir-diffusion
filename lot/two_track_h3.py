@@ -66,7 +66,8 @@ EXTENT = (1, 2, 2)
 def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoTrackPlan | None, t: float,
                       text: torch.Tensor, *, maps: UpMaps | None = None, audio_generator=None,
                       capture: dict | None = None, res_embed: "ResolutionEmbedding | None" = None,
-                      video_extra: torch.Tensor | None = None, video_temb_delta: torch.Tensor | None = None):
+                      video_extra: torch.Tensor | None = None, video_temb_delta: torch.Tensor | None = None,
+                      dwd: dict | None = None):
     """Velocities ``(v_lr, v_hr)`` of the LR latent and of the HR latent on the plan's region.
 
     ``lr`` is ``(1, 24, T, h, w)``, ``hr`` is ``(1, 24, T, 2h, 2w)``; ``v_hr`` is zero outside the
@@ -78,6 +79,8 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
     is added to the embedded video rows (LR grid first, then the region's HR rows in ``plan.hr_index``
     order), and ``video_temb_delta`` ``(temb_dim,)`` gives every video row, LR and HR, its own
     timestep row. Text and audio keep the original row.
+    ``dwd={"first": i, "lora": ctx}``: as on ``h3_musubi._lot_forward``; ``dwd["h"]`` holds the DWD tokens of every
+    video row (the LR grid first, then the region's HR rows), and the velocities stay the base forward's.
 
     With grad enabled (training) the attention patch is installed for good (``_training_patch``)
     so activation checkpointing recomputes the same attention in the backward pass.
@@ -157,8 +160,11 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
         else:
             patch = patched_attention(dit.blocks, attention=two_track_attention, **context)
     checkpoint = training and dit.gradient_checkpointing
+    again = None
     with patch:
         for index, block in enumerate(dit.blocks):
+            if dwd is not None and index == dwd["first"]:
+                dwd["hidden"] = hidden
             if dit.blocks_to_swap:
                 dit.offloader.wait_for_block(index)
             if checkpoint:
@@ -171,11 +177,18 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
             if capture is not None and capture.get("block") == index:
                 states = hidden[0, segment.start:segment.start + lr_count].float()
                 capture["states"] = states if capture.get("grad") else states.detach()
+        if dwd is not None:                              # inside the patch: the tail needs the same attention
+            from h3_musubi import rerun_blocks
+
+            again = rerun_blocks(dit, dwd, temb, block_segments, rotation)
     hidden = hidden.to(device)
 
     final = dit.final_layer
     shift, scale = final.adaln_proj(temb)
     states = final.norm(hidden[:, segment.start:]) * (1.0 + scale[video_index]) + shift[video_index]
+    if again is not None:
+        dwd["h"] = (final.norm(again[:, segment.start:]) * (1.0 + scale[video_index])
+                    + shift[video_index])[0].to(torch.float32)
     out = final.video_out(states.to(torch.float32))
     v_lr = _unpack_video_rows(out[:, :lr_count], layout.target_video).to(lr.dtype)
     if not hr_count:
