@@ -18,6 +18,7 @@ Explainers: [scrya.com/dir_diffusion](https://scrya.com/dir_diffusion) and [scry
 
 ## News
 
+- **2026-11-20: DiR + MPEG two-track.** About 2× faster end to end (768×512: 2.7 s against 5.5 s per 39-frame clip), as a different video, not the same one sooner. [`docs/TWO_TRACK.md`](docs/TWO_TRACK.md).
 - **2026-11-20: DWD.** LPIPS against the VAE goes 0.466 → 0.115, at 0.27 s per clip against the VAE's 1.8 s. [Results with pictures](https://github.com/scrya-com/dir-diffusion/issues/6) · [`docs/DWD.md`](docs/DWD.md).
 - **2026-11-19: Neighbor Forcing + ConvKV memory** for streaming H3. [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md) · [issue #5](https://github.com/scrya-com/dir-diffusion/issues/5).
 - **2026-11-17: DiR research checkpoint** on Hugging Face (below).
@@ -93,6 +94,7 @@ Every path variable is listed in [`lot/lot_paths.py`](lot/lot_paths.py). A 24 GB
 ```bash
 python3 lot/probe_dir_h3.py --out runs/probe --frames 12 --max-latent-hw 32 48 --items 3 --name dir --run lot/runs/dir_turbo_clip
 python3 lot/probe_dir_h3.py --out runs/probe --decode dir          # mp4s and frame sheets
+bash scripts/bench_two_track.sh                                     # DiR vs two-track timings -> runs/bench_two_track/BENCH.md
 ```
 
 ## Train
@@ -107,6 +109,7 @@ python3 lot/probe_dir_h3.py --out runs/probe --decode dir          # mp4s and fr
 
 - [`docs/DIR.md`](docs/DIR.md): how DiR works on H3, every result (what refines, what doesn't, video, Turbo, eDMD), speed and memory, status.
 - [`docs/DWD.md`](docs/DWD.md): decoding without the VAE: design, results, speed, recipe.
+- [`docs/TWO_TRACK.md`](docs/TWO_TRACK.md): DiR inside MPEG-Diffusion's two-track sampler: one-command benchmark, results.
 - [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md): Neighbor Forcing and ConvKV memory.
 - [`docs/FILES.md`](docs/FILES.md): what every script does.
 - [`lot/CHEATSHEET.md`](lot/CHEATSHEET.md): Level-of-Token diffusion for H3.
@@ -123,4 +126,5 @@ python3 lot/probe_dir_h3.py --out runs/probe --decode dir          # mp4s and fr
 
 - **Data-space iteration:** Shanchuan Lin, Yansong Peng, Fu-Yun Wang, Haoqi Fan. *Few-Step Generation via Data-Space Iteration*. [arXiv 2610.12102](https://arxiv.org/abs/2610.12102).
 - **Decoding without a decoder:** Hansheng Chen, Shengqu Cai, Jan Ackermann, Rayhan Zirvi, Gordon Wetzstein, Xinchen Yan, Leonidas Guibas. *Decoding Without a Decoder: Direct Pixel Prediction from Diffusion Transformers*. [arXiv 2611.22287](https://arxiv.org/abs/2611.22287).
+- **MPEG-Diffusion:** Dennis Menn, Tianpei Gu, Guande He, Aryan V S, Yanke Song, Nan Liu, Desai Xie, Xun Huang, Chenfeng Xu, Diana Marculescu. *MPEG-Diffusion: Mixed-Resolution Video Generation*. [arXiv 2611.12069](https://arxiv.org/abs/2611.12069).
 - **Level-of-Token Diffusion:** [arXiv 2610.05816](https://arxiv.org/abs/2610.05816).

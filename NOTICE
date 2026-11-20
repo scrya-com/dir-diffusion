@@ -12,6 +12,11 @@ third_party/musubi_tuner/, copied without modification; third_party/README.md li
 Level-of-Token Diffusion is described in Nakayama et al., arXiv 2610.05816. The eq. 9 velocity
 recovery can optionally use LakonLab (not included; see lot/flow.py).
 
+lot/mixed_res.py and lot/two_track_h3.py are copied from mpeg-diffusion
+(https://github.com/scrya-com/mpeg-diffusion, commit 8e91323, Apache-2.0), with the changes listed
+at the top of two_track_h3.py. MPEG-Diffusion is described in arXiv 2611.12069 (Dennis Menn, Tianpei Gu, Guande He, Aryan V S,
+Yanke Song, Nan Liu, Desai Xie, Xun Huang, Chenfeng Xu and Diana Marculescu).
+
 MiniMax H3 model weights are NOT included. They, and any weights trained from them, are
 governed by the MiniMax H3 Community License Agreement
 (https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE), which excludes use in the

@@ -17,3 +17,4 @@
 | [`lot/`](../lot) (rest) | Level-of-Token Diffusion for H3, unchanged from [scrya-com/lot-diffusion](https://github.com/scrya-com/lot-diffusion); start at [`lot/CHEATSHEET.md`](../lot/CHEATSHEET.md) |
 | [`third_party/musubi_tuner/`](../third_party) | The unmodified subset of [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) that runs H3 (Apache-2.0; see [`NOTICE`](../NOTICE)) |
 | [`comfyui/`](../comfyui) | LoT ComfyUI workflows (DiR has no ComfyUI node yet) |
+| [`lot/dir_two_track_h3.py`](../lot/dir_two_track_h3.py) / [`scripts/bench_two_track.sh`](../scripts/bench_two_track.sh) / [`lot/bench_table_two_track.py`](../lot/bench_table_two_track.py) | DiR inside MPEG-Diffusion's two-track sampler (`lot/two_track_h3.py`, `lot/mixed_res.py` copied from it): render, `--check`, the benchmark and its table. [`docs/TWO_TRACK.md`](TWO_TRACK.md) |
