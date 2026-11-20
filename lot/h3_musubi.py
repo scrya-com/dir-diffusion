@@ -150,7 +150,38 @@ def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, trai
     if train:
         dit.enable_gradient_checkpointing()
         dit.train()
+    drop_blocks(dit, dropped_blocks())
     return dit
+
+
+#: H3-Tiny's depth plan (https://github.com/fuyi25/H3-Tiny): the same 8 blocks for the Ref2VA and FL2VA/T2VA
+#: transformers. Our int8 checkpoint already has their other stage (rank-8 AdaLN).
+H3_TINY_DROP = (6, 7, 8, 9, 10, 11, 13, 15)
+
+
+def dropped_blocks() -> tuple[int, ...]:
+    """``LOT_H3_DROP_BLOCKS``: ``h3tiny`` for H3-Tiny's plan, or block indices separated by spaces or commas."""
+    spec = os.environ.get("LOT_H3_DROP_BLOCKS", "").strip()
+    if not spec:
+        return ()
+    if spec == "h3tiny":
+        return H3_TINY_DROP
+    return tuple(sorted({int(x) for x in spec.replace(",", " ").split()}))
+
+
+def drop_blocks(dit, indices) -> None:
+    """Skip blocks ``indices`` (they return their input), keeping every index and name in place, so LoRA files,
+    block swap and the DWD tail (``dit.blocks[first:]``) are unchanged. The weights stay loaded: this measures
+    speed and quality, not memory."""
+    import types
+
+    for i in indices:
+        if not 0 <= i < len(dit.blocks):
+            raise ValueError(f"block {i} out of range 0..{len(dit.blocks) - 1}")
+        dit.blocks[i].forward = types.MethodType(lambda _self, hidden, *_a, **_k: hidden, dit.blocks[i])
+    if indices:
+        print(f"LOT_H3 kind=drop_blocks blocks={','.join(map(str, indices))} kept={len(dit.blocks) - len(indices)}",
+              flush=True)
 
 
 def make_lora(dit, rank: int):
