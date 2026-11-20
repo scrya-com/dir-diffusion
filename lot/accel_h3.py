@@ -869,7 +869,8 @@ def load_two_track(args) -> dict:
 def tt_pairs(args) -> None:
     """Refiner pairs from two-track rollouts, each made in ONE forward (no replay, so the tokens, the latent and
     the target agree): over the region's box, the DWD composite before its refiner (``region_compose``), the
-    composite HR latent the refiner reads there, and the VAE composite of the same two latents as the target.
+    composite HR latent the refiner reads there, the region's paste weight (the trainer counts its loss there only:
+    ``refine_dwd_h3.clip_weight``), and the VAE composite of the same two latents as the target.
     Writes ``OUT/cache/pairs.json`` in ``cache``'s format (folder ``tt_<WxH>``); existing clips are skipped."""
     from dir_h3 import use_networks
     from dir_two_track_h3 import dir_two_track_sample, pixel_compose_crop
@@ -934,6 +935,7 @@ def tt_pairs(args) -> None:
             target = pixel_compose_crop(vae, latent, info["lr"], info["weight"])[box_px(box)].float()
             tmp = files["lat"].with_suffix(".tmp")
             torch.save({"latent": latent[..., box[0]:box[1], box[2]:box[3]].half().cpu(), "box": box,
+                        "weight": info["weight"][0, 0, :, box[0]:box[1], box[2]:box[3]].half().cpu(),   # clip_weight
                         "size": (width, height), "share": float(info["mask"].float().mean())}, tmp)
             tmp.replace(files["lat"])
             write_mp4(files["vae"], target)

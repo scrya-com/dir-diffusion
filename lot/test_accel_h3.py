@@ -148,19 +148,31 @@ def test_crops_mixed_sizes_batch_together():
             frames = 5
             for name in ("dwd", "vae"):
                 write_mp4(tmp / f"{k}_{name}.mp4", torch.rand(1, 3, frames, h, w) * 2 - 1)
-            torch.save({"latent": torch.randn(1, 24, 2, h // 16, w // 16)}, tmp / f"{k}.lat.pt")
+            saved = {"latent": torch.randn(1, 24, 2, h // 16, w // 16)}
+            if k == 1:                                               # a two-track box: its region is the left half
+                saved["weight"] = torch.zeros(2, h // 16, w // 16)
+                saved["weight"][..., : w // 32] = 1
+            torch.save(saved, tmp / f"{k}.lat.pt")
             pairs.append({"dwd": str(tmp / f"{k}_dwd.mp4"), "vae": str(tmp / f"{k}_vae.mp4"), "lat": str(tmp / f"{k}.lat.pt"),
                           "held": False, "folder": f"{w}x{h}"})
         data = Crops(pairs, crop=80, per_clip=6, seed=0, pool=4, context=True, group=3)
         loader = torch.utils.data.DataLoader(data, batch_size=3, num_workers=0)
         seen = set()
-        for i, (x, y, lat) in enumerate(loader):                 # default_collate raises on a mixed batch
+        partial = 0
+        for i, (x, y, lat, weight) in enumerate(loader):         # default_collate raises on a mixed batch
             c = x.shape[-1]
             assert x.shape == (3, 2, 9, c, c) and y.shape == (3, 2, 3, c, c) and lat.shape == (3, 2, CONTEXT_CH, c // 16, c // 16)
+            assert weight.shape == (3, 2, 1, c // 16, c // 16) and weight.min() >= 0 and weight.max() <= 1
+            partial += int((weight.flatten(1).mean(1) < 1).sum())
+            assert c == 64 or bool((weight == 1).all())              # only the 64 px clip carries a region
             seen.add(c)
             if i >= 12:
                 break
-        assert seen == {80, 64}, seen
+        assert seen == {80, 64} and partial > 0, (seen, partial)
+        from refine_dwd_h3 import clip_weight, weight_px
+        assert clip_weight(pairs[0]) is None and clip_weight(pairs[1]).shape == (2, 4, 6)
+        w = weight_px(clip_weight(pairs[1]), [0, 1, 1, 1, 1])
+        assert w.shape == (1, 1, 5, 64, 96) and w[..., :32].min() == 1 and w[..., 64:].max() == 0
 
 
 class ToyBlock(torch.nn.Module):

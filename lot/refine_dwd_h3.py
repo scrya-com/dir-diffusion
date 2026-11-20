@@ -237,6 +237,25 @@ def clip_latent(pair: dict) -> torch.Tensor:
     return torch.load(Path(pair["vae"]).with_suffix(".pt"), map_location="cpu", mmap=True, weights_only=True)["latent"]
 
 
+def clip_weight(pair: dict) -> torch.Tensor | None:
+    """``(T, H/16, W/16)`` in [0, 1]: where the refiner's output is used, for a pair that says so (``"weight"`` in
+    its ``lat`` file; ``accel_h3.py tt-pairs`` writes the two-track region's paste weight). ``None``: everywhere.
+
+    A two-track clip is the region's bounding box. Outside the region the box shows the LR track and its latent
+    is an upsampled LR latent, which decodes to nothing; the composite never uses the refiner there. So the loss
+    and the scores count the region only: prediction and target are blended with this weight first."""
+    if not pair.get("lat"):
+        return None
+    weight = torch.load(pair["lat"], map_location="cpu", mmap=True, weights_only=True).get("weight")
+    return None if weight is None else weight.float()
+
+
+def weight_px(weight: torch.Tensor, groups: list[int]) -> torch.Tensor:
+    """``(T, h, w)`` latent-grid weight -> ``(1, 1, F, 16h, 16w)`` for the clip's pixel frames."""
+    return F.interpolate(weight[groups][:, None], scale_factor=16, mode="bilinear", align_corners=False) \
+        .transpose(0, 1).unsqueeze(0)
+
+
 # ------------------------------------------------------------------------------------------- cache
 
 def cache(args) -> None:
@@ -292,7 +311,8 @@ def cache(args) -> None:
 
 class Crops(torch.utils.data.IterableDataset):
     """Endless random crops of two consecutive frames: ``x`` ``(2, 9, c, c)`` uint8 (each frame with its
-    neighbours), ``y`` ``(2, 3, c, c)`` uint8, and with ``latent`` the two frames' latents ``(2, 24, c/16, c/16)``.
+    neighbours), ``y`` ``(2, 3, c, c)`` uint8, and with ``latent`` the two frames' latents ``(2, 24, c/16, c/16)``
+    and their loss weight ``(2, 1, c/16, c/16)`` (``clip_weight``; ones for an ordinary clip).
 
     Two frames per sample let the loss compare the refined frame-to-frame change with the VAE's. Decoding is the
     cost (about 0.25 s a pair), so each decoded clip gives ``per_clip`` crops, cut while still uint8, and a
@@ -320,12 +340,13 @@ class Crops(torch.utils.data.IterableDataset):
             if a.shape != b.shape or f < 2 or c < 4 * grid:
                 continue
             pool = pools.setdefault(c, [])
-            lat = group = None
+            lat = group = weight = None
             if self.latent:
                 lat = clip_latent(p)[0]                                               # (24, T, h/16, w/16)
                 if pixel_frame_count(lat.shape[1]) != f:
                     continue
                 group = frame_groups(lat.shape[1])
+                weight = clip_weight(p)
             for _ in range(self.per_clip):
                 t = rng.randrange(f - 1)
                 top, left = rng.randrange(0, h - c + 1, grid), rng.randrange(0, w - c + 1, grid)
@@ -340,6 +361,9 @@ class Crops(torch.utils.data.IterableDataset):
                 elif self.latent:
                     item += (lat[:, [group[t], group[t + 1]], top // 16:(top + c) // 16,
                                  left // 16:(left + c) // 16].permute(1, 0, 2, 3).float(),)
+                if self.latent:
+                    item += (torch.ones(2, 1, c // 16, c // 16) if weight is None else
+                             weight[[group[t], group[t + 1]], top // 16:(top + c) // 16, left // 16:(left + c) // 16][:, None],)
                 pool.append(item)
             while len(pool) > self.pool:
                 for _ in range(self.group):
@@ -363,6 +387,10 @@ def evaluate(model: Refiner, pairs: list[dict], net, dev, limit: int = 2) -> tup
         vae = read_mp4(Path(p["vae"])).to(dev)
         ref = refine_clip(model, dwd, clip_latent(p).to(dev) if model.latent else None)
         t = latent_frames(dwd.shape[2])
+        weight = clip_weight(p) if model.latent else None
+        if weight is not None:                                    # a two-track box: only its region is ever used
+            w = weight_px(weight.to(dev), frame_groups(t))
+            ref, dwd = w * ref + (1 - w) * vae, w * dwd + (1 - w) * vae
         dv = vae[:, :, 1:] - vae[:, :, :-1]
         for name, clip, store in (("refined", ref, rows), ("dwd", dwd, base)):
             a, b = clip[0].permute(1, 0, 2, 3)[::6], vae[0].permute(1, 0, 2, 3)[::6]
@@ -466,6 +494,10 @@ def train(args) -> None:
         y = batch[1].to(dev, non_blocking=True).flatten(0, 1).float() / 127.5 - 1
         lat = batch[2].to(dev, non_blocking=True).flatten(0, 1) if args.latent else None
         pred = model(x, lat)
+        if args.latent:                                           # count the loss where the output is used
+            w = F.interpolate(batch[3].to(dev, non_blocking=True).flatten(0, 1), scale_factor=16, mode="bilinear",
+                              align_corners=False)
+            pred = w * pred + (1 - w) * y
         l1 = (pred - y).abs().mean()
         lp = net(pred.clamp(-1, 1), y).mean()
         pp, yy = pred.unflatten(0, (-1, 2)), y.unflatten(0, (-1, 2))
