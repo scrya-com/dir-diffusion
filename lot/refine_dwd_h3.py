@@ -50,11 +50,29 @@ class Block(nn.Module):
         return x + self.c2(F.silu(self.c1(F.silu(x))))
 
 
+class LatentPath(nn.Module):
+    """The latent input on its own grid: ``(N, C, H/16, W/16)`` -> ``(N, out, H/4, W/4)``, added at the U-Net's
+    bottleneck. A pixel shuffle gives each of the 4x4 positions inside a latent pixel its own weights, which the
+    nearest-upsampled copy at the input cannot; and a few wide blocks here see +-``2 * blocks + 1`` latent pixels
+    for about 1/256 of their cost at full resolution. Zero-initialised output."""
+
+    def __init__(self, in_ch: int, width: int, blocks: int, out_ch: int):
+        super().__init__()
+        self.inp = nn.Conv2d(in_ch, width, 3, padding=1)
+        self.blocks = nn.Sequential(*[Block(width) for _ in range(blocks)])
+        self.out = nn.Conv2d(width, out_ch * 16, 1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def forward(self, lat):
+        return F.pixel_shuffle(self.out(F.silu(self.blocks(self.inp(lat)))), 4)
+
+
 class Refiner(nn.Module):
     """``(N, 9, H, W)`` (previous, current, next frame) -> residual for the current frame. Zero-initialised
     output, so an untrained refiner returns the DWD frame unchanged."""
 
-    def __init__(self, base: int = 48, latent: bool | int = False):
+    def __init__(self, base: int = 48, latent: bool | int = False, grid: int = 0, grid_blocks: int = 4):
         super().__init__()
         b = base
         # latent: False, True (the frame's 24-channel latent) or a channel count (CONTEXT_CH: neighbouring latent
@@ -67,6 +85,10 @@ class Refiner(nn.Module):
         self.e2 = Block(2 * b)
         self.d2 = nn.Conv2d(2 * b, 4 * b, 4, stride=2, padding=1)
         self.mid = nn.Sequential(Block(4 * b), Block(4 * b))
+        self.grid_width, self.grid_blocks = (grid, grid_blocks) if grid else (0, 0)
+        if grid and not self.latent:
+            raise ValueError("the latent-grid path needs a latent input")
+        self.grid = LatentPath(self.latent_ch, grid, grid_blocks, 4 * b) if grid else None
         self.u2 = nn.ConvTranspose2d(4 * b, 2 * b, 4, stride=2, padding=1)
         self.m2 = Block(2 * b)
         self.u1 = nn.ConvTranspose2d(2 * b, b, 4, stride=2, padding=1)
@@ -80,13 +102,60 @@ class Refiner(nn.Module):
         inp = x if not self.latent else torch.cat([x, F.interpolate(lat.to(x.dtype), scale_factor=16, mode="nearest")], 1)
         h1 = self.e1(self.inp(inp))
         h2 = self.e2(self.d1(h1))
-        h = self.mid(self.d2(h2))
+        h = self.d2(h2)
+        if self.grid is not None:
+            h = h + self.grid(lat.to(x.dtype))
+        h = self.mid(h)
         h = self.m2(self.u2(h) + h2)
         h = self.m1(self.u1(h) + h1)
         return x[:, 3:6] + self.out(h)
 
 
 CONTEXT_CH = 3 * 24 + 4
+
+
+def spec_of(saved: dict) -> dict:
+    """Constructor arguments of a saved refiner (``refiner_best.pt`` or ``refiner_last.pt``), old files included."""
+    return {"base": saved.get("base", 48), "latent": saved.get("latent_spec", saved.get("latent", False)),
+            "grid": saved.get("grid", 0), "grid_blocks": saved.get("grid_blocks", 4)}
+
+
+def init_from(model: Refiner, saved: dict) -> list[str]:
+    """Start ``model`` from another refiner's weights so that it computes the same function at step 0.
+
+    The source may lack the latent-grid path (left at its zero-output initialisation) and may read fewer latent
+    channels: a plain refiner (9 inputs) or a ``--latent`` one (9 + 24) widens to ``--latent-context`` (9 + 76)
+    with its 24 latent channels placed on the pixel frame's own latent frame and zeros elsewhere. Returns the
+    names it did not find in the source."""
+    src, own = saved["model"], model.state_dict()
+    missing = []
+    for name, value in own.items():
+        if name not in src:
+            missing.append(name)
+            continue
+        old = src[name]
+        if name == "inp.weight" and old.shape != value.shape:
+            if old.shape[0] != value.shape[0] or old.shape[2:] != value.shape[2:]:
+                raise SystemExit(f"--init: {name} is {tuple(old.shape)}, the model wants {tuple(value.shape)} (base?)")
+            new = torch.zeros_like(value)
+            new[:, :9] = old[:, :9]
+            if old.shape[1] == 9 + 24 and value.shape[1] == 9 + CONTEXT_CH:
+                # frame_context interleaves: channel 3c + j is latent channel c of the frame before (j=0), own, after
+                new[:, 9 + 1:9 + 72:3] = old[:, 9:]
+            elif old.shape[1] != 9:
+                raise SystemExit(f"--init: cannot widen {old.shape[1]} input channels to {value.shape[1]}")
+            own[name] = new
+        elif old.shape != value.shape:
+            raise SystemExit(f"--init: {name} is {tuple(old.shape)}, the model wants {tuple(value.shape)} (base?)")
+        else:
+            own[name] = old
+    extra = [k for k in src if k not in own]
+    if extra:
+        raise SystemExit(f"--init: the source has weights this model lacks: {extra[:4]}")
+    if any(not k.startswith("grid.") for k in missing):
+        raise SystemExit(f"--init: the source lacks {missing[:4]}")
+    model.load_state_dict(own)
+    return missing
 
 
 def frame_context(lat: torch.Tensor, ts: list[int]) -> torch.Tensor:
@@ -321,29 +390,39 @@ def train(args) -> None:
     held = [p for p in pairs if p["held"]]
     latent_spec = CONTEXT_CH if args.latent_context else args.latent
     args.latent = bool(args.latent or args.latent_context)
-    model = Refiner(args.base, latent=latent_spec).to(dev)
-    ema_model = None
-    if args.ema > 0:                                              # averaged weights: evaluated and saved
-        import copy
-        ema_model = copy.deepcopy(model).eval().requires_grad_(False)
+    model = Refiner(args.base, latent=latent_spec, grid=args.latent_grid, grid_blocks=args.grid_blocks).to(dev)
+    spec = {"base": args.base, "latent": latent_spec, "grid": model.grid_width, "grid_blocks": model.grid_blocks}
     net = lpips.LPIPS(net="vgg", verbose=False).to(dev).eval().requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     last_path = args.out / "refiner_last.pt"
     step, best, elapsed, log = 0, math.inf, 0.0, []
     if last_path.exists():
         last = torch.load(last_path, map_location="cpu", weights_only=False)
-        if last.get("base", args.base) != args.base or last.get("latent_spec", last.get("latent", False)) != latent_spec:
-            raise SystemExit(f"{last_path} is a base={last.get('base')} latent={last.get('latent_spec')} refiner")
+        if spec_of(last) != spec:
+            raise SystemExit(f"{last_path} is a {spec_of(last)} refiner, not {spec}")
         model.load_state_dict(last["model"])
-        if ema_model is not None and last.get("ema_model") is not None:
-            ema_model.load_state_dict(last["ema_model"])
         opt.load_state_dict(last["opt"])
+        for group in opt.param_groups:                            # the saved optimiser carries its own lr: --lr wins
+            group["lr"] = args.lr
         step, best, elapsed, log = last["step"], last["best"], last["elapsed"], last["log"]
         print(f"LOT_H3 kind=refine_resume step={step} elapsed_min={elapsed:.1f} best_lpips={best:.4f}", flush=True)
     else:
+        if args.init:
+            missing = init_from(model, torch.load(args.init, map_location="cpu", weights_only=False))
+            print(f"LOT_H3 kind=refine_init from={args.init} new={len(missing)}", flush=True)
+        # with --init the refined row of this step-0 evaluation must equal the source's own evaluation
         m, _keep = evaluate(model, held, net, dev, limit=0)
+        if args.init:
+            print("LOT_H3 kind=refine_eval_init step=0 " + " ".join(f"{k}={v:.4f}" for k, v in m["refined"].items()),
+                  flush=True)
         log.append({"step": 0, **m})
         print("LOT_H3 kind=refine_eval step=0 " + " ".join(f"{k}={v:.4f}" for k, v in m["dwd"].items()), flush=True)
+    ema_model = None
+    if args.ema > 0:                                              # averaged weights: evaluated and saved
+        import copy
+        ema_model = copy.deepcopy(model).eval().requires_grad_(False)       # after any load: starts at the weights
+        if last_path.exists() and last.get("ema_model") is not None:
+            ema_model.load_state_dict(last["ema_model"])
     print(f"LOT_H3 kind=refine params={sum(p.numel() for p in model.parameters())} train_pairs={len(train_pairs)} "
           f"held={len(held)}", flush=True)
     loader = torch.utils.data.DataLoader(Crops(train_pairs, args.crop, args.per_clip, seed=step, pool=args.pool,
@@ -357,7 +436,8 @@ def train(args) -> None:
         tmp = last_path.with_suffix(".tmp")
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best": best,
                     "elapsed": (time.time() - t_start) / 60, "log": log, "base": args.base,
-                    "latent": args.latent, "latent_spec": latent_spec,
+                    "latent": args.latent, "latent_spec": latent_spec, "grid": model.grid_width,
+                    "grid_blocks": model.grid_blocks,
                     "ema_model": None if ema_model is None else ema_model.state_dict()}, tmp)
         tmp.replace(last_path)
 
@@ -405,13 +485,52 @@ def train(args) -> None:
             if m["refined"]["lpips"] < best:
                 best = m["refined"]["lpips"]
                 torch.save({"model": judged.state_dict(), "base": args.base, "latent": args.latent,
-                            "latent_spec": latent_spec, "step": step}, args.out / "refiner_best.pt")
+                            "latent_spec": latent_spec, "grid": model.grid_width,
+                            "grid_blocks": model.grid_blocks, "step": step}, args.out / "refiner_best.pt")
                 write_videos(keep, args.out / "videos")
                 print(f"LOT_H3 kind=refine_save step={step} lpips={best:.4f} out={args.out}", flush=True)
             del keep
             checkpoint()
     checkpoint()
     print(f"LOT_H3 kind=refine_done steps={step} best_lpips={best:.4f} out={args.out} ok=1", flush=True)
+
+
+def bench(args) -> None:
+    """Seconds per clip of ``refine_clip`` on random input: float32 and bfloat16 autocast, a few chunk sizes."""
+    dev = torch.device(args.device)
+    if args.ckpt:
+        saved = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+        model = Refiner(**spec_of(saved))
+        model.load_state_dict(saved["model"])
+    else:
+        model = Refiner(args.base, latent=CONTEXT_CH if args.latent_context else args.latent, grid=args.latent_grid,
+                        grid_blocks=args.grid_blocks)
+    model = model.to(dev).eval()
+    t = latent_frames(args.frames)
+    clip = torch.rand(1, 3, args.frames, args.height, args.width, device=dev) * 2 - 1
+    latent = torch.randn(1, 24, t, args.height // 16, args.width // 16, device=dev) if model.latent else None
+
+    def sync():
+        if dev.type == "cuda":
+            torch.cuda.synchronize(dev)
+
+    print(f"LOT_H3 kind=refine_bench params={sum(p.numel() for p in model.parameters())} frames={args.frames} "
+          f"size={args.height}x{args.width} device={dev}", flush=True)
+    for amp in (False, True):
+        for chunk in args.chunks:
+            times = []
+            if dev.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(dev)
+            for _ in range(args.repeats + 1):                      # the first run is the warm-up
+                sync()
+                t0 = time.time()
+                with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=amp):
+                    out = refine_clip(model, clip, latent, chunk=chunk)
+                sync()
+                times.append(time.time() - t0)
+            peak = torch.cuda.max_memory_allocated(dev) / 2**30 if dev.type == "cuda" else 0.0
+            print(f"LOT_H3 kind=refine_bench amp={int(amp)} chunk={chunk} s_per_clip={min(times[1:]):.4f} "
+                  f"mean={sum(times[1:]) / len(times[1:]):.4f} peak_gb={peak:.2f} out={tuple(out.shape)}", flush=True)
 
 
 def main() -> None:
@@ -440,18 +559,38 @@ def main() -> None:
                    help="also feed each frame's stored latent (24 channels at 1/16 resolution) to the refiner")
     t.add_argument("--latent-context", action="store_true",
                    help="feed the latent frames before, at and after each pixel frame's own, plus its sub-frame phase")
+    t.add_argument("--latent-grid", type=int, default=0, metavar="WIDTH",
+                   help="also run the latent input through a WIDTH-wide path on the latent grid, pixel-shuffled into "
+                        "the bottleneck (e.g. 256); needs --latent or --latent-context")
+    t.add_argument("--grid-blocks", type=int, default=4, help="residual blocks of the latent-grid path")
+    t.add_argument("--init", type=Path, default=None,
+                   help="start a new run from another refiner's weights (refiner_best.pt), same base; new inputs and "
+                        "the latent-grid path start at zero, so step 0 reproduces the source")
     t.add_argument("--ema", type=float, default=0.0, help="weight EMA decay (e.g. 0.999); the EMA is evaluated and saved")
     t.add_argument("--workers", type=int, default=6)
     t.add_argument("--lpips-weight", type=float, default=0.5)
     t.add_argument("--log-every", type=int, default=100)
     t.add_argument("--device", default="cuda")
+    b = sub.add_parser("bench", help="time refine_clip on random input")
+    b.add_argument("--ckpt", type=Path, default=None, help="a saved refiner; otherwise the flags below build one")
+    b.add_argument("--base", type=int, default=48)
+    b.add_argument("--latent", action="store_true")
+    b.add_argument("--latent-context", action="store_true")
+    b.add_argument("--latent-grid", type=int, default=0)
+    b.add_argument("--grid-blocks", type=int, default=4)
+    b.add_argument("--frames", type=int, default=39)
+    b.add_argument("--height", type=int, default=512)
+    b.add_argument("--width", type=int, default=768)
+    b.add_argument("--chunks", type=int, nargs="+", default=[8, 13, 39])
+    b.add_argument("--repeats", type=int, default=5)
+    b.add_argument("--device", default="cuda")
     args = parser.parse_args()
     try:
         from setproctitle import setproctitle
-        setproctitle(f"dwd:refine-{args.phase} {args.out.name}")
+        setproctitle(f"dwd:refine-{args.phase} {args.out.name if hasattr(args, 'out') else ''}")
     except ImportError:
         pass
-    {"cache": cache, "train": train}[args.phase](args)
+    {"cache": cache, "train": train, "bench": bench}[args.phase](args)
 
 
 if __name__ == "__main__":
