@@ -28,13 +28,71 @@ The target is the VAE decode of the generator's own estimate. So the head can at
 - **A fixed probe set instead of the loss value.** Every evaluation scores the same held-out (prompt, seed) pairs by PSNR against the VAE decode and by flicker against the VAE clip's.
 - **Not used yet: DMD2's GAN term.** With a VAE target a discriminator would push away from the target; it belongs with a real-pixel target.
 
-## Not done
-
-- Fine-tuning the last K blocks. The generator LoRA is shared by every iteration, so this needs a separate small LoRA that is on only at the final iteration, and a check that it is bit-identical when switched off.
-- A real-pixel target from the clip cache.
-- A `--dwd` decode path in the renderers.
-
 ## Results
+
+Status thread with pictures (including known-character prompts): [issue #6](https://github.com/scrya-com/dir-diffusion/issues/6).
+
+### Summary (2026-11-20)
+
+Everything is scored against the VAE decode of the same latent, on held-out clips: iso (isometric scenes) and atlas (portraits), 39 frames at 512×768. LPIPS is VGG on every 6th frame.
+
+| Stage | LPIPS (all) | iso PSNR / LPIPS | atlas PSNR / LPIPS |
+|---|---|---|---|
+| Linear head on base DiR, no LoRA | 0.466 | 21.76 / 0.467 | 25.08 / 0.466 |
+| + final-iteration LoRA, K=8, rank 64, MSE, 5 h | 0.365 | 23.49 / 0.381 | 28.70 / 0.348 |
+| + head refit on those features (`refit`) | 0.321 | 23.88 / 0.346 | 29.49 / 0.296 |
+| + LoRA continued with LPIPS | 0.267 | 23.82 / 0.302 | 29.34 / 0.231 |
+| + plain refiner (`refine_dwd_h3.py`) | 0.171 | 24.38 / 0.196 | 30.59 / 0.146 |
+| + refiner that also reads the latent (`--latent`) | 0.138 | 25.56 / 0.161 | 31.65 / 0.115 |
+| **+ latent context and latent-grid path (`--latent-context --latent-grid 256`), still training** | **0.115** | **27.02 / 0.135** | **33.09 / 0.096** |
+
+**Temporal:**
+- Flicker across latent frames: 0.044, against the VAE's ~0.047.
+- Error in frame-to-frame change: 0.026.
+- Seam ratio: 1.05, against the VAE's ~1.08.
+
+**Known-character prompts** (8 held out; not in the refiner's training data): PSNR 24.57 → 27.74 dB, LPIPS 0.247 → 0.119.
+
+**Speed** (RTX 5090, one 39-frame 512×768 clip, measured with `refine_dwd_h3.py bench`):
+
+| Decoder | Time |
+|---|---|
+| VAE decode | 1.8 s |
+| Linear head | 13 ms fp32, 4 ms fp16 |
+| Refiner, `--latent` | 0.34 s fp32, 0.21 s bf16 |
+| Refiner, context + grid | 0.40 s fp32, 0.25 s bf16 |
+
+So the whole path (head + refiner, bf16) takes about 0.27 s, roughly 6–7× faster than the VAE. Refiner accuracy in bf16 has not been re-checked.
+
+**LPIPS calibration** (the VAE's own frames after simple degradations):
+
+| Degradation | LPIPS |
+|---|---|
+| blur σ0.5 | 0.033 |
+| half resolution, upscaled | 0.121 |
+| blur σ1 | 0.167 |
+| blur σ2 | 0.289 |
+| quarter resolution, upscaled | 0.295 |
+
+**Recipe**, as run in `train_dwd_h3.py` and `refine_dwd_h3.py`:
+1. Run `collect --light`, plus `targets` for the VAE mp4s.
+2. Run `ridge --halo 4`.
+3. Run `ft` with K=8, rank 64, MSE.
+4. Run `refit`.
+5. Run `ft` again with `--lpips-weight 0.05`.
+6. Run `refine_dwd_h3.py cache`, then `train --latent`, then `train --init <that> --latent-context --latent-grid 256 --ema 0.999 --crop 384`.
+
+**What did not help:**
+- Teacher-forced targets from existing H3 clips: +5 dB teacher-forced, −4.6 dB on real rollouts.
+- `sgd` on a frozen-feature head.
+- More LoRA training after the refit.
+
+**Not done:**
+- Real-pixel targets: needed to beat the VAE rather than match it.
+- A renderer `--dwd` path.
+- A bf16 accuracy check.
+- Published weights.
+
 
 ### Run 1 (2026-11-19)
 
