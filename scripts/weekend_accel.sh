@@ -33,7 +33,7 @@ export ACCEL_CACHES=${ACCEL_CACHES:-/media/2TB/lora-data/h3_lot/cache_iso3d:/med
 BASE_LORA=${BASE_LORA:-$D/wB/dwd_ft_lora.pt}
 BASE_HEAD=${BASE_HEAD:-$D/wB_head/dwd_head_ridge.pt}
 BASE_REFINER=${BASE_REFINER:-$D/wG/refiner_best.pt}
-BASE_PAIRS=${BASE_PAIRS:-$D/wC/cache/pairs.json}                      # the published refiner's own training pairs
+BASE_PAIRS=${BASE_PAIRS-$D/wC/cache/pairs.json}                       # the published refiner's own training pairs (not published: BASE_PAIRS= to train on the new pairs only)
 SMOKE=${SMOKE:-0}
 E1=${E1:-0}                                                           # 1: also try the exit after iteration 2
 EARLY_EXITS=$([ "$E1" = 1 ] && echo "2 1" || echo "2")
@@ -120,7 +120,7 @@ preflight() {
   local free=$(( $(df --output=avail -k "$D" | tail -1) / 1048576 ))
   say phase=preflight event=disk free_gb=$free need_gb=$MIN_FREE_GB
   [ "$free" -ge "$MIN_FREE_GB" ] || { say phase=preflight event=failed why=disk; exit 1; }
-  local f; for f in "$BASE_LORA" "$BASE_HEAD" "$BASE_REFINER" "$BASE_PAIRS" "$RUN/config.json"; do
+  local f; for f in "$BASE_LORA" "$BASE_HEAD" "$BASE_REFINER" ${BASE_PAIRS:+"$BASE_PAIRS"} "$RUN/config.json"; do
     [ -e "$f" ] || { say phase=preflight event=failed why=missing file=$f; exit 1; }
   done
   step tests 10 sh -c "$PY test_accel_h3.py && $PY test_dwd_h3.py && $PY test_refine_dwd_h3.py" \
@@ -237,7 +237,7 @@ mr() {                                                                # one refi
   pairs="$X/new/cache/pairs.json"
   step mr_tt $(fit $B_TT) $PY -u accel_h3.py tt-pairs $STACK --sizes $TT_SIZES --held $TT_HELD --minutes $(fit $B_TT) --out "$X/tt"
   [ -f "$X/tt/cache/pairs.json" ] && pairs="$pairs $X/tt/cache/pairs.json" || say phase=mr event=note two_track_pairs=none
-  step mr_merge 5 $PY -u accel_h3.py merge-pairs --pairs $pairs "$BASE_PAIRS" --out "$X/ref" || return 1
+  step mr_merge 5 $PY -u accel_h3.py merge-pairs --pairs $pairs ${BASE_PAIRS:+"$BASE_PAIRS"} --out "$X/ref" || return 1
   step mr_refiner $(fit $B_REF_MR) $PY -u refine_dwd_h3.py train --out "$X/ref" --init "$BASE_REFINER" --latent-context \
     --latent-grid 256 --ema 0.999 --crop 384 --minutes $(fit $B_REF_MR) --eval-minutes $EVAL_MIN --device cuda:0 --workers 6
   [ -f "$X/ref/refiner_best.pt" ] || { say phase=mr event=failed at=refiner; return 1; }
