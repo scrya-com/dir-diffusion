@@ -54,11 +54,14 @@ class Refiner(nn.Module):
     """``(N, 9, H, W)`` (previous, current, next frame) -> residual for the current frame. Zero-initialised
     output, so an untrained refiner returns the DWD frame unchanged."""
 
-    def __init__(self, base: int = 48, latent: bool = False):
+    def __init__(self, base: int = 48, latent: bool | int = False):
         super().__init__()
         b = base
-        self.latent = latent                                   # also read the frame's 24-channel latent (1/16 res)
-        self.inp = nn.Conv2d(9 + (24 if latent else 0), b, 3, padding=1)
+        # latent: False, True (the frame's 24-channel latent) or a channel count (CONTEXT_CH: neighbouring latent
+        # frames and the sub-frame phase, see ``frame_context``); always at 1/16 resolution
+        self.latent_ch = 0 if not latent else (24 if latent is True else int(latent))
+        self.latent = self.latent_ch > 0
+        self.inp = nn.Conv2d(9 + self.latent_ch, b, 3, padding=1)
         self.e1 = Block(b)
         self.d1 = nn.Conv2d(b, 2 * b, 4, stride=2, padding=1)
         self.e2 = Block(2 * b)
@@ -81,6 +84,29 @@ class Refiner(nn.Module):
         h = self.m2(self.u2(h) + h2)
         h = self.m1(self.u1(h) + h1)
         return x[:, 3:6] + self.out(h)
+
+
+CONTEXT_CH = 3 * 24 + 4
+
+
+def frame_context(lat: torch.Tensor, ts: list[int]) -> torch.Tensor:
+    """``lat`` ``(24, T, h, w)`` -> ``(len(ts), 76, h, w)`` for pixel frames ``ts``: the latent frames before, at and
+    after the pixel frame's own (edges repeated), and a one-hot of its place among that latent frame's 1 or 4 pixel
+    frames. The VAE's output depends on neighbouring latent frames, and the four pixel frames of one latent frame
+    differ; a single latent per pixel frame gives the refiner neither."""
+    t_lat = lat.shape[1]
+    group = frame_groups(t_lat)
+    first = {}
+    for i, g in enumerate(group):
+        first.setdefault(g, i)
+    out = []
+    for t in ts:
+        g = group[t]
+        cur = lat[:, [max(g - 1, 0), g, min(g + 1, t_lat - 1)]].flatten(0, 1)            # (72, h, w)
+        phase = torch.zeros(4, *lat.shape[2:], dtype=lat.dtype)
+        phase[t - first[g]] = 1
+        out.append(torch.cat([cur, phase]))
+    return torch.stack(out)
 
 
 def neighbours(frames: torch.Tensor) -> torch.Tensor:
@@ -110,7 +136,9 @@ def refine_clip(model: Refiner, clip: torch.Tensor, latent: torch.Tensor | None 
     frames = clip[0].permute(1, 0, 2, 3)
     x = neighbours(frames)
     lat = None
-    if model.latent:
+    if model.latent_ch == CONTEXT_CH:
+        lat = frame_context(latent[0].float().cpu(), list(range(frames.shape[0]))).to(frames.device)
+    elif model.latent:
         lat = latent[0][:, frame_groups(latent.shape[2])].permute(1, 0, 2, 3).float()          # (F, 24, h, w)
     out = torch.cat([model(x[i:i + chunk], None if lat is None else lat[i:i + chunk])
                      for i in range(0, x.shape[0], chunk)])
@@ -198,8 +226,10 @@ class Crops(torch.utils.data.IterableDataset):
     shuffle pool mixes clips so a batch is not two clips' worth of crops.
     """
 
-    def __init__(self, pairs: list[dict], crop: int, per_clip: int, seed: int, pool: int = 128, latent: bool = False):
-        self.pairs, self.crop, self.per_clip, self.seed, self.pool, self.latent = pairs, crop, per_clip, seed, pool, latent
+    def __init__(self, pairs: list[dict], crop: int, per_clip: int, seed: int, pool: int = 128, latent: bool = False,
+                 context: bool = False):
+        self.pairs, self.crop, self.per_clip, self.seed, self.pool = pairs, crop, per_clip, seed, pool
+        self.latent, self.context = latent or context, context
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
@@ -225,7 +255,10 @@ class Crops(torch.utils.data.IterableDataset):
                 x = torch.stack([win[0:3].reshape(9, c, c), win[1:4].reshape(9, c, c)])
                 y = b[t:t + 2, top:top + c, left:left + c].permute(0, 3, 1, 2).contiguous()
                 item = (x, y)
-                if self.latent:
+                if self.context:
+                    item += (frame_context(lat[:, :, top // 16:(top + c) // 16, left // 16:(left + c) // 16].float(),
+                                           [t, t + 1]),)
+                elif self.latent:
                     item += (lat[:, [group[t], group[t + 1]], top // 16:(top + c) // 16,
                                  left // 16:(left + c) // 16].permute(1, 0, 2, 3).float(),)
                 pool.append(item)
@@ -286,16 +319,24 @@ def train(args) -> None:
     pairs = json.loads((args.out / "cache" / "pairs.json").read_text())
     train_pairs = [p for p in pairs if not p["held"]]
     held = [p for p in pairs if p["held"]]
-    model = Refiner(args.base, latent=args.latent).to(dev)
+    latent_spec = CONTEXT_CH if args.latent_context else args.latent
+    args.latent = bool(args.latent or args.latent_context)
+    model = Refiner(args.base, latent=latent_spec).to(dev)
+    ema_model = None
+    if args.ema > 0:                                              # averaged weights: evaluated and saved
+        import copy
+        ema_model = copy.deepcopy(model).eval().requires_grad_(False)
     net = lpips.LPIPS(net="vgg", verbose=False).to(dev).eval().requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     last_path = args.out / "refiner_last.pt"
     step, best, elapsed, log = 0, math.inf, 0.0, []
     if last_path.exists():
         last = torch.load(last_path, map_location="cpu", weights_only=False)
-        if last.get("base", args.base) != args.base or last.get("latent", False) != args.latent:
-            raise SystemExit(f"{last_path} is a base={last.get('base')} latent={last.get('latent', False)} refiner")
+        if last.get("base", args.base) != args.base or last.get("latent_spec", last.get("latent", False)) != latent_spec:
+            raise SystemExit(f"{last_path} is a base={last.get('base')} latent={last.get('latent_spec')} refiner")
         model.load_state_dict(last["model"])
+        if ema_model is not None and last.get("ema_model") is not None:
+            ema_model.load_state_dict(last["ema_model"])
         opt.load_state_dict(last["opt"])
         step, best, elapsed, log = last["step"], last["best"], last["elapsed"], last["log"]
         print(f"LOT_H3 kind=refine_resume step={step} elapsed_min={elapsed:.1f} best_lpips={best:.4f}", flush=True)
@@ -306,7 +347,7 @@ def train(args) -> None:
     print(f"LOT_H3 kind=refine params={sum(p.numel() for p in model.parameters())} train_pairs={len(train_pairs)} "
           f"held={len(held)}", flush=True)
     loader = torch.utils.data.DataLoader(Crops(train_pairs, args.crop, args.per_clip, seed=step, pool=args.pool,
-                                               latent=args.latent), batch_size=args.batch,
+                                               latent=args.latent, context=args.latent_context), batch_size=args.batch,
                                          num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
     t_start = time.time() - elapsed * 60
     next_eval = (math.floor(elapsed / args.eval_minutes) + 1) * args.eval_minutes * 60
@@ -316,7 +357,8 @@ def train(args) -> None:
         tmp = last_path.with_suffix(".tmp")
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best": best,
                     "elapsed": (time.time() - t_start) / 60, "log": log, "base": args.base,
-                    "latent": args.latent}, tmp)
+                    "latent": args.latent, "latent_spec": latent_spec,
+                    "ema_model": None if ema_model is None else ema_model.state_dict()}, tmp)
         tmp.replace(last_path)
 
     for batch in loader:
@@ -343,6 +385,10 @@ def train(args) -> None:
         loss.backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0))
         opt.step()
+        if ema_model is not None:
+            with torch.no_grad():
+                for pe, pm in zip(ema_model.parameters(), model.parameters()):
+                    pe.lerp_(pm, 1.0 - args.ema)
         step += 1
         ema = loss.item() if ema is None else 0.98 * ema + 0.02 * loss.item()
         if step % args.log_every == 0:
@@ -351,14 +397,15 @@ def train(args) -> None:
                   f"peak_gb={torch.cuda.max_memory_allocated(dev) / 2**30:.1f}", flush=True)
         if time.time() - t_start > next_eval:
             next_eval += args.eval_minutes * 60
-            m, keep = evaluate(model, held, net, dev)
+            judged = ema_model if ema_model is not None else model          # with --ema the EMA is what counts
+            m, keep = evaluate(judged, held, net, dev)
             log.append({"step": step, **m})
             print(f"LOT_H3 kind=refine_eval step={step} " + " ".join(f"{k}={v:.4f}" for k, v in m["refined"].items()),
                   flush=True)
             if m["refined"]["lpips"] < best:
                 best = m["refined"]["lpips"]
-                torch.save({"model": model.state_dict(), "base": args.base, "latent": args.latent, "step": step},
-                           args.out / "refiner_best.pt")
+                torch.save({"model": judged.state_dict(), "base": args.base, "latent": args.latent,
+                            "latent_spec": latent_spec, "step": step}, args.out / "refiner_best.pt")
                 write_videos(keep, args.out / "videos")
                 print(f"LOT_H3 kind=refine_save step={step} lpips={best:.4f} out={args.out}", flush=True)
             del keep
@@ -391,6 +438,9 @@ def main() -> None:
                    help="weight of the L1 between the refined and the VAE frame-to-frame change")
     t.add_argument("--latent", action="store_true",
                    help="also feed each frame's stored latent (24 channels at 1/16 resolution) to the refiner")
+    t.add_argument("--latent-context", action="store_true",
+                   help="feed the latent frames before, at and after each pixel frame's own, plus its sub-frame phase")
+    t.add_argument("--ema", type=float, default=0.0, help="weight EMA decay (e.g. 0.999); the EMA is evaluated and saved")
     t.add_argument("--workers", type=int, default=6)
     t.add_argument("--lpips-weight", type=float, default=0.5)
     t.add_argument("--log-every", type=int, default=100)
