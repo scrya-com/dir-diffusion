@@ -18,6 +18,7 @@ Explainers: [scrya.com/dir_diffusion](https://scrya.com/dir_diffusion) and [scry
 
 ## News
 
+- **2026-11-21: DWD weights** on Hugging Face: [johndpope/dir-diffusion-h3-dwd](https://huggingface.co/johndpope/dir-diffusion-h3-dwd). Run them with the `feat/accel` branch (below).
 - **2026-11-20: DiR + MPEG two-track.** About 2× faster end to end (768×512: 2.7 s against 5.5 s per 39-frame clip), as a different video, not the same one sooner. [`docs/TWO_TRACK.md`](docs/TWO_TRACK.md).
 - **2026-11-20: DWD.** LPIPS against the VAE goes 0.466 → 0.115, at 0.27 s per clip against the VAE's 1.8 s. [Results with pictures](https://github.com/scrya-com/dir-diffusion/issues/6) · [`docs/DWD.md`](docs/DWD.md).
 - **2026-11-19: Neighbor Forcing + ConvKV memory** for streaming H3. [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md) · [issue #5](https://github.com/scrya-com/dir-diffusion/issues/5).
@@ -28,7 +29,7 @@ Explainers: [scrya.com/dir_diffusion](https://scrya.com/dir_diffusion) and [scry
 | Model | Weights | What it is |
 |---|---|---|
 | **DiR generator** | [johndpope/dir-diffusion-h3](https://huggingface.co/johndpope/dir-diffusion-h3) | A rank-128 LoRA + DiR head on H3, 4 iterations. Sharp, with motion at the teacher's level; busier detail than 20-step H3. |
-| **DWD decoder** | not published yet (training ends 22 Nov) | A final-iteration LoRA, pixel head and refiner. Replaces the VAE decode: LPIPS 0.115 against the VAE, about 6–7× faster. |
+| **DWD decoder** | [johndpope/dir-diffusion-h3-dwd](https://huggingface.co/johndpope/dir-diffusion-h3-dwd) (v0.1) | A final-iteration LoRA, pixel head and refiner. Replaces the VAE decode: LPIPS 0.114 against the VAE, about 6–7× faster. Decodes only the DiR checkpoint above, on a 32 GB card. |
 
 These are research weights: one run each, judged on held-out prompts. Read [`docs/DIR.md`](docs/DIR.md) for what works and what doesn't.
 
@@ -69,7 +70,7 @@ So changing the generator means retraining DWD. You can also train DiR from scra
 | **Vanilla, the paper:** base H3, σ pinned to 1, DMD | `train_dir_h3.py --swap 4 --max-latent-hw 48 48 --accum 2 --steps 1000` (defaults are the paper's) | Faithful to the paper. No Turbo dependency. | **On H3 the iterations do not refine:** the trained generator ignores the estimate it is fed, so it is a one-step generator run four times. The paper used batch 256 and ~50M samples; one card manages batch 2. |
 | **Base H3 + mixed state** (not in the paper) | `--rank 128 --fake-rank 64 --zero-init --sigmas grid:6 --mix-state --dmd-draws 4 --fake-warmup 100 --accum 2` | Refines: 4 iterations give sharp images from base H3 in ~200 steps. No Turbo dependency. | Departs from the paper. Unstable between checkpoints (a white-background collapse at step 100). The stills model barely moves on clips, and the clip version was only tested to step 50. |
 | **Stacked on Turbo** (the published model) | `--init lot/runs/turbo4_init --sigmas turbo --zero-init --frames 12 --fake-source iteration --tau-max 0.9` | Step 0 is already Turbo-quality. It fixes Turbo's over-motion in 100 steps. The cheapest route to a usable model. | Inherits Turbo's look and adds detail. Depends on Turbo's LoRA (Apache-2.0). One run, batch 2. |
-| **DWD** (stacked on the DiR checkpoint) | [`docs/DWD.md`](docs/DWD.md), recipe | Replaces the 1.8 s VAE decode with 0.27 s. | Tied to the generator it was trained on. Its target is the VAE, so it can match the VAE but not beat it. Weights not published yet. |
+| **DWD** (stacked on the DiR checkpoint) | [`docs/DWD.md`](docs/DWD.md), recipe | Replaces the 1.8 s VAE decode with 0.27 s. | Tied to the generator it was trained on. Its target is the VAE, so it can match the VAE but not beat it. |
 
 ## Setup
 
@@ -96,6 +97,17 @@ python3 lot/probe_dir_h3.py --out runs/probe --frames 12 --max-latent-hw 32 48 -
 python3 lot/probe_dir_h3.py --out runs/probe --decode dir          # mp4s and frame sheets
 bash scripts/bench_two_track.sh                                     # DiR vs two-track timings -> runs/bench_two_track/BENCH.md
 ```
+
+**DiR + DWD** (32 GB card, no block swap; the end-to-end code is on the `feat/accel` branch until it is merged):
+
+```bash
+git checkout feat/accel
+hf download johndpope/dir-diffusion-h3-dwd --local-dir dwd
+python3 lot/accel_h3.py check --run johndpope/dir-diffusion-h3 --lora dwd/dwd_lora.pt --head dwd/dwd_head.pt --refiner dwd/dwd_refiner.pt
+LORA=dwd/dwd_lora.pt HEAD=dwd/dwd_head.pt REFINER=dwd/dwd_refiner.pt SIZES=768x512 bash scripts/bench_accel.sh speed
+```
+
+DWD decodes only the published DiR checkpoint's final iteration: with base H3, Turbo or another checkpoint the output is noise.
 
 ## Train
 

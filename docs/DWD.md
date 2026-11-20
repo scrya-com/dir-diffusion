@@ -87,11 +87,12 @@ So the whole path (head + refiner, bf16) takes about 0.27 s, roughly 6–7× fas
 - `sgd` on a frozen-feature head.
 - More LoRA training after the refit.
 
+**Weights:** [johndpope/dir-diffusion-h3-dwd](https://huggingface.co/johndpope/dir-diffusion-h3-dwd) (v0.1: run B LoRA, ridge head in fp16, run G refiner at step 40416). Run them with the `feat/accel` branch's `lot/accel_h3.py`; see the README.
+
 **Not done:**
 - Real-pixel targets: needed to beat the VAE rather than match it.
 - A renderer `--dwd` path.
 - A bf16 accuracy check.
-- Published weights.
 
 
 ### Run 1 (2026-11-19)
