@@ -129,6 +129,7 @@ Phases, each with a time budget and a gate; launching again resumes (`accel/stat
 | mr_more | 2 more minutes at lr 5e-5, gate again: 0.1320 |
 | final | all eight rows, the early-exit row included (3.22 s at 768×512: DiT 2.96 s, decode 0.26 s), and `FINAL.md` |
 | resume | second launch skipped every finished step and continued |
+| largest sizes | 1344×768, 768×1344 and 1280×704 through collect (29.5 GB peak with the VAE beside the DiT), both caches, two-track pairs (26.6 GB), `quality` and a refiner run that evaluates on them (17.2 GB) |
 | two-track pairs | 26 clips at 768×512 and 1024×576 in 3.5 min; the published refiner on the region's box, loss and score counted on the region: LPIPS 0.079 at step 0, 0.062 after 234 steps on 20 clips (PSNR 29.2 → 30.5 dB) |
 
 ## Files

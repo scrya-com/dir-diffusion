@@ -54,6 +54,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dwd_h3 import capture_last_layer, flicker_split, pack_rows, pixel_frame_count, psnr, seam_ratio  # noqa: E402
+from refine_dwd_h3 import refiner_chunk  # noqa: E402,F401
 
 DEFAULT_RUN = "johndpope/dir-diffusion-h3"
 MODES = ("two_pass", "single")
@@ -149,13 +150,6 @@ def load_refiner(path: Path, device):
     return model.to(device).eval().requires_grad_(False)
 
 
-def refiner_chunk(height: int, width: int, budget: float = 1.6e6) -> int:
-    """Frames per refiner batch for a ``height x width`` clip: as many as fit ``budget`` pixels, between 1 and 8.
-    Measured on an RTX 5090 at 768x512: 4 frames per batch take 0.26 s a clip and 2.2 GB, 8 the same time and
-    3.6 GB, so memory is what the batch costs. 1344x768 gets 1 (8 would need about 9.5 GB beside the DiT)."""
-    return int(max(1, min(8, budget // (height * width))))
-
-
 class DwdStack:
     """The DWD decoder of one exit iteration: the last-K-blocks LoRA (applied to ``dit``, off until ``on()``),
     the linear pixel head and, optionally, the refiner."""
@@ -224,7 +218,7 @@ class DwdStack:
             return head_px, head_px
         clip = head_px.contiguous(memory_format=torch.channels_last_3d) if self.channels_last else head_px
         with torch.autocast(head_px.device.type, dtype=torch.bfloat16, enabled=self.amp):
-            out = refine_clip(self.refiner, clip, latent, chunk=self.chunk or refiner_chunk(*head_px.shape[-2:]))
+            out = refine_clip(self.refiner, clip, latent, chunk=self.chunk or None)
         return out.float(), head_px
 
 
@@ -509,7 +503,7 @@ def cache(args) -> None:
     gpu_setup("accel_h3.py")
     models = load_models(args)
     dit, gen_head, net, R = models["dit"], models["gen_head"], models["net"], models["iters"]
-    stack = load_stack(args, dit, refiner=False, half_head=False)
+    stack = load_stack(args, dit, refiner=False)      # fp16 head, as at inference: fp32 would not fit at 1344x768
     out = args.out / "cache"
     out.mkdir(parents=True, exist_ok=True)
     rng = random.Random(0)
@@ -847,7 +841,7 @@ def region_decode(stack: DwdStack, h_hr: torch.Tensor, state_hr: torch.Tensor, h
     if stack.refiner is not None:
         with torch.autocast(crop.device.type, dtype=torch.bfloat16, enabled=stack.amp):
             crop = refine_clip(stack.refiner, crop.contiguous(), latent[..., y0:y1, x0:x1].contiguous(),
-                               chunk=stack.chunk or refiner_chunk(*crop.shape[-2:])).float()
+                               chunk=stack.chunk or None).float()
     out = up.clone()
     out[box_px(box)] = w_px * crop + (1.0 - w_px) * up[box_px(box)]
     return out
