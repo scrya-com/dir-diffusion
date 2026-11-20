@@ -87,7 +87,7 @@ Every path variable is listed in [`lot/lot_paths.py`](lot/lot_paths.py). A 24 GB
 
 ## Run it
 
-**ComfyUI (easiest):** see [`comfyui/`](comfyui).
+**ComfyUI:** DiR and DWD nodes are written but not yet tested on a GPU; they will land in [`comfyui/`](comfyui) once they pass.
 
 **From the command line** (prompts come from a cache of encoded captions; see [`DIR_CHEATSHEET.md`](DIR_CHEATSHEET.md), sections 2–3):
 
