@@ -241,12 +241,18 @@ def video_modulation_rewrite(block_adaln_indices: torch.Tensor, video_slice: sli
 
 def forward_video(dit, latent: torch.Tensor, t, text: torch.Tensor, *, lot=None,
                   video_extra: torch.Tensor | None = None, video_temb_delta: torch.Tensor | None = None,
-                  audio_generator: torch.Generator | None = None, dwd: dict | None = None) -> torch.Tensor:
+                  audio_generator: torch.Generator | None = None, dwd: dict | None = None,
+                  audio: torch.Tensor | None = None, t_audio: float | None = None,
+                  out: dict | None = None) -> torch.Tensor:
     """``predict`` that always runs the hand-written forward, so the hooks are available.
 
     Same inputs and output as ``predict``; ``video_extra`` and ``video_temb_delta`` are
     described on ``_lot_forward``. With neither, and ``lot=None``, it matches the dense
     ``dit(...)`` call (``parity_dir_h3.py`` checks that on the GPU).
+
+    A joint audio-video sampler (``pih3_h3``) passes its own ``audio`` ``(1, 32, 2, A)`` at cleanness ``t_audio``
+    instead of the silence noised here, and ``out`` (a dict) to get the audio velocity and the block stack's
+    output (see ``_lot_forward``). Without them nothing changes.
     """
     if latent.ndim != 5 or latent.shape[0] != 1:
         raise ValueError(f"latent must be (1, 24, T, H, W), got {tuple(latent.shape)}")
@@ -258,10 +264,13 @@ def forward_video(dit, latent: torch.Tensor, t, text: torch.Tensor, *, lot=None,
     _b, _c, latent_t, lat_h, lat_w = latent.shape
     layout = _layout(text.shape[1], latent_t, lat_h, lat_w)
     device = dit.video_patch_proj.weight.device
-    audio = _silence(latent_t, sigma_a, device, audio_generator)
+    if audio is None:
+        audio = _silence(latent_t, sigma_a, device, audio_generator)
+    else:
+        sigma_a = 1.0 - float(t_audio)
     tags = torch.ones(1, text.shape[1], dtype=torch.int64)
     return _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video, 1.0 - sigma_a,
-                        video_extra=video_extra, video_temb_delta=video_temb_delta, dwd=dwd)
+                        video_extra=video_extra, video_temb_delta=video_temb_delta, dwd=dwd, out=out)
 
 
 def run_blocks(dit, hidden: torch.Tensor, temb: torch.Tensor, block_segments, rotation,
@@ -306,7 +315,8 @@ def rerun_blocks(dit, tap: dict, temb: torch.Tensor, block_segments, rotation) -
 
 def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_audio: float, *,
                  video_extra: torch.Tensor | None = None,
-                 video_temb_delta: torch.Tensor | None = None, dwd: dict | None = None) -> torch.Tensor:
+                 video_temb_delta: torch.Tensor | None = None, dwd: dict | None = None,
+                 out: dict | None = None) -> torch.Tensor:
     """``MiniMaxH3Model.forward`` for a T2VA layout, with the target video on ``lot.layout``.
 
     ``lot=None`` is the dense forward written out (``video_patch_proj`` in,
@@ -319,6 +329,10 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
     ``dwd={"first": i, "lora": ctx}`` (dense only): after the forward, blocks ``i..`` run again with that LoRA on
     (``rerun_blocks``) and ``dwd["h"]`` gets the ``(N, hidden)`` fp32 tokens ``video_out`` would then read. The
     returned velocity is the base forward's.
+
+    ``out`` (a dict, dense only) receives ``audio`` (the audio velocity, ``(1, 32, 2, A)``), ``hidden`` (the block
+    stack's output on the target-video rows, ``(N, hidden)``, before the final norm: what a pi-H3 DWD head reads)
+    and ``temb_video`` (the video rows' timestep embedding).
     """
     from musubi_tuner.minimax_h3.packing import (
         H3RowSegment,
@@ -399,7 +413,13 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
     else:
         modulated = lot.modulate(final, hidden[0, lot_layout.target_video_segment.row_slice], temb, video_index)
         velocity = lot.project_rows(modulated, tokens, max(0.0, min(1.0, 1.0 - t_video))).unsqueeze(0)
-    video_out, _audio = unpack_targets(layout, velocity.to(torch.float32), audio_out)
+    video_out, audio_velocity = unpack_targets(layout, velocity.to(torch.float32), audio_out)
+    if out is not None:
+        if lot is not None:
+            raise ValueError("out= is dense-only")
+        out["audio"] = audio_velocity
+        out["hidden"] = hidden[0, lot_layout.target_video_segment.row_slice]
+        out["temb_video"] = temb[video_index]
     return video_out.to(latent.dtype)
 
 

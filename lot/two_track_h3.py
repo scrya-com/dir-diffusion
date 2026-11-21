@@ -67,7 +67,8 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
                       text: torch.Tensor, *, maps: UpMaps | None = None, audio_generator=None,
                       capture: dict | None = None, res_embed: "ResolutionEmbedding | None" = None,
                       video_extra: torch.Tensor | None = None, video_temb_delta: torch.Tensor | None = None,
-                      dwd: dict | None = None):
+                      dwd: dict | None = None, audio: torch.Tensor | None = None, t_audio: float | None = None,
+                      out: dict | None = None):
     """Velocities ``(v_lr, v_hr)`` of the LR latent and of the HR latent on the plan's region.
 
     ``lr`` is ``(1, 24, T, h, w)``, ``hr`` is ``(1, 24, T, 2h, 2w)``; ``v_hr`` is zero outside the
@@ -81,6 +82,8 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
     timestep row. Text and audio keep the original row.
     ``dwd={"first": i, "lora": ctx}``: as on ``h3_musubi._lot_forward``; ``dwd["h"]`` holds the DWD tokens of every
     video row (the LR grid first, then the region's HR rows), and the velocities stay the base forward's.
+    ``audio`` / ``t_audio`` / ``out``: as on ``h3_musubi.forward_video`` (a joint audio-video sampler's own audio,
+    and the audio velocity, the block output on every video row and the video timestep embedding back).
 
     With grad enabled (training) the attention patch is installed for good (``_training_patch``)
     so activation checkpointing recomputes the same attention in the backward pass.
@@ -97,7 +100,7 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
     # float32(1/3) moved the output by 3-6% rel. rms (measured, cause not found), so this forward and
     # dir_sample disagreed at a DiR run's sigmas.
     t = float(torch.as_tensor(t).reshape(-1)[0])
-    sigma_a = float(audio_sigma(1.0 - t))
+    sigma_a = float(audio_sigma(1.0 - t)) if audio is None else 1.0 - float(t_audio)
     _b, _c, frames, lat_h, lat_w = lr.shape
     layout = _layout(text.shape[1], frames, lat_h, lat_w)
     segment = layout.target_video_segment
@@ -123,7 +126,8 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
         if tuple(video_extra.shape) != tuple(video.shape):
             raise ValueError(f"video_extra {tuple(video_extra.shape)} != video rows {tuple(video.shape)}")
         video = video + video_extra.to(device=video.device, dtype=video.dtype)
-    audio = _silence(frames, sigma_a, device, audio_generator)
+    if audio is None:
+        audio = _silence(frames, sigma_a, device, audio_generator)
     audio_rows = dit.audio_patch_proj(pack_audio_rows(audio.to(device)).to(torch.float32)).to(dit.dtype)
     text_rows = dit.token_refiner(dit.condition_proj(text.to(device, dit.dtype)))
     hidden = torch.cat([text_rows, audio_rows, video], dim=1)
@@ -189,12 +193,20 @@ def two_track_forward(dit, lr: torch.Tensor, hr: torch.Tensor | None, plan: TwoT
     if again is not None:
         dwd["h"] = (final.norm(again[:, segment.start:]) * (1.0 + scale[video_index])
                     + shift[video_index])[0].to(torch.float32)
-    out = final.video_out(states.to(torch.float32))
-    v_lr = _unpack_video_rows(out[:, :lr_count], layout.target_video).to(lr.dtype)
+    if out is not None:
+        from musubi_tuner.minimax_h3.packing import _unpack_audio_rows
+
+        a_index = timesteps.audio_timestep_index
+        a_states = final.norm(hidden[:, layout.target_audio_segment.row_slice]) * (1.0 + scale[a_index]) + shift[a_index]
+        out["audio"] = _unpack_audio_rows(final.audio_out(a_states.to(torch.float32)), layout.target_audio_frames)
+        out["hidden"] = hidden[0, segment.start:]
+        out["temb_video"] = temb[video_index]
+    velocity = final.video_out(states.to(torch.float32))
+    v_lr = _unpack_video_rows(velocity[:, :lr_count], layout.target_video).to(lr.dtype)
     if not hr_count:
         return v_lr, None
-    full = out.new_zeros(1, 4 * lr_count, out.shape[-1])
-    full[:, plan.hr_index] = out[:, lr_count:]
+    full = velocity.new_zeros(1, 4 * lr_count, velocity.shape[-1])
+    full[:, plan.hr_index] = velocity[:, lr_count:]
     return v_lr, _unpack_video_rows(full, hr_layout.target_video).to(hr.dtype)
 
 
