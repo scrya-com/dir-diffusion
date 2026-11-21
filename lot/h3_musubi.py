@@ -22,6 +22,7 @@ rows are on the video shift (12). They carry no loss.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from dataclasses import replace
@@ -173,15 +174,48 @@ def drop_blocks(dit, indices) -> None:
     """Skip blocks ``indices`` (they return their input), keeping every index and name in place, so LoRA files,
     block swap and the DWD tail (``dit.blocks[first:]``) are unchanged. The weights stay loaded: this measures
     speed and quality, not memory."""
+    set_blocks_dropped(dit, indices, True)
+    if indices:
+        print(f"LOT_H3 kind=drop_blocks blocks={','.join(map(str, indices))} kept={len(dit.blocks) - len(indices)}",
+              flush=True)
+
+
+def _skip_block(_self, hidden, *_args, **_kwargs):
+    return hidden
+
+
+def set_blocks_dropped(dit, indices, dropped: bool) -> None:
+    """Skip (``dropped``) or run blocks ``indices``: the skip is an instance ``forward`` that returns its input;
+    deleting it brings back the class's own ``forward``."""
     import types
 
     for i in indices:
         if not 0 <= i < len(dit.blocks):
             raise ValueError(f"block {i} out of range 0..{len(dit.blocks) - 1}")
-        dit.blocks[i].forward = types.MethodType(lambda _self, hidden, *_a, **_k: hidden, dit.blocks[i])
-    if indices:
-        print(f"LOT_H3 kind=drop_blocks blocks={','.join(map(str, indices))} kept={len(dit.blocks) - len(indices)}",
-              flush=True)
+        block = dit.blocks[i]
+        if dropped:
+            block.forward = types.MethodType(_skip_block, block)
+        elif "forward" in vars(block):
+            del block.forward
+
+
+def blocks_are_dropped(dit, indices) -> list[bool]:
+    return ["forward" in vars(dit.blocks[i]) for i in indices]
+
+
+@contextlib.contextmanager
+def blocks_dropped(dit, indices, dropped: bool = True):
+    """Skip (or, ``dropped=False``, run) blocks ``indices`` inside the block, then restore each block as it was.
+    One model copy serves as both the full model and the dropped-block model (``distill_tiny_h3.py``).
+    With activation checkpointing the backward recomputes through whatever ``forward`` a block has THEN: keep
+    the same setting from a grad forward through its backward."""
+    before = blocks_are_dropped(dit, indices)
+    set_blocks_dropped(dit, indices, dropped)
+    try:
+        yield
+    finally:
+        for i, was in zip(indices, before):
+            set_blocks_dropped(dit, [i], was)
 
 
 def make_lora(dit, rank: int):
