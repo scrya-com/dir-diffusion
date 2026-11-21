@@ -241,7 +241,7 @@ def video_modulation_rewrite(block_adaln_indices: torch.Tensor, video_slice: sli
 
 def forward_video(dit, latent: torch.Tensor, t, text: torch.Tensor, *, lot=None,
                   video_extra: torch.Tensor | None = None, video_temb_delta: torch.Tensor | None = None,
-                  audio_generator: torch.Generator | None = None) -> torch.Tensor:
+                  audio_generator: torch.Generator | None = None, dwd: dict | None = None) -> torch.Tensor:
     """``predict`` that always runs the hand-written forward, so the hooks are available.
 
     Same inputs and output as ``predict``; ``video_extra`` and ``video_temb_delta`` are
@@ -261,16 +261,20 @@ def forward_video(dit, latent: torch.Tensor, t, text: torch.Tensor, *, lot=None,
     audio = _silence(latent_t, sigma_a, device, audio_generator)
     tags = torch.ones(1, text.shape[1], dtype=torch.int64)
     return _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video, 1.0 - sigma_a,
-                        video_extra=video_extra, video_temb_delta=video_temb_delta)
+                        video_extra=video_extra, video_temb_delta=video_temb_delta, dwd=dwd)
 
 
-def run_blocks(dit, hidden: torch.Tensor, temb: torch.Tensor, block_segments, rotation) -> torch.Tensor:
+def run_blocks(dit, hidden: torch.Tensor, temb: torch.Tensor, block_segments, rotation,
+               tap: dict | None = None) -> torch.Tensor:
     """The DiT block stack as ``MiniMaxH3Model.forward`` runs it: block streaming, and activation
-    checkpointing in training mode. Returns the hidden states on the execution device."""
+    checkpointing in training mode. Returns the hidden states on the execution device.
+    ``tap={"first": i}`` keeps block ``i``'s input in ``tap["hidden"]`` (for ``rerun_blocks``)."""
     from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
     device = dit.video_patch_proj.weight.device
     for index, block in enumerate(dit.blocks):
+        if tap is not None and index == tap["first"]:
+            tap["hidden"] = hidden
         if dit.blocks_to_swap:
             dit.offloader.wait_for_block(index)
         if dit.gradient_checkpointing and dit.training:
@@ -286,9 +290,23 @@ def run_blocks(dit, hidden: torch.Tensor, temb: torch.Tensor, block_segments, ro
     return hidden.to(device)
 
 
+def rerun_blocks(dit, tap: dict, temb: torch.Tensor, block_segments, rotation) -> torch.Tensor:
+    """Blocks ``tap["first"]..`` again from the input ``run_blocks`` kept, inside ``tap["lora"]()`` (a context
+    manager that switches a LoRA on). The blocks before ``first`` carry no such LoRA, so the result is a full
+    forward with the LoRA on, at ``(blocks - first) / blocks`` of its cost; the first pass stays the base model's.
+    No block streaming: a streamed block has left the card by now."""
+    if dit.blocks_to_swap:
+        raise RuntimeError("the DWD tail needs every block on the card (swap 0)")
+    hidden = tap.pop("hidden")
+    with tap["lora"]():
+        for block in dit.blocks[tap["first"]:]:
+            hidden = block(hidden, temb, block_segments, rotation)
+    return hidden
+
+
 def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_audio: float, *,
                  video_extra: torch.Tensor | None = None,
-                 video_temb_delta: torch.Tensor | None = None) -> torch.Tensor:
+                 video_temb_delta: torch.Tensor | None = None, dwd: dict | None = None) -> torch.Tensor:
     """``MiniMaxH3Model.forward`` for a T2VA layout, with the target video on ``lot.layout``.
 
     ``lot=None`` is the dense forward written out (``video_patch_proj`` in,
@@ -297,6 +315,10 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
     and ``video_temb_delta`` ``(temb_dim,)`` is added to the video's timestep
     embedding as a NEW row, used only by the target-video rows and the final layer's
     video head. Text and audio keep the original row.
+
+    ``dwd={"first": i, "lora": ctx}`` (dense only): after the forward, blocks ``i..`` run again with that LoRA on
+    (``rerun_blocks``) and ``dwd["h"]`` gets the ``(N, hidden)`` fp32 tokens ``video_out`` would then read. The
+    returned velocity is the base forward's.
     """
     from musubi_tuner.minimax_h3.packing import (
         H3RowSegment,
@@ -355,7 +377,9 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
             rows.block_adaln_indices[0], lot_layout.target_video_segment.row_slice, new_index)
         video_index = new_index
 
-    hidden = run_blocks(dit, hidden, temb, block_segments, rotation)
+    if dwd is not None and lot is not None:
+        raise ValueError("the DWD tail is dense-only")
+    hidden = run_blocks(dit, hidden, temb, block_segments, rotation, tap=dwd)
 
     # 3. Final layer: shared norm + AdaLN, then the extent heads in place of video_out.
     final = dit.final_layer
@@ -368,6 +392,10 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
         video_states = final.norm(hidden[:, lot_layout.target_video_segment.row_slice])
         video_states = video_states * (1.0 + scale[video_index]) + shift[video_index]
         velocity = final.video_out(video_states.to(torch.float32))
+        if dwd is not None:
+            again = rerun_blocks(dit, dwd, temb, block_segments, rotation)
+            again = final.norm(again[:, lot_layout.target_video_segment.row_slice])
+            dwd["h"] = (again * (1.0 + scale[video_index]) + shift[video_index])[0].to(torch.float32)
     else:
         modulated = lot.modulate(final, hidden[0, lot_layout.target_video_segment.row_slice], temb, video_index)
         velocity = lot.project_rows(modulated, tokens, max(0.0, min(1.0, 1.0 - t_video))).unsqueeze(0)

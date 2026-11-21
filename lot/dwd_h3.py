@@ -51,6 +51,13 @@ def pack_rows(latent: torch.Tensor) -> torch.Tensor:
     return rows.reshape(t * (h // 2) * (w // 2), c * 4)
 
 
+def unpack_rows(rows: torch.Tensor, latent_t: int, token_h: int, token_w: int) -> torch.Tensor:
+    """Inverse of ``pack_rows``: ``(T*th*tw, 96)`` -> ``(1, 24, T, 2*th, 2*tw)``."""
+    c = rows.shape[-1] // 4
+    x = rows.reshape(latent_t, token_h, token_w, c, 2, 2).permute(3, 0, 1, 4, 2, 5)
+    return x.reshape(1, c, latent_t, 2 * token_h, 2 * token_w)
+
+
 def pixels_to_tokens(pixels: torch.Tensor, latent_t: int) -> torch.Tensor:
     """``(1, 3, F, 16H, 16W)`` pixels -> ``(N, 12288)`` per-token targets, ``N = T * (H/2) * (W/2)``.
 
@@ -218,8 +225,14 @@ class DWDHead(nn.Module):
     def features(self, h: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         return (torch.cat([h.float(), s.float()], dim=-1) - self.mean) / self.scale
 
+    def half_weights(self) -> "DWDHead":
+        """Keep the map in fp16 (half the memory, about 3x faster); the feature statistics stay fp32."""
+        self.weight.data = self.weight.data.half()
+        self.bias.data = self.bias.data.half()
+        return self
+
     def forward(self, h: torch.Tensor, s: torch.Tensor, classes: torch.Tensor) -> torch.Tensor:
-        x = self.features(h, s)
+        x = self.features(h, s).to(self.weight.dtype)
         if self.classes == 1:
             return x @ self.weight[0].T + self.bias[0]
         out = x.new_empty(x.shape[0], self.weight.shape[1])

@@ -65,7 +65,8 @@ def video_extra(head, est_lr: torch.Tensor, est_hr: torch.Tensor | None = None, 
 def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, sigmas: list, mix_state: bool,
                          switch: int, seed: int, latent_t: int = 1, maps=None, region=None, box=None,
                          block: int = 25, alpha: float = 0.5, floor=None, feather: float = 4.0,
-                         switch_upscale: str = "crop", final: str = "pixel", repeat_last: int = 0):
+                         switch_upscale: str = "crop", final: str = "pixel", repeat_last: int = 0,
+                         dwd: dict | None = None):
     """The sampler of the module docstring. Returns ``(latent, info)`` at ``width x height``.
 
     ``info`` has ``mask``, ``tokens`` (video tokens per forward), ``dit_s`` (seconds inside the DiT),
@@ -73,6 +74,8 @@ def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, s
     ``switch == len(sigmas)`` never opens the region: the result is DiR at half resolution, upscaled.
     ``repeat_last`` runs the last iteration (same ``r`` and sigma) that many more times on the packed
     sequence, each time from the newest estimates; it only has an effect with ``mix_state``.
+    ``dwd`` (see ``two_track_forward``) goes to the last forward only; ``info`` then also has ``state_lr`` and
+    ``state_hr``, the states that forward read (the DWD head's ``s`` input).
     """
     from dir_h3 import next_state
     from mixed_res import TwoTrackPlan, region_mask
@@ -85,14 +88,16 @@ def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, s
     tok_h, tok_w = lat_h // 2, lat_w // 2               # LR token grid
     info = {"tokens": [], "dit_s": 0.0}
 
-    def forward(state_lr, state_hr, plan, r, extra, capture=None):
+    def forward(state_lr, state_hr, plan, r, extra, capture=None, last=False):
+        if last:
+            info.update(state_lr=state_lr, state_hr=state_hr)
         torch.cuda.synchronize()
         start = time.perf_counter()
         # same silent-audio noise at every iteration, as dir_sample
         audio = torch.Generator("cuda").manual_seed(seed + 1)
         out = two_track_forward(dit, state_lr, state_hr, plan, 1.0 - sigmas[r], text, maps=maps,
                                 audio_generator=audio, capture=capture, video_extra=extra,
-                                video_temb_delta=head.r_embed[r])
+                                video_temb_delta=head.r_embed[r], dwd=dwd if last else None)
         torch.cuda.synchronize()
         info["dit_s"] += time.perf_counter() - start
         return out
@@ -101,7 +106,7 @@ def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, s
     est_lr, state_lr, states = torch.zeros_like(z_lr), z_lr, None
     for r in range(switch):
         capture = {"block": block} if region is not None and r == switch - 1 else None
-        v_lr, _ = forward(state_lr, None, None, r, video_extra(head, est_lr), capture)
+        v_lr, _ = forward(state_lr, None, None, r, video_extra(head, est_lr), capture, last=r == iters - 1)
         if capture is not None:
             states = capture["states"]
         est_lr = state_lr.float() + sigmas[r] * v_lr.float()
@@ -116,7 +121,7 @@ def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, s
     info.update(mask=mask, lr=est_lr)
     if switch == iters or not mask.any():
         for r in range(switch, iters):                  # no region: finish at LR
-            v_lr, _ = forward(state_lr, None, None, r, video_extra(head, est_lr))
+            v_lr, _ = forward(state_lr, None, None, r, video_extra(head, est_lr), last=r == iters - 1)
             est_lr = state_lr.float() + sigmas[r] * v_lr.float()
             info["tokens"].append(tok_h * tok_w * latent_t)
             if r + 1 < iters:
@@ -125,6 +130,7 @@ def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, s
         return upscale(est_lr), info
 
     plan = TwoTrackPlan(mask).to("cuda")
+    info["hr_index"] = plan.hr_index
     # The HR track's first estimate: U(x0_lr). ``crop`` round-trips only the region's bounding box through
     # the VAE and fills the rest with a latent x2, which the HR track never reads.
     if switch_upscale == "vae":
@@ -140,7 +146,8 @@ def dir_two_track_sample(dit, head, text, upscale, *, height: int, width: int, s
     state_hr = sigmas[switch] * z_hr + (1.0 - sigmas[switch]) * est_hr
     mixed = list(range(switch, iters)) + [iters - 1] * repeat_last
     for step, r in enumerate(mixed):
-        v_lr, v_hr = forward(state_lr, state_hr, plan, r, video_extra(head, est_lr, est_hr, plan))
+        v_lr, v_hr = forward(state_lr, state_hr, plan, r, video_extra(head, est_lr, est_hr, plan),
+                             last=step + 1 == len(mixed))
         est_lr = state_lr.float() + sigmas[r] * v_lr.float()
         est_hr = state_hr.float() + sigmas[r] * v_hr.float()          # v_hr is zero outside the region
         info["tokens"].append(plan.lr_count + plan.hr_count)
@@ -247,17 +254,19 @@ def schedule_of(args, config: dict):
 
 
 def pixel_compose_crop(vae, hr_latent: torch.Tensor, lr_latent: torch.Tensor, weight: torch.Tensor,
-                       margin: int = 4) -> torch.Tensor:
+                       margin: int = 4, lr_px: torch.Tensor | None = None) -> torch.Tensor:
     """``pixel_compose`` with the HR latent decoded only over the region's bounding box (union over frames, plus
     ``margin`` latent pixels of context), instead of the whole full-resolution frame. The LR track is decoded whole
     and upscaled x2 as before. Outside the box the weight is 0, so only the decoder's context at the box edge can
-    differ from the full decode (``margin`` sets how much)."""
+    differ from the full decode (``margin`` sets how much). ``lr_px`` ``(1, 3, F, h, w)``: the LR track's pixels
+    from another decoder (DWD), in place of its VAE decode."""
     from h3_musubi import pixel_frames
 
     dtype = next(vae.parameters()).dtype
     w = weight[0, 0].float()                                                    # (T, H, W) HR latent grid
     ys, xs = torch.nonzero(w.amax(0) > 0, as_tuple=True)
-    lr_px = vae.decode(lr_latent.to("cuda", dtype)).clamp(-1, 1).to("cpu", torch.float16)
+    if lr_px is None:
+        lr_px = vae.decode(lr_latent.to("cuda", dtype)).clamp(-1, 1).to("cpu", torch.float16)
     if hr_latent.shape[2] == 1:
         lr_px = lr_px[:, :, :1]
     frames = lr_px.shape[2]

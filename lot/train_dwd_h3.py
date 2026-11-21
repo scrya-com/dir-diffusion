@@ -821,10 +821,10 @@ def ft(args) -> None:
             log.append({"step": step, **m})
             print(f"LOT_H3 kind=dwd_ft_eval step={step} {fmt(m)}", flush=True)
             if (args.gate_minutes and (time.time() - t_start) / 60 >= args.gate_minutes
-                    and m.get(args.gate_key, -math.inf) < args.gate_min):
+                    and not args.gate_min <= m.get(args.gate_key, math.nan) <= args.gate_max):
                 checkpoint()
                 print(f"LOT_H3 kind=dwd_ft_gate_failed step={step} {args.gate_key}={m.get(args.gate_key)} "
-                      f"needed={args.gate_min} out={args.out}", flush=True)
+                      f"needed={args.gate_min}..{args.gate_max} out={args.out}", flush=True)
                 raise SystemExit(3)
             if score_of(m) > best:
                 best = score_of(m)
@@ -989,6 +989,7 @@ def main() -> None:
     f.add_argument("--gate-minutes", type=float, default=0, help="at the first eval after this, stop (exit 3) unless")
     f.add_argument("--gate-key", default="psnr", help="... this eval value (e.g. psnr@collect_w1_iso) ...")
     f.add_argument("--gate-min", type=float, default=-math.inf, help="... is at least this")
+    f.add_argument("--gate-max", type=float, default=math.inf, help="... and at most this (e.g. for lpips)")
     f.add_argument("--select", choices=["psnr", "lpips"], default="psnr",
                    help="what a new best means: higher PSNR, or lower LPIPS")
     f.add_argument("--eval-minutes", type=float, default=15)
