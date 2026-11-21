@@ -303,12 +303,13 @@ def decode(model: dict, out: dict, latent_shape: tuple) -> torch.Tensor:
 @torch.no_grad()
 def pih3_two_track(model: dict, text: torch.Tensor, *, height: int, width: int, latent_t: int, seed: int,
                    two_track: dict, switch: int = 1, alpha: float = 0.5, floor=None, box=None,
-                   timer: dict | None = None) -> dict:
+                   timer: dict | None = None, up=None) -> dict:
     """MPEG-Diffusion's two-track sampler on pi-H3, DWD on both tracks.
 
     Steps ``0 .. switch - 1`` denoise the whole clip at half resolution; then the region head (on the LR track's
     block states, MPEG-Diffusion's) picks a region, whose bounding box over the whole clip becomes the HR track:
-    the clean LR estimate x2 (latent, trilinear), re-noised with fresh noise to the next sigma. The remaining steps
+    the clean LR estimate x2 (latent: trilinear, or ``up``, a learned upsampler, since interpolated latents make
+    pi-H3 draw ghosts), re-noised with fresh noise to the next sigma. The remaining steps
     run one packed sequence (dual-resolution attention with the K/V maps). Audio is denoised jointly throughout.
 
     The HR region is a box so the Sol refiner, which needs a full token grid, decodes it from real HR tokens.
@@ -365,7 +366,14 @@ def pih3_two_track(model: dict, text: torch.Tensor, *, height: int, width: int, 
     rect = torch.zeros(latent_t, tok_h, tok_w, dtype=torch.bool)
     rect[:, y0:y1, x0:x1] = True
     plan = TwoTrackPlan(rect).to("cuda")
-    est_hr = F.interpolate(est_lr, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
+    if up is not None:                                     # a latent upsampler (latent_up_h3.load_up), timed as DiT
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        est_hr = up(est_lr).float()
+        torch.cuda.synchronize()
+        timer["dit_s"] += time.perf_counter() - start
+    else:
+        est_hr = F.interpolate(est_lr, scale_factor=(1, 2, 2), mode="trilinear", align_corners=False)
     z_hr = torch.randn(1, 24, latent_t, 2 * lat_h, 2 * lat_w, device="cuda",
                        generator=torch.Generator("cuda").manual_seed(seed + 2))
     x_hr = sigmas[switch] * z_hr + (1.0 - sigmas[switch]) * est_hr
