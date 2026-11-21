@@ -1,6 +1,6 @@
 # PMD on MiniMax H3: Posterior Matching Distillation
 
-> **Research code, not yet run on a GPU.** Everything below the paper's own settings is a guess, listed in full in section 3. CPU tests: `CUDA_VISIBLE_DEVICES="" python3 lot/test_pmd_h3.py` (15 tests).
+> **Research code, not yet run on a GPU.** Everything below the paper's own settings is a guess, listed in full in section 3. CPU tests: `CUDA_VISIBLE_DEVICES="" python3 lot/test_pmd_h3.py` (16 tests).
 
 **PMD is the method of Hidir Yesiltepe, Julius Berner, Arash Vahdat and Pinar Yanardag**: ["Posterior Matching Distillation"](https://arxiv.org/abs/2611.26629), arXiv 2611.26629 (Virginia Tech and NVIDIA; project page pmd-distillation.github.io). Their code is not released. This port to H3 is independent and is not affiliated with the authors, with MiniMax, or with ByteDance Seed (DiR).
 
@@ -79,7 +79,7 @@ There is one DiT in memory.
 - It is *not* CFG and *not* many-step sampling. Tilt=Shift needs a posterior mean, and appendix E.1 notes that a CFG output is not the posterior mean of any distribution. A many-step ODE sample is one posterior *sample*, not the mean.
 - So the default teacher costs K = 4 forward passes per update.
 - H3's published checkpoint is CFG-distilled (DIR_CHEATSHEET.md), so its one-call output already carries baked-in guidance. That breaks the exact-denoiser assumption somewhat, but it is the closest thing to the paper's teacher.
-- `--teacher-cfg S --neg-te EMPTY_te.safetensors` applies real CFG to the teacher. It doubles the teacher cost (8 forwards per update) and departs from the paper. No empty-prompt embedding exists in our caches yet.
+- `--teacher-cfg S --neg-te EMPTY_te.safetensors` applies real CFG to the teacher. It doubles the teacher cost (8 forwards per update) and departs from the paper. An empty-prompt embedding exists at `/media/2TB/lora-data/h3_lot/cache_iso3d/uncond_minimaxh3_te.safetensors` (not checked for which prompt it encodes).
 - The many-step cost belongs to **evaluation** (the 20-step dense20 reference), not to training.
 
 **Starting point.** The default is `--init-run johndpope/dir-diffusion-h3`, the published DiR checkpoint, with its own grid of 1 / 0.947 / 0.857 / 0.667. `--init-run none` gives the paper's setting: base H3 plus a fresh LoRA, on H3's `grid` (1 / 0.973 / 0.923 / 0.8).
@@ -203,7 +203,8 @@ python3 lot/pmd_h3.py probe "${O[@]}" --name dir4 --dir-run johndpope/dir-diffus
 python3 lot/pmd_h3.py probe "${O[@]}" --name dir2 --dir-run johndpope/dir-diffusion-h3 --iters 2 --seeds 4
 python3 lot/pmd_h3.py probe "${O[@]}" --name pmd2 --pmd lot/runs/pmd_trial --levels 0,2 --seeds 4
 python3 lot/pmd_h3.py probe "${O[@]}" --name pmd4 --pmd lot/runs/pmd_trial --levels 0,1,2,3 --seeds 4
-python3 lot/pmd_h3.py score --out lot/runs/probe_pmd --names dir4 dir2 pmd2 pmd4 --pass pmd2 dir4 dir2
+python3 lot/pmd_h3.py probe "${O[@]}" --name pmd2_eta0 --pmd lot/runs/pmd_trial --levels 0,2 --eta 0 --seeds 4   # same-noise path
+python3 lot/pmd_h3.py score --out lot/runs/probe_pmd --names dir4 dir2 pmd2 pmd4 pmd2_eta0 --pass pmd2 dir4 dir2
 ```
 
 `probe` uses `probe_dir_h3.py`'s held-out items, crops and noise: seed 0 is `z = randn(seed i)`, with audio seed 7i. `score` decodes with the VAE and writes `SCORE.md` and `score.json`. It reports two numbers, each with its standard error:
@@ -216,4 +217,4 @@ python3 lot/pmd_h3.py score --out lot/runs/probe_pmd --names dir4 dir2 pmd2 pmd4
 
 PMD-2 against DiR-4 on LPIPS is reported as well. Look at the clips by eye too: `python3 lot/probe_dir_h3.py --out lot/runs/probe_pmd --decode pmd2 dir4 dir2` writes side-by-side mp4s (dense20, then every seed of each name), since `probe` stores its latents in `probe_dir_h3.py`'s format.
 
-**Caveat.** LPIPS to a same-z dense20 favours deterministic samplers. PMD re-noises with fresh noise (CPS at η = 0.9) and draws `u`, so even a perfect PMD student does not reproduce dense20's trajectory from `z`. Read that column together with diversity. The paper's own trade-off holds too: PMD-only training (no GAN) gives the most diverse but least faithful samples (appendix E.1). A failed fidelity check without the GAN term is therefore expected; it is not proof that the code is wrong.
+**Caveat.** LPIPS to a same-z dense20 favours deterministic samplers. PMD re-noises with fresh noise (CPS at η = 0.9) and draws `u`, so even a perfect PMD student does not reproduce dense20's trajectory from `z`. At η = 0.9 about 99% of the noise is replaced between steps (sin²(0.45π) ≈ 0.976 of the variance), so the PASS line's fidelity half favours DiR almost by construction. `pmd2_eta0` re-noises with the state's own implied noise (η = 0, deterministic between steps, still with student draws `u`), which gives a fidelity number on a same-noise path; read it next to `pmd2`'s diversity. The paper's own trade-off holds too: PMD-only training (no GAN) gives the most diverse but least faithful samples (appendix E.1). A failed fidelity check without the GAN term is therefore expected; it is not proof that the code is wrong.

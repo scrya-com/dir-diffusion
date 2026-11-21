@@ -289,6 +289,37 @@ def test_zero_init_noise_input_leaves_the_starting_model():
     assert not torch.allclose(model.student(z, u1, 2, text, 0), mixed)
 
 
+def test_dir_head_path_the_default_init():
+    """The default init (the published DiR run) sends the head through every student call: x0_proj of a ZERO
+    estimate (its bias rows) added to the noise input, and r_embed[k] as the video timestep delta. The teacher sees
+    neither. At dial 0 the student is the DiR generator's own call with that estimate."""
+    from dir_h3 import DirHead
+
+    model, z, text, _ = toy_model()
+    head = DirHead(16, 8, 4)
+    with torch.no_grad():
+        head.r_embed.normal_(0, 0.5)
+        head.x0_proj.bias.normal_(0, 0.5)                          # trained from zero-init: the bias moved
+    model.head = head
+    model.dials = [0.0, 0.0, 0.0, 0.0]
+    seen = {}
+
+    def spy(dit, latent, t, text, *, video_extra=None, video_temb_delta=None, audio_generator=None):
+        seen.update(extra=None if video_extra is None else tuple(video_extra.shape),
+                    delta=None if video_temb_delta is None else video_temb_delta.clone())
+        return toy_forward(dit, latent, t, text, video_extra=video_extra, video_temb_delta=video_temb_delta)
+
+    model.forward = spy
+    got = model.student(z, torch.randn_like(z), 2, text, 0)
+    assert seen["extra"] == (1, 2 * 2 * 3, 16) and torch.equal(seen["delta"], head.r_embed[2])
+    rows = head.x0_proj.bias.view(1, 1, -1).expand(1, 12, 16)
+    with model.student_modes():
+        want = z + 0.857 * toy_forward(model.dit, z, 1.0 - 0.857, text, video_extra=rows, video_temb_delta=head.r_embed[2])
+    assert torch.allclose(got, want, atol=1e-6)
+    model.teacher(z, 0.857, text, 0)
+    assert seen["extra"] is None and seen["delta"] is None
+
+
 def test_replayed_gradients_equal_direct_autograd():
     model, z, text, _ = toy_model(lora_last=1)
     with torch.no_grad():
