@@ -256,6 +256,13 @@ def test_helpers():
     assert D.on_policy_prob(0.1, 0.25, 0.5) == 0.0 and D.on_policy_prob(0.3, 0.25, 0.5) == 0.5
 
 
+def test_rollout_gate_is_relative():
+    assert D.rollout_gate(0.0, 0.0, 0.6) and D.rollout_gate(0.1, 0.12, 0.6)   # replay noise well under the gap: ok
+    assert not D.rollout_gate(0.6, 0.0, 0.6)                                  # teacher is the tiny model: toggle broken
+    assert not D.rollout_gate(0.0, 0.6, 0.6)                                  # student is the full model: toggle broken
+    assert not D.rollout_gate(0.0, 0.0, 0.0)
+
+
 def probe_files(name, offset):
     torch.manual_seed(0)
     pub = {(i, f"pub_r{r}"): torch.randn(1, 24, 2, 4, 4) for i in range(3) for r in range(1, 5)}

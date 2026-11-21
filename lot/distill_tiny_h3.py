@@ -292,7 +292,7 @@ def train(args) -> None:
     from lot_paths import LOT_H3_STILLS_CACHE
 
     caches = args.cache or [Path(p) for p in os.environ.get("ACCEL_CACHES", "").split(":") if p] or [LOT_H3_STILLS_CACHE]
-    probe_cache = args.probe_cache or LOT_H3_STILLS_CACHE
+    probe_cache = args.probe_cache = args.probe_cache or LOT_H3_STILLS_CACHE
     drop = H3_TINY_DROP if args.drop == "h3tiny" else tuple(sorted({int(x) for x in args.drop.replace(",", " ").split()}))
     sizes = parse_sizes(args.sizes)
     train_h3.CROP_MULTIPLE = 2
@@ -484,11 +484,21 @@ def train(args) -> None:
     print(f"{TAG} event=done steps={state['step']} hours={state['elapsed'] / 3600:.2f} best={state['best']} ok=1", flush=True)
 
 
+def rollout_gate(teacher_vs_pub: float, student_vs_tiny: float, pub_vs_tiny: float, fraction: float = 0.25) -> bool:
+    """``--check``: the toggle works when the teacher reproduces the full model's saved rollout and the student the untuned
+    tiny one, each far closer than the two models are to each other. Relative, not bit-exact: the saved rollouts come
+    from another process (eval-mode load, its own int8 autotune choices), and small differences compound over iterations."""
+    return teacher_vs_pub < fraction * pub_vs_tiny and student_vs_tiny < fraction * pub_vs_tiny
+
+
 def check(args, distill, probe, weights, load, opt, params, sizes, train_items, rng) -> None:
-    """Rollouts on probe item 0 against ``probe_dir_h3.py``'s (teacher = pub.pt, untuned student = tiny.pt),
-    then ``--check-steps`` updates (half on-policy), the time and the memory peak. Writes nothing."""
+    """Rollouts on probe item 0 against ``probe_dir_h3.py``'s (teacher = pub.pt, untuned student = tiny.pt) at r = 1
+    (one forward from (z, 0)) and r = R, the save path's LoRA merge on the real files, then ``--check-steps`` updates
+    (half on-policy; the first on the largest crop of a stills item, so the memory peak is the worst case), the time
+    and the memory peak. Writes nothing."""
     import train_dir_h3
     import train_h3
+    from safetensors.torch import load_file
 
     device = distill.device
     ok = True
@@ -499,31 +509,44 @@ def check(args, distill, probe, weights, load, opt, params, sizes, train_items, 
         z = torch.randn(x0.shape, device=device, generator=torch.Generator(device).manual_seed(i))
         teacher = distill.final(False, z, text, 7 * i)
         student = distill.final(True, z, text, 7 * i)
-        r = distill.iters
-        t_pub = mad(teacher[-1], pub[(i, f"pub_r{r}")])
-        s_tiny = mad(student[-1], tiny[(i, f"tiny_r{r}")])
-        gap = mad(student[-1], teacher[-1])
-        ok = t_pub < 0.05 and s_tiny < 0.05 and gap > 0.3
-        print(f"{TAG} event=check_rollouts teacher_vs_pub={t_pub:.4f} student_vs_tiny={s_tiny:.4f} "
-              f"student_vs_teacher={gap:.4f} (probe: {mad(tiny[(i, f'tiny_r{r}')], pub[(i, f'pub_r{r}')]):.4f}) ok={int(ok)}",
-              flush=True)
+        for r in (1, distill.iters):
+            t_pub = mad(teacher[r - 1], pub[(i, f"pub_r{r}")])
+            s_tiny = mad(student[r - 1], tiny[(i, f"tiny_r{r}")])
+            base = mad(tiny[(i, f"tiny_r{r}")], pub[(i, f"pub_r{r}")])
+            good = rollout_gate(t_pub, s_tiny, base)
+            ok = ok and good
+            print(f"{TAG} event=check_rollouts r={r} teacher_vs_pub={t_pub:.4f} student_vs_tiny={s_tiny:.4f} "
+                  f"student_vs_teacher={mad(student[r - 1], teacher[r - 1]):.4f} pub_vs_tiny={base:.4f} ok={int(good)}",
+                  flush=True)
+    pub_lora = load_file(str(args.run / "lora_gen.safetensors"))
+    delta_state = {k: v.detach().cpu() for k, v in distill.delta_net.state_dict().items()}
+    merged = merge_lora_states(pub_lora, delta_state)
+    rank = next(v.shape[0] for k, v in merged.items() if k.endswith(".lora_down.weight"))
+    good = set(merged) == set(pub_lora) and rank == args.rank + next(
+        v.shape[0] for k, v in pub_lora.items() if k.endswith(".lora_down.weight"))
+    ok = ok and good
+    print(f"{TAG} event=check_merge keys={len(merged)} rank={rank} ok={int(good)}", flush=True)
+    del pub_lora, delta_state, merged
+    stills = [e for e in train_items if Path(e[0]).parent == Path(args.probe_cache)] or train_items
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     for step in range(args.check_steps):
         opt.zero_grad(set_to_none=True)
-        losses = []
+        losses, shapes = [], []
         for j in range(args.accum):
-            train_h3.MAX_LATENT_HW = sizes[(step * args.accum + j) % len(sizes)] if step else max(sizes, key=lambda s: s[0] * s[1])
-            x0, text = train_dir_h3.load_item(rng.choice(train_items), rng, device, args.frames)
+            first = step == 0 and j == 0
+            train_h3.MAX_LATENT_HW = max(sizes, key=lambda s: s[0] * s[1]) if first else sizes[(step * args.accum + j) % len(sizes)]
+            x0, text = train_dir_h3.load_item(rng.choice(stills if first else train_items), rng, device, args.frames)
             s = distill.sample(torch.randn_like(x0), text, rng.randrange(2**31 - 1), on_policy=bool(j % 2), weights=weights,
                                loss_scale=1.0 / args.accum)
             losses.append(s["loss"])
+            shapes.append("x".join(map(str, x0.shape[2:])))
             ok = ok and math.isfinite(s["loss"])
         grads = sum(float(p.grad.abs().sum()) for p in params if p.grad is not None)
         ok = ok and grads > 0
         torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
         opt.step()
-        print(f"{TAG} event=check_step step={step} loss={sum(losses) / len(losses):.5f} grad_sum={grads:.4g} "
+        print(f"{TAG} event=check_step step={step} shapes={shapes} loss={sum(losses) / len(losses):.5f} grad_sum={grads:.4g} "
               f"seconds={time.perf_counter() - started:.1f} peak_mb={torch.cuda.max_memory_allocated() / 2**20:.0f}", flush=True)
     peak = torch.cuda.max_memory_allocated() / 2**20
     reserved = torch.cuda.max_memory_reserved() / 2**20
