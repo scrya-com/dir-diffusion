@@ -17,7 +17,7 @@ setproctitle("dwd:sgd lr=3e-5 run_v1")   # <project>:<phase> <the arguments that
 
 ## The reference to beat: pi-H3
 
-**pi-H3** is the top-tier few-step MiniMax H3: the official 2/4-step model with DWD, by **Hansheng Chen, Shengqu Cai, Jiaming Song, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas** (the DWD paper's own authors, Stanford University and Luma AI; [blog](https://hanshengchen.com/blog/pi-h3/), [weights](https://huggingface.co/Lakonik/pi-H3)). It beats our stack on both fidelity and speed. New work must beat it or build on it.
+**pi-H3** is the top-tier few-step MiniMax H3: the official 2/4-step model with DWD, by **Hansheng Chen, Shengqu Cai, Jiaming Song, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas** (Stanford University and Luma AI; five of the six also wrote the DWD paper; [blog](https://hanshengchen.com/blog/pi-h3/), [weights](https://huggingface.co/Lakonik/pi-H3)). It beats our stack on both fidelity and speed. New work must beat it or build on it.
 - **DiR + our DWD** (`johndpope/dir-diffusion-h3`, `-dwd` v0.2) is our earlier port; compare against pi-H3, not against DiR alone.
 - How to run pi-H3 in this pipeline, and the parity with the authors' ComfyUI path: [`docs/PIH3.md`](docs/PIH3.md). Select it with `--generator pih3` (`lot/generators.py`).
 

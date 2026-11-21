@@ -1,6 +1,6 @@
 # pi-H3 in this pipeline
 
-**pi-H3** is the official 2- and 4-step MiniMax H3 with DWD (decoding without a decoder), by **Hansheng Chen, Shengqu Cai, Jiaming Song, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas** (Stanford University; part of the work at Luma AI). They also wrote DWD, with Jan Ackermann and Rayhan Zirvi.
+**pi-H3** is the official 2- and 4-step MiniMax H3 with DWD (decoding without a decoder), by **Hansheng Chen, Shengqu Cai, Jiaming Song, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas** (Stanford University; part of the work at Luma AI). Five of the six also wrote DWD: Hansheng Chen, Shengqu Cai, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas, together with Jan Ackermann and Rayhan Zirvi.
 - Blog: [hanshengchen.com/blog/pi-h3](https://hanshengchen.com/blog/pi-h3/)
 - Weights: [Lakonik/pi-H3](https://huggingface.co/Lakonik/pi-H3), under the MiniMax H3 Community License
 - Code: [LakonLab](https://github.com/Lakonik/LakonLab) and [ComfyUI-piFlow](https://github.com/Lakonik/ComfyUI-piFlow), Apache-2.0
@@ -91,7 +91,7 @@ Base model without the adapter, same check: 3–5% per call. Audio: 2–6% per c
 - **The head is exact.** Fed ComfyUI's own block output and timestep embedding, our head gives ComfyUI's pixels to 59–65 dB.
 - **The weights are ComfyUI's.** ComfyUI merges the LoRA into fp16, then requantizes to int8 with per-key stochastic rounding. `--merge comfy` (the default) does the same. Every layer compared matched ComfyUI's patched weights to the bf16 floor of the dump (0.16–0.17% relative, the same as an untouched layer).
   - `--merge exact` merges in fp32 and rounds deterministically. It lands 1.3% away per layer. That is ordinary int8 requantization noise, but it is as large as the LoRA's whole effect (1.7%): merging any LoRA into int8 is lossy at this scale.
-- **The forward differs by 3–5% per call on the base model.** That is two W8A8 implementations: musubi's triton kernels against comfy-kitchen's. pi-H3's first step (an x0 jump from almost pure noise) amplifies it to 3–21%.
+- **The forward differs by 3–5% per call on the base model.** That is two W8A8 implementations: musubi's triton kernels against comfy-kitchen's. With the adapter the gap per call is 3–21%, largest at the first step. That is consistent with pi-H3's first step (an x0 jump from almost pure noise) amplifying the kernel gap, but it was not isolated.
 - **End to end the two clips sit at the DiT's chaos floor.** Ours against ComfyUI is as far apart as ours against itself from the same noise rounded to bf16 (the "floor" columns). Same scene, layout and motion; different fine detail.
 
 ## Results (RTX 5090, dense attention, medians of the warm prompts)
@@ -129,7 +129,7 @@ How to read it:
 - **Total** = DiT + decode, pixels left on the GPU, no text encoder, no audio decode, in every row. **× real time** = clip seconds at 24 fps / total.
 - **LPIPS vs VAE** compares the DWD pixels with the VAE decode of the same run's final latent.
   - At **4 steps**, pi-H3's DWD agrees with the VAE better than ours does: 0.067 / 0.087 against our 0.112 / 0.114.
-  - At **2 steps** (blank above, 0.40 in the raw table) it is not a DWD error. The last 2-step latent is one jump from σ 0.87, and its VAE decode is blocky; the DWD pixels are clean. The non-DWD adapters exist for VAE decoding.
+  - At **2 steps** (blank above, 0.40 in the raw table) it is not a DWD error. The last 2-step latent is one jump from σ 0.87, and its VAE decode is blocky; the DWD pixels are clean. The authors' ComfyUI path shows the same: 0.36–0.41 at 2 steps, 0.05–0.09 at 4. The non-DWD adapters exist for VAE decoding.
   - For two-track rows the reference is the VAE on the composite latent.
 - **The 124-frame rows are 15–20× the 39-frame rows for 3.2× the frames.** Dense attention is quadratic in 37k tokens; the blog uses Sol sparse attention here.
 - **The ComfyUI reference** (the authors' path, same card, dense) takes **1.37 s** for 2 steps and **2.64 s** for 4 steps at 768×512 × 39 frames, DWD included. Ours is 13% (2-step) and 16% (4-step) slower: musubi's int8 kernels against comfy-kitchen's. The ComfyUI path is the faster way to run pi-H3 on this card today.
