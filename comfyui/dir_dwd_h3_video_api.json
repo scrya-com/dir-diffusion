@@ -1,0 +1,156 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "H3 DiT (pruned int8, the one DiR was trained on)"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  }
+ },
+ "4": {
+  "class_type": "DiRH3Loader",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "source": "johndpope/dir-diffusion-h3",
+   "lora_mode": "bypass (as trained)",
+   "strength": 1.0,
+   "tag": "",
+   "ema": false
+  },
+  "_meta": {
+   "title": "DiR H3 Loader (or a local run folder, e.g. lot/runs/dir_turbo_clip)"
+  }
+ },
+ "5": {
+  "class_type": "MiniMaxH3ImageToVideo",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ],
+   "prompt": "Head-and-shoulders portrait of a woman in a plain grey studio, soft even light. She looks into the camera and says quickly: \"Wait, what time is it? Did I miss the train?\" Her lips, jaw, eyes and head move naturally with the words. Static locked-off camera, single continuous shot, no cut. Sharp focus, crisp detailed face and eyes, no motion blur, no soft focus.",
+   "width": 512,
+   "height": 768,
+   "length": 39
+  },
+  "_meta": {
+   "title": "t2va, 39 frames = 12 latent frames (as trained); no first/last frame"
+  }
+ },
+ "6": {
+  "class_type": "DiRH3DWDLoader",
+  "inputs": {
+   "lora_path": "/media/2TB/lora-data/h3_lot/dwd/wB/dwd_ft_lora.pt",
+   "head_path": "/media/2TB/lora-data/h3_lot/dwd/wB_head/dwd_head_ridge.pt",
+   "refiner_path": "/media/2TB/lora-data/h3_lot/dwd/wG/refiner_best.pt",
+   "lora_strength": 1.0
+  },
+  "_meta": {
+   "title": "DWD weights (local paths until published; hf://owner/repo/file also works)"
+  }
+ },
+ "7": {
+  "class_type": "DiRH3DWDSampler",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "dir": [
+    "4",
+    1
+   ],
+   "positive": [
+    "5",
+    0
+   ],
+   "latent": [
+    "5",
+    1
+   ],
+   "seed": 7,
+   "noise_device": "gpu",
+   "sigmas": "",
+   "mix_state": "from run",
+   "dwd": [
+    "6",
+    0
+   ],
+   "refine": true,
+   "head_dtype": "float32"
+  },
+  "_meta": {
+   "title": "DiR + DWD: IMAGE without the VAE; LATENT is the plain DiR latent"
+  }
+ },
+ "8": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "7",
+    0
+   ],
+   "filename_prefix": "dir_h3/dwd_video",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  },
+  "_meta": {
+   "title": "DWD decode (head + refiner)"
+  }
+ },
+ "9": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "7",
+    1
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE decode of the same latent, for A/B (bypass to save time)"
+  }
+ },
+ "10": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "9",
+    0
+   ],
+   "filename_prefix": "dir_h3/dwd_vae_video",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  }
+ }
+}

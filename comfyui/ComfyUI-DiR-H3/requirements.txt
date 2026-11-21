@@ -1,0 +1,2 @@
+# Everything else comes with ComfyUI. Only needed to fetch the DiR run (or DWD files) from Hugging Face.
+huggingface_hub
