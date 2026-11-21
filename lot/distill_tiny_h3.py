@@ -112,7 +112,7 @@ def on_policy_prob(frac: float, start: float, prob: float) -> float:
 
 
 def mad(a: torch.Tensor, b: torch.Tensor) -> float:
-    return float((a.float() - b.float()).abs().mean())
+    return float((a.float() - b.to(a.device).float()).abs().mean())
 
 
 def pass_check(pub: dict, tiny: dict, ft: dict, pub_json: dict, tiny_json: dict, ft_json: dict, evals: list,
