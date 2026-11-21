@@ -548,6 +548,165 @@ def sample(args) -> None:
             print(f"LOT_H3 kind=pih3_sample size={width}x{height} frames={frames} prompt={index}", flush=True)
 
 
+# ------------------------------------------------------------------------------------------- bench
+
+VARIANTS = ("pih3_dwd", "pih3_vae", "pih3_lr_dwd", "pih3_tt_dwd2")
+LABEL = {"pih3_dwd": "pi-H3 {s}-step + its DWD", "pih3_vae": "pi-H3 {s}-step, VAE decode",
+         "pih3_lr_dwd": "pi-H3 {s}-step half res + its DWD, x2",
+         "pih3_tt_dwd2": "pi-H3 {s}-step two-track, its DWD on both tracks"}
+
+
+@torch.no_grad()
+def bench(args) -> None:
+    """``accel_h3.py bench --generator pih3``: the pi-H3 rows of ``BENCH.md``, in ``accel_h3.bench``'s conventions
+    (held-out prompts, the first a warm-up; DiT and decode timed apart, pixels left on the GPU; ``--score``: PSNR
+    and LPIPS of the DWD pixels against the VAE decode of the same latent, not timed). The audio latent is
+    denoised but not decoded, in every row (the DiR rows have no audio), so the rows compare video time.
+
+    Two-track rows also score against full-resolution pi-H3 from the same seed (``lpips_full``) and over the HR
+    box alone (``lpips_box``); the two-track clip is a different video (other noise at half resolution)."""
+    import statistics  # noqa: F401
+
+    from accel_h3 import (default_caches, lpips_clip, parse_job, prompt_lists, sync, token_shape,
+                          upscale_px)
+    from dwd_h3 import psnr
+    from gpu_guard import refuse_if_busy
+    from h3_musubi import load_vae
+    from lot_paths import LOT_H3_VAE
+    from setproctitle import setproctitle
+    from train_dwd_h3 import load_text
+
+    setproctitle(f"pih3:bench s{args.steps} {' '.join(args.sizes)}"[:60])
+    refuse_if_busy("pih3_h3.py")
+    wanted = [v for v in VARIANTS if v in (args.variants or ",".join(VARIANTS)).split(",")]
+    unknown = set((args.variants or ",".join(VARIANTS)).split(",")) - set(VARIANTS)
+    if unknown:
+        raise SystemExit(f"--variants: {sorted(unknown)} not in {VARIANTS}")
+    model = load_pih3(args.steps, merge=args.merge)
+    vae = load_vae(LOT_H3_VAE, device="cpu") if args.score or "pih3_vae" in wanted else None
+    vae_dtype = next(vae.parameters()).dtype if vae is not None else None
+    two_track = None
+    if "pih3_tt_dwd2" in wanted:
+        from accel_h3 import load_two_track
+
+        two_track = load_two_track(args)
+    lp = None
+    if args.score:
+        import lpips
+
+        lp = lpips.LPIPS(net="vgg", verbose=False).cuda().eval().requires_grad_(False)
+    _train, held = prompt_lists(args.caches or default_caches(), args.holdout)
+    prompts = held[:args.prompts]
+
+    def vae_on(on: bool) -> None:
+        if vae is None:
+            return
+        vae.to("cuda" if on else "cpu")
+        torch.cuda.empty_cache()
+
+    def vae_decode(latent: torch.Tensor) -> torch.Tensor:
+        return vae.decode(latent.to("cuda", vae_dtype)).clamp(-1, 1)
+
+    for spec in args.sizes:
+        width, height, _count, frames = parse_job(spec, args.frames)
+        latent_t, _th, _tw = token_shape(width, height, frames)
+        columns = [v for v in wanted if not (v in ("pih3_lr_dwd", "pih3_tt_dwd2") and (width % 64 or height % 64))]
+        meta = {"generator": "pih3", "adapter": model["adapter"], "merge": model["merge"], "steps": args.steps,
+                "sigmas": model["sigmas"], "canvas": f"{width}x{height}", "frames": frames, "latent_t": latent_t,
+                "iters": args.steps, "columns": columns, "prompts": [], "switch": args.switch, "hr_share": [],
+                "oom": [], "gpu": torch.cuda.get_device_name(), "attention": "dense (musubi-tuner H3 attention)",
+                "labels": {c: LABEL[c].format(s=args.steps) for c in columns},
+                **{key: {c: [] for c in columns} for key in ("seconds", "dit_seconds", "decode_seconds", "psnr",
+                                                              "lpips", "peak_gb", "lpips_full", "lpips_box")}}
+        name_dir = f"{width}x{height}" + ("" if frames == 39 else f"_f{frames}") + f"_pih3_s{args.steps}"
+        out_dir = args.out / name_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for index, te in enumerate(prompts):
+            text = load_text(str(te)).cuda()
+            seed = args.seed + index
+            meta["prompts"].append(Path(te).name)
+            full_px = None
+            for name in columns:
+                pixels = reference = scored = out = tt = None
+                values = {key: None for key in ("seconds", "dit_seconds", "decode_seconds", "peak_gb", "psnr",
+                                                "lpips", "lpips_full", "lpips_box")}
+                try:
+                    vae_on(name == "pih3_vae")
+                    half = name == "pih3_lr_dwd"
+                    w, h = (width // 2, height // 2) if half else (width, height)
+                    z = torch.randn(1, 24, latent_t, h // 16, w // 16, device="cuda",
+                                    generator=torch.Generator("cuda").manual_seed(seed))
+                    torch.cuda.reset_peak_memory_stats()
+                    sync()
+                    start = time.perf_counter()
+                    if name == "pih3_tt_dwd2":
+                        timer: dict = {}
+                        tt = pih3_two_track(model, text, height=height, width=width, latent_t=latent_t, seed=seed,
+                                            two_track=two_track, switch=args.switch, timer=timer)
+                        sync()
+                        pixels = scored = tt["pixels"]
+                        dit_s, decode_s = timer["dit_s"], timer["decode_s"]
+                        meta["hr_share"].append(round(tt["share"], 4)) if index else None
+                    else:
+                        out = pih3_sample(model, text, z, audio_noise(latent_t, seed + 1))
+                        sync()
+                        sampled = time.perf_counter()
+                        if name == "pih3_vae":
+                            pixels = vae_decode(out["latent"])
+                        else:
+                            pixels = scored = decode(model, out, tuple(z.shape))
+                            if half:
+                                pixels = scored = upscale_px(pixels)
+                        sync()
+                        dit_s, decode_s = sampled - start, time.perf_counter() - sampled
+                    values.update(seconds=round(dit_s + decode_s, 3), dit_seconds=round(dit_s, 3),
+                                  decode_seconds=round(decode_s, 3),
+                                  peak_gb=round(torch.cuda.max_memory_allocated() / 2**30, 1))
+                    if pixels.shape[2:] != (frames, height, width):
+                        raise RuntimeError(f"{name}: pixels {tuple(pixels.shape)} for {frames}x{height}x{width}")
+                    if name == "pih3_dwd":
+                        full_px = pixels.to("cpu", torch.float16)
+                    if args.save and index == min(1, len(prompts) - 1):
+                        from two_track_h3 import save_clip
+
+                        save_clip(pixels.to("cpu", torch.float16), out_dir / f"p{index}_{name}.mp4")
+                    if lp is not None and scored is not None:
+                        scored = scored.float().cpu()
+                        pixels = None
+                        vae_on(True)
+                        if tt is not None:            # the VAE on the same two latents' composite
+                            reference = vae_decode(tt["latent"]).float()
+                        else:
+                            reference = vae_decode(out["latent"]).float()
+                            if half:
+                                reference = upscale_px(reference)
+                        vae_on(False)
+                        values["psnr"] = round(psnr(scored.cuda(), reference), 3)
+                        values["lpips"] = round(lpips_clip(lp, scored.cuda(), reference), 4)
+                        reference = None
+                    if lp is not None and tt is not None and full_px is not None:
+                        ours, full = tt["pixels"].float(), full_px.cuda().float()
+                        values["lpips_full"] = round(lpips_clip(lp, ours, full), 4)
+                        y0, y1, x0, x1 = (64 * v for v in tt["box"])
+                        values["lpips_box"] = round(lpips_clip(lp, ours[..., y0:y1, x0:x1].contiguous(),
+                                                               full[..., y0:y1, x0:x1].contiguous()), 4)
+                    print(f"LOT_H3 kind=pih3_bench size={width}x{height} frames={frames} prompt={index} variant={name} "
+                          + " ".join(f"{k}={v}" for k, v in values.items() if v is not None), flush=True)
+                except torch.OutOfMemoryError:
+                    meta["oom"].append(name)
+                    print(f"LOT_H3 kind=pih3_bench size={width}x{height} prompt={index} variant={name} oom=1", flush=True)
+                for key, value in values.items():
+                    meta[key][name].append(value)
+                del pixels, reference, scored, out, tt
+                vae_on(False)
+                torch.cuda.empty_cache()
+        (out_dir / "meta.json").write_text(json.dumps(meta, indent=1) + "\n")
+    from accel_h3 import bench_table
+
+    print(bench_table(args.out))
+    print(f"LOT_H3 kind=pih3_bench_done out={args.out} ok=1", flush=True)
+
+
 # ------------------------------------------------------------------------------------------- main
 
 def main() -> None:

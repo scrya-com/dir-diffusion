@@ -964,10 +964,10 @@ def bench_table(root: Path) -> str:
                 values = [v for v in (values[skip:] or values) if v is not None]
                 return round(statistics.median(values), digits) if values else None
             total = med("seconds")
-            label = LABEL[name] + (" (out of memory)" if name in meta.get("oom", []) else "")
+            label = (meta.get("labels", {}).get(name) or LABEL[name]) + (" (out of memory)" if name in meta.get("oom", []) else "")
             if name == "dir_dwd_early":
                 label += f" (after iteration {meta['early_exit'] + 1} of {meta['iters']})"
-            if name.startswith("tt_") and meta.get("hr_share"):
+            if (name.startswith("tt_") or "_tt_" in name) and meta.get("hr_share"):
                 label += f" ({100 * statistics.median(meta['hr_share']):.0f}% region)"
             row = (meta["canvas"], meta["frames"], label, total, med("dit_seconds"), med("decode_seconds"),
                    round(meta["frames"] / 24.0 / total, 2) if total else None, med("psnr"), med("lpips", 4),
@@ -986,6 +986,13 @@ def bench_table(root: Path) -> str:
 
 @torch.no_grad()
 def bench(args) -> None:
+    from generators import generator_module
+
+    plugin = generator_module(getattr(args, "generator", "dir"))
+    if plugin is not None:                                # another generator's rows, same table (generators.py)
+        return plugin.bench(args)
+    if args.lora is None or args.head is None:
+        raise SystemExit("bench --generator dir needs --lora and --head (the DWD stack)")
     from dir_h3 import use_networks
     from h3_musubi import load_vae
     from lot_paths import LOT_H3_VAE
@@ -994,6 +1001,7 @@ def bench(args) -> None:
     gpu_setup("accel_h3.py")
     models = load_models(args)
     dit, gen_head, net, sigmas, mix, R = (models[k] for k in ("dit", "gen_head", "net", "sigmas", "mix", "iters"))
+    args.variants = args.variants or ",".join(VARIANTS)
     wanted = [v for v in VARIANTS if v in args.variants.split(",")]
     unknown = set(args.variants.split(",")) - set(VARIANTS)
     if unknown:
@@ -1228,11 +1236,14 @@ def main() -> None:
 
     b = sub.add_parser("bench", help="end-to-end speed, DiT and decode split")
     common(b)
-    add_stack(b)
+    add_stack(b, required=False)                         # required for --generator dir (checked in bench)
     add_stack(b, prefix="early_", required=False)
     b.add_argument("--out", type=Path, required=True)
-    b.add_argument("--variants", default=",".join(VARIANTS),
-                   help=f"comma list of {','.join(VARIANTS)}")
+    b.add_argument("--generator", default="dir", help="dir (default) or pih3: see generators.py")
+    b.add_argument("--steps", type=int, default=2, help="pih3: sampling steps (2 or 4)")
+    b.add_argument("--merge", default="comfy", help="pih3: adapter merge (pih3_h3.MERGES)")
+    b.add_argument("--variants", default=None,
+                   help=f"comma list; dir: {','.join(VARIANTS)}; other generators: their VARIANTS (default: all)")
     b.add_argument("--prompts", type=int, default=3, help="held-out prompts; the first is warm-up")
     b.add_argument("--seed", type=int, default=0)
     b.add_argument("--switch", type=int, default=2, help="two-track: iterations at half resolution before the region opens")

@@ -4,6 +4,7 @@
 #   bash scripts/bench_accel.sh quality     # LPIPS / PSNR / flicker / seam / tde vs the VAE -> $OUT/quality/QUALITY.md
 #   bash scripts/bench_accel.sh             # both
 # Any size works: SIZES="640x384 1280x704" bash scripts/bench_accel.sh speed
+# pi-H3 rows instead of DiR's: GENERATOR=pih3 STEPS=2 SWITCH=1 bash scripts/bench_accel.sh speed (docs/PIH3.md)
 # Needs $LOT_H3_CHECKPOINT and $LOT_H3_VAE (lot/lot_paths.py), prompts ($ACCEL_CACHES, colon-separated H3 caches,
 # else the default stills and clips caches), and a DWD stack: LORA, HEAD, REFINER (not published yet).
 # A 32 GB card with every DiT block resident (no block swap: the DWD tail and the stacked LoRA need that).
@@ -27,6 +28,11 @@ SCORE=${SCORE:-1}                                 # speed: also PSNR / LPIPS of 
 [ -n "${GPU:-}" ] && export CUDA_VISIBLE_DEVICES=$GPU
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 STACK=(--run "$RUN" --lora "$LORA" --head "$HEAD" --refiner "$REFINER" --mode "$MODE" --frames "$FRAMES")
+GENERATOR=${GENERATOR:-dir}                       # dir (DiR + our DWD) or pih3 (pi-H3, its own DWD): lot/generators.py
+if [ "$GENERATOR" != dir ]; then
+  STACK=(--generator "$GENERATOR" --steps "${STEPS:-2}" --switch "${SWITCH:-1}" --frames "$FRAMES")
+  VARIANTS=${PIH3_VARIANTS:-pih3_dwd,pih3_vae,pih3_lr_dwd,pih3_tt_dwd2}
+fi
 EARLY=()                                          # an early-exit stack, when one has been trained
 if [ -n "${EARLY_LORA:-}" ]; then
   EARLY=(--early-lora "$EARLY_LORA" --early-head "$EARLY_HEAD" --early-refiner "$EARLY_REFINER"
@@ -37,7 +43,7 @@ if [ "$what" = speed ] || [ "$what" = all ]; then
   $PY -u accel_h3.py bench "${STACK[@]}" "${EARLY[@]}" --sizes $SIZES --prompts "$PROMPTS" --variants "$VARIANTS" \
     --out "$OUT/speed" --save $([ "$SCORE" = 1 ] && echo --score)
 fi
-if [ "$what" = quality ] || [ "$what" = all ]; then
+if [ "$GENERATOR" = dir ] && { [ "$what" = quality ] || [ "$what" = all ]; }; then
   $PY -u accel_h3.py quality "${STACK[@]}" --sizes $QSIZES --held "$HELD" --out "$OUT/quality"
   if [ -n "${EARLY_LORA:-}" ]; then
     $PY -u accel_h3.py quality --run "$RUN" --frames "$FRAMES" --lora "$EARLY_LORA" --head "$EARLY_HEAD" \
