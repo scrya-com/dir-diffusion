@@ -267,7 +267,7 @@ def load_student(steps: int = 2, *, rank: int = 32, lora: Path | None = None, tr
 
 
 @torch.no_grad()
-def held_eval(dit, head, up, lp, items, sigmas, drop: str) -> dict:
+def held_eval(dit, head, up, lp, items, sigmas, drop: str, sheet_path: Path | None = None, sheets: int = 2) -> dict:
     """The fast path on held-out teacher clips: LPIPS of the whole clip against the teacher's DWD pixels, detail
     (``hf``) as a fraction of the teacher's, latent MSE. Inside training (same DiT, LoRA as it is)."""
     from accel_h3 import lpips_clip
@@ -290,6 +290,11 @@ def held_eval(dit, head, up, lp, items, sigmas, drop: str) -> dict:
         rows["lpips"].append(lpips_clip(lp, px, ref))
         rows["hf"].append(hf_energy(px) / hf_energy(ref))
         rows["lat"].append(float(F.mse_loss(out["latent"], item["latent"].cuda().float())))
+        if sheet_path is not None and len(rows["lat"]) <= sheets:
+            from pih3_cascade import sheet
+
+            sheet({"teacher 4-step": item["pixels"], "student": u8(px)},
+                  sheet_path.with_name(f"{sheet_path.stem}_p{len(rows['lat']) - 1}.jpg"), columns=4, tile_w=320)
     dit.train(was)
     return {k: round(sum(v) / len(v), 4) for k, v in rows.items()}
 
@@ -504,7 +509,8 @@ def dmd_train(args) -> None:
         lp = getattr(run_eval, "lp", None) or lpips.LPIPS(net="vgg", verbose=False).cuda().eval().requires_grad_(False)
         run_eval.lp = lp
         with use_networks(gen_net, fake_net, gen=True, fake=False):
-            row = {"step": step, "eval": held_eval(dit, head, up, lp, held, sigmas, args.drop)}
+            row = {"step": step, "eval": held_eval(dit, head, up, lp, held, sigmas, args.drop,
+                                                   sheet_path=args.out / f"sheet_{step}.jpg")}
         print("LOT_H3 kind=pih3_distill_eval " + json.dumps(row), flush=True)
         log.write(json.dumps(row) + "\n")
         log.flush()

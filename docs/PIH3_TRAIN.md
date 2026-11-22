@@ -88,7 +88,28 @@ checked at 1344×768.
 
 ## Results
 
-Not yet. They will go here, with the eval table and the contact sheets.
+In progress. The gate result will go here, with the eval table and the contact sheets.
+
+**Regression (latent MSE + LPIPS) blurs.** Held-out eval, 8 clips, against the 4-step teacher, H3-Tiny's blocks dropped:
+
+| | LPIPS | Detail (hf) | Latent MSE |
+|---|---|---|---|
+| Step 0 (untrained cascade) | 0.473 | 0.82 | 1.149 |
+| run_b, MSE + 0.2·LPIPS, step 250 | 0.455 | 0.41 | 0.404 |
+| run_b2, 0.25·MSE + 1.0·LPIPS, step 250 | 0.445 | 0.52 | 0.458 |
+
+- The layout moves toward the teacher's, but detail collapses. Regressing onto a teacher that is a chaotic function of its noise averages the detail away, so both runs were stopped at step 250.
+- **A bug taints both runs.** With `--drop`, `backward()` ran after the drop context had exited. Activation checkpointing then recomputed the skipped blocks as real blocks, so the gradients were wrong. There was no error, because the shapes match. Fixed in `af8b51b`: `backward()` now runs inside the same switches (drop, adapter, LoRAs). The runs were not repeated: the blur conclusion is the likely one regardless.
+
+**Next: distribution matching** (`pih3_distill.py dmd`), as the DiR generator was trained:
+- **Real score:** base H3, through a switchable, unmerged pi-H3 adapter.
+- **Fake score:** a rank-16 fake LoRA.
+- **Anchor:** the latent MSE to the teacher at 0.05.
+- **Cost (RTX 5090, 768×512):** about 13.5 s a step, 29.8 GB peak.
+
+```bash
+python3 pih3_distill.py dmd --data $D --out $D/dmd_b --steps 1000 --drop h3tiny --fake-rank 16
+```
 
 ## Credits
 
