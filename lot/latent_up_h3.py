@@ -164,6 +164,7 @@ def main() -> None:
         loss = F.l1_loss(net(lr), hr)
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
         opt.step()
         sched.step()
         if step % 500 == 0 or step == args.steps - 1:

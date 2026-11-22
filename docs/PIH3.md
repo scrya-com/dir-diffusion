@@ -185,6 +185,29 @@ By eye (`p1_*.mp4` in the bench folders):
 
 **What would make it work:** the region head and the K/V maps were fitted on base H3, not pi-H3, and pi-H3 was not distilled for mixed sequences. Our DiR two-track had the same untrained gap.
 
+## The handoff, the cascade and block dropping (branch `exp/pih3-cascade`, 2026-11-22)
+
+`lot/pih3_cascade.py run` compares samplers on the same prompts and seeds; `lot/latent_up_h3.py` trains the upsampler. RTX 5090, 39 frames, medians of 2 warm prompts, so read the pictures, not only the numbers.
+
+- **The two-track ghost is the latent handoff, not the mixed sequence.** A cascade with no region at all (`cas:K`: K steps at half resolution, the estimate ×2, re-noised, the rest at full resolution) ghosts the same way with a trilinear, nearest or bicubic latent ×2: dots, outlines, text. Controls: fresh re-noising at full resolution is clean (`self:K`), and so is the VAE round trip (`cas:K:vae`, 6 s).
+- **A learned latent ×2 removes it.** A small 3D conv net fitted to the VAE round trip (160 clips, 9 minutes of training; 17% relative error where trilinear has 76%) costs milliseconds. `pih3_two_track(..., up=load_up(path))` and `cas:K:net`. A diverged net (48%) ghosts again.
+- **Still softer than full resolution.** Clean, but detail (`hf`) is 0.75–0.85 of full at 768×512, about half resolution ×2's level; the VAE handoff reaches 0.90. Every LR-started clip is another video (LPIPS 0.44–0.70 against full; the same-seed floor is 0.17–0.30).
+
+| 39 frames | 768×512 s | 1344×768 s |
+|---|---|---|
+| 2-step full | 1.55 | 5.46 |
+| 2-step two-track, learned handoff | 0.82 | 2.66 |
+| 2-step cascade 1+1 | 0.98 | 3.30 |
+| 2-step cascade 1+1, H3-Tiny blocks dropped | 0.83 | 2.79 |
+| 2-step full, H3-Tiny blocks dropped | 1.31 | |
+| 4-step full | 3.08 | 10.80 |
+| 4-step two-track | 1.50 | 3.90 |
+| 4-step cascade 2+2 / 3+1 | 1.93 / 1.36 | 6.44 / 4.26 |
+
+124 frames at 1344×768: 2-step full 31.1 s, two-track 15.1 s (67% region), cascade 17.8 s; 4-step full 61.7 s, two-track 16.7 s (24% region), cascade 3+1 21.7 s. The cascade 3+1 shows wavy texture; 2+2 and 1+1 do not.
+
+**Block dropping** (`dropscan`, 4-step): skipping H3-Tiny's 8 blocks, or the 8 least sensitive of a per-block scan (4, 6, 8, 11, 13, 15, 16, 17), gives a clean clip 16% faster with no training, at 1.5–2× the same-seed floor (LPIPS 0.14–0.49 against 0.07–0.26). 12 blocks still hold; 16 change the scene.
+
 ## Files
 
 | Path | What |
