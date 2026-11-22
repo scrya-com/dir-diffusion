@@ -388,7 +388,7 @@ def train(args) -> None:
     noise_params = list(model.noise_input.parameters())
     opt = torch.optim.AdamW([{"params": lora_params, "lr": args.lr},
                              {"params": noise_params, "lr": args.noise_lr or args.lr}],
-                            betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+                            betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, foreach=False)
     base_lrs = [group["lr"] for group in opt.param_groups]
     step0 = 0
     if args.resume:
