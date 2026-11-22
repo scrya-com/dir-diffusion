@@ -19,6 +19,7 @@ the pure-noise half-resolution step (as in the paper).
 
     CUDA_VISIBLE_DEVICES="" python3 lot/test_pmd_pih3.py
     python3 lot/pmd_pih3.py train --data D --out D/pmd_a --drop h3tiny --check        # 3 updates: s/step, peak GB
+    python3 lot/pmd_pih3.py probe --data D --out D/pmd_probe --drop h3tiny --scales 1 4 16   # are the tilts informative?
     python3 lot/pmd_pih3.py train --data D --out D/pmd_a --drop h3tiny --steps 1000 --stop-at 500 --stop-below-hf 0.9
     python3 lot/pmd_pih3.py eval --data D --out D/pmd_a/eval --drop h3tiny --ckpt D/pmd_a/pmd_500.pt
 
@@ -193,6 +194,50 @@ def pmd_update(model: FastPMD, text, z, z_lr, za, *, tilts_n: int, draws_n: int,
         loss, stats = P.pmd_step(lambda s, u, _k: model.student(s, u, text, ya), lambda s: model.teacher(s, text, ya),
                                  z_t, model.s1, 1, tilts, noises, estimator=estimator, scale=scale)
     return loss, stats
+
+
+@torch.no_grad()
+def probe_state(model: FastPMD, text, z, z_lr, za, *, scales, tilts_n: int, draws_n: int,
+                generator: torch.Generator, factor=(4, 8, 8), radius=(0.25, 0.5), estimator: str = "jk") -> list[dict]:
+    """No training: how informative the tilts are at one on-policy state, per radius multiplier in ``scales``.
+
+    The same tilt directions and the same ``draws_n`` student draws serve every multiplier. Per multiplier:
+    ``ess`` / ``w_max`` (softmax weights over the draws: ``draws_n`` = flat = mean matching, 1 = one-hot),
+    ``teacher_shift`` (``|D(z + rho lambda) - D(z)| / |D(z)|``), ``shift_ratio`` (``|rho lambda| / |z_t|``),
+    ``gain`` (``|D(z + rho lambda) - D(z)| / |rho lambda|``: the teacher's response per unit of input shift; it
+    should stay about constant while the teacher is in its linear, sane range), ``std_ratio`` (std of the shifted
+    target over std of ``D(z)``: far from 1 = the teacher left its range), ``tilt_over_mean`` (the tilt part of
+    the target against the student's mean residual, ``|D(z + rho lambda) - D(z)| / |mean(x) - D(z)|``) and the
+    two losses. ``draw_spread`` is the draws' spread over their mean (the same for every multiplier)."""
+    rows = []
+    with model.student_mode():
+        z_t, ya = model.lr_state(text, z, z_lr, za)
+        base = P.sample_tilts(z_t, tilts_n, factor=tuple(factor), radius=tuple(radius), generator=generator)
+        noises = [torch.randn(z_t.shape, device=z_t.device, generator=generator) for _ in range(draws_n)]
+        draws = torch.stack([model.student(z_t, u, text, ya).float()[0] for u in noises])
+        d0 = model.teacher(z_t, text, ya).float()
+        rho = P.rho_of(model.s1)
+        mean = draws.mean(0)
+        spread = float((draws - mean).pow(2).sum(dim=tuple(range(1, draws.ndim))).mean().sqrt()
+                       / mean.norm().clamp_min(1e-12))
+        mean_gap = float((mean - d0[0]).norm())
+        for scale in scales:
+            tilts = [float(scale) * t for t in base]
+            targets = [model.teacher(z_t + rho * t, text, ya).float() for t in tilts]
+            stats = P.weight_stats(draws, [t[0] for t in tilts])
+            moved = [float((target - d0).norm()) for target in targets]
+            count = len(tilts)
+            rows.append({
+                "scale": float(scale), "ess": stats["ess"], "w_max": stats["w_max"], "draw_spread": spread,
+                "teacher_shift": sum(moved) / count / float(d0.norm().clamp_min(1e-12)),
+                "shift_ratio": sum(float(rho * t.norm()) for t in tilts) / count / float(z_t.norm().clamp_min(1e-12)),
+                "gain": sum(m / float(rho * t.norm()) for m, t in zip(moved, tilts)) / count,
+                "std_ratio": sum(float(target.std() / d0.std().clamp_min(1e-12)) for target in targets) / count,
+                "tilt_over_mean": sum(moved) / count / max(mean_gap, 1e-12),
+                "loss": float(P.pmd_loss(draws, [t[0] for t in tilts], [t[0] for t in targets], estimator)),
+                "loss_plain": float(P.pmd_loss(draws, [t[0] for t in tilts], [t[0] for t in targets], "plain")),
+            })
+    return rows
 
 
 # ------------------------------------------------------------------------------------------- GPU: build, eval
@@ -491,6 +536,43 @@ def evaluate(args) -> None:
                                                    indent=1) + "\n")
 
 
+@torch.no_grad()
+def probe(args) -> None:
+    """``probe_state`` on the first ``--states`` held-out prompts (their own seeds), the untrained student. Prints
+    one line per state and multiplier, then the means. Writes ``probe.json``. No training, nothing else saved."""
+    from pih3_distill import paired_noise
+    from pih3_h3 import audio_noise
+    from setproctitle import setproctitle
+    from train_dwd_h3 import load_text
+
+    setproctitle(f"pih3:pmd probe {args.out.name}"[:60])
+    _guard()
+    args.out.mkdir(parents=True, exist_ok=True)
+    model, _network, _head = build(args, train=False)
+    held = sorted((args.data / args.folder / "held").glob("*.pt"))[:args.states]
+    gen = torch.Generator(model.device).manual_seed(args.seed)
+    rows = []
+    for index, path in enumerate(held):
+        item = torch.load(path, weights_only=False)
+        width, height = item["size"]
+        z, z_lr = paired_noise(item["latent_t"], height, width, item["seed"])
+        za = audio_noise(item["latent_t"], item["seed"] + 1)
+        for row in probe_state(model, load_text(item["te"]).cuda(), z, z_lr, za, scales=args.scales,
+                               tilts_n=args.tilts, draws_n=args.draws, generator=gen, factor=args.tilt_factor,
+                               radius=args.radius, estimator=args.estimator):
+            row = {"state": index, **{k: round(v, 5) for k, v in row.items()}}
+            rows.append(row)
+            print("LOT_H3 kind=pmd_pih3_probe " + json.dumps(row), flush=True)
+    means = []
+    for scale in args.scales:
+        group = [r for r in rows if r["scale"] == float(scale)]
+        means.append({k: round(sum(r[k] for r in group) / len(group), 5) for k in group[0] if k != "state"})
+        print("LOT_H3 kind=pmd_pih3_probe_mean " + json.dumps(means[-1]), flush=True)
+    (args.out / "probe.json").write_text(json.dumps({"radius": args.radius, "dial": args.dial, "drop": args.drop,
+                                                     "teacher": args.teacher, "rows": rows, "means": means},
+                                                    indent=1) + "\n")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -541,8 +623,20 @@ def main() -> None:
     e.add_argument("--eval-dial", type=float, default=None, help="override the checkpoint's dial at inference")
     e.add_argument("--held", type=int, default=16)
     e.add_argument("--sheets", type=int, default=4)
+    b = sub.add_parser("probe", help="no training: ESS, draw spread and teacher shift per tilt-radius multiplier")
+    common(b)
+    b.add_argument("--adapter", choices=("bypass",), default="bypass")
+    b.add_argument("--teacher", choices=("base", "pih3"), default="base")
+    b.add_argument("--states", type=int, default=3)
+    b.add_argument("--scales", type=float, nargs="+", default=[1.0, 4.0, 16.0])
+    b.add_argument("--tilts", type=int, default=4)
+    b.add_argument("--draws", type=int, default=4)
+    b.add_argument("--radius", type=float, nargs=2, default=[0.25, 0.5])
+    b.add_argument("--tilt-factor", type=int, nargs=3, default=[4, 8, 8])
+    b.add_argument("--estimator", choices=tuple(P.ESTIMATORS), default="jk")
+    b.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
-    {"train": train, "eval": evaluate}[args.cmd](args)
+    {"train": train, "eval": evaluate, "probe": probe}[args.cmd](args)
 
 
 if __name__ == "__main__":

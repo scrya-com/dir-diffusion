@@ -372,6 +372,32 @@ def test_train_loop_saves_stops_early_and_resumes_on_cpu():
         F.HOOKS.update(saved)
 
 
+def test_probe_state_scales_the_same_tilts():
+    """The probe changes nothing, uses one set of draws and directions for every multiplier, and reports what the
+    radius does: the input shift grows linearly, the weights sharpen (ESS falls), the teacher moves further."""
+    model, net, data, _ = toy()
+    before = [p.detach().clone() for p in params_of(model, net)]
+    rows = F.probe_state(model, *data, scales=[1.0, 4.0, 16.0, 400.0], tilts_n=3, draws_n=4,
+                         generator=torch.Generator().manual_seed(5), factor=(1, 2, 2))
+    assert [r["scale"] for r in rows] == [1.0, 4.0, 16.0, 400.0]
+    assert all(torch.equal(a, b) for a, b in zip(before, params_of(model, net)))
+    assert all(p.grad is None for p in params_of(model, net))
+    assert model.state == {"drop": False, "lora": True, "adapter": True}
+    assert len({r["draw_spread"] for r in rows}) == 1 and rows[0]["draw_spread"] > 0
+    for a, b in zip(rows, rows[1:]):
+        assert abs(b["shift_ratio"] / a["shift_ratio"] - b["scale"] / a["scale"]) < 1e-3
+        assert b["ess"] <= a["ess"] + 1e-6 and b["teacher_shift"] > a["teacher_shift"]
+        assert b["tilt_over_mean"] > a["tilt_over_mean"]
+    assert rows[0]["ess"] > 3.9 and rows[-1]["ess"] < 2.0 and 1.0 <= rows[-1]["ess"]
+    assert all(math.isfinite(v) for r in rows for v in r.values())
+    with torch.no_grad(), model.student_mode():                                 # teacher_shift is |D(z+rho l)-D(z)|/|D(z)|
+        z_t, ya = model.lr_state(*data)
+        tilt = P.sample_tilts(z_t, 3, factor=(1, 2, 2), generator=torch.Generator().manual_seed(5))
+        d0 = model.teacher(z_t, data[0], ya)
+        want = sum(float((model.teacher(z_t + P.rho_of(model.s1) * t, data[0], ya) - d0).norm()) for t in tilt) / 3
+    assert abs(rows[0]["teacher_shift"] - want / float(d0.norm())) < 1e-5
+
+
 def test_checkpoint_roundtrip():
     model, net, data, _ = toy()
     with torch.no_grad():
