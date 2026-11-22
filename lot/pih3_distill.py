@@ -276,7 +276,7 @@ def held_eval(dit, head, up, lp, items, sigmas, drop: str, sheet_path: Path | No
 
     was = dit.training
     dit.eval()
-    rows = {"lpips": [], "hf": [], "lat": []}
+    rows = {"lpips": [], "hf": [], "lat": [], "mean_diff": [], "std_ratio": []}
     for path in items:
         item = torch.load(path, weights_only=False)
         width, height = item["size"]
@@ -290,6 +290,10 @@ def held_eval(dit, head, up, lp, items, sigmas, drop: str, sheet_path: Path | No
         rows["lpips"].append(lpips_clip(lp, px, ref))
         rows["hf"].append(hf_energy(px) / hf_energy(ref))
         rows["lat"].append(float(F.mse_loss(out["latent"], item["latent"].cuda().float())))
+        # colour and contrast against the teacher: |mean difference| per RGB channel (in [-1, 1] units), and the
+        # ratio of the frames' standard deviations (1.0 = same contrast; base H3's look reads flatter)
+        rows["mean_diff"].append(float((px.mean(dim=(0, 2, 3, 4)) - ref.mean(dim=(0, 2, 3, 4))).abs().mean()))
+        rows["std_ratio"].append(float(px.std(dim=(0, 2, 3, 4)).mean() / ref.std(dim=(0, 2, 3, 4)).mean()))
         if sheet_path is not None and len(rows["lat"]) <= sheets:
             from pih3_cascade import sheet
 
@@ -481,7 +485,11 @@ def dmd_train(args) -> None:
     adapter = BypassAdapter(dit, adapter_path(2))
     gen_net = make_lora(dit, args.rank)
     fake_net = make_lora(dit, args.fake_rank)
-    for net in (gen_net, fake_net):
+    for net, path in ((gen_net, args.resume), (fake_net, args.resume_fake)):
+        if path:
+            if net.load_state_dict(torch.load(path, map_location="cpu", weights_only=True)["lora"],
+                                   strict=False).unexpected_keys:
+                raise SystemExit(f"{path}: unexpected keys")
         net.to("cuda", torch.float32)
         net.requires_grad_(True)
     head = PiH3Head(adapter.dwd, dit.final_layer.norm.eps)
@@ -726,6 +734,8 @@ def main() -> None:
     m.add_argument("--clip", type=float, default=1.0)
     m.add_argument("--steps", type=int, default=1000)
     m.add_argument("--start-step", type=int, default=0)
+    m.add_argument("--resume", type=Path, default=None, help="generator LoRA to start from (lora_<step>.pt)")
+    m.add_argument("--resume-fake", type=Path, default=None, help="fake LoRA to start from (fake_last.pt)")
     m.add_argument("--save-every", type=int, default=250)
     m.add_argument("--eval-every", type=int, default=250)
     m.add_argument("--eval-held", type=int, default=8)
