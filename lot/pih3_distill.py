@@ -688,6 +688,111 @@ def evaluate(args) -> None:
     print(json.dumps(summary, indent=1))
 
 
+# ------------------------------------------------------------------------------------------- paired 4-step cascade
+
+def paired_cascade(dit, up, text, z, za, sigmas, *, lr_steps: int, start: int = 0) -> dict:
+    """pi-H3 4-step as a cascade, no training: steps ``start .. start + lr_steps - 1`` at half resolution on the
+    teacher's noise pooled (``2 avgpool2x2(z)``), then the learned latent x2 of the clean estimate re-noised with ``z``
+    itself at the next grid sigma, and the remaining steps at full resolution. ``start=1`` skips the first, tiny step
+    (0.9965 -> 0.9645) and starts from ``sigma_1 z``."""
+    from h3_musubi import forward_video
+
+    s = sigmas[start:]
+    z_lr = 2.0 * F.avg_pool3d(z, (1, 2, 2))
+    x, y = s[0] * z_lr, s[0] * za
+    out: dict = {}
+    est = None
+    for i in range(len(s) - 1):
+        sigma, sigma_next = s[i], s[i + 1]
+        if i == lr_steps:
+            with torch.autocast("cuda", torch.bfloat16):
+                x = sigma * z + (1.0 - sigma) * up(est).float()
+        sa = float(audio_sigma(sigma))
+        store: dict = {}
+        v = forward_video(dit, x, 1.0 - sigma, text, audio=y * (sa / sigma), t_audio=1.0 - sa, out=store).float()
+        est = x + sigma * v
+        y = carried_audio_step(y, store["audio"].float(), sigma, sigma_next)
+        x = x + v * (sigma - sigma_next)
+        out["h"], out["temb"] = store["hidden"], store["temb_video"]
+    out["latent"] = x
+    return out
+
+
+@torch.no_grad()
+def cascade4(args) -> None:
+    """Held-out comparison of the paired 4-step cascades against the stored 4-step teacher (same seeds, same
+    model): time, LPIPS, detail, colour and contrast, contact sheets. ``teacher`` replays the teacher (a check:
+    LPIPS about 0)."""
+    import lpips
+
+    from accel_h3 import lpips_clip
+    from pih3_cascade import hf_energy, refuse_if_card_busy, sheet
+    from pih3_h3 import load_pih3, pih3_sample
+    from setproctitle import setproctitle
+    from train_dwd_h3 import load_text
+
+    setproctitle(f"pih3:cascade4 {args.out.name}"[:60])
+    refuse_if_card_busy(4.0)
+    items = sorted((args.data / args.folder / "held").glob("*.pt"))[:args.held]
+    model = load_pih3(4)
+    dit, head, sigmas = model["dit"], model["head"], model["sigmas"]
+    up = load_up_net(args.up)
+    lp = lpips.LPIPS(net="vgg", verbose=False).cuda().eval().requires_grad_(False)
+    variants = [("teacher", None, 0, 0, ""), ("full4@h3tiny", None, 0, 0, "h3tiny"),
+                ("c3+1", "cas", 3, 0, ""), ("c3+1@h3tiny", "cas", 3, 0, "h3tiny"),
+                ("c2+1skip", "cas", 2, 1, ""), ("c2+1skip@h3tiny", "cas", 2, 1, "h3tiny"),
+                ("full2@h3tiny", "full2", 0, 0, "h3tiny")]             # last: needs the 2-step adapter
+    keys = ("seconds", "lpips", "hf", "mean_diff", "std_ratio")
+    rows = {v[0]: {k: [] for k in keys} for v in variants}
+    clips: dict = {}
+    for name, kind, lr_steps, start, drop in variants:
+        if kind == "full2":                          # the current fallback: pi-H3 2-step, full res, blocks dropped
+            del dit, head, model
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            model = load_pih3(2)
+            dit, head = model["dit"], model["head"]
+        for k, path in enumerate(items):
+            item = torch.load(path, weights_only=False)
+            width, height = item["size"]
+            latent_t = item["latent_t"]
+            text = load_text(item["te"]).cuda()
+            z, _ = paired_noise(latent_t, height, width, item["seed"])
+            za = audio_noise(latent_t, item["seed"] + 1)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with drop_ctx(dit, drop):
+                if kind in (None, "full2"):
+                    out = pih3_sample(model, text, z, za)
+                else:
+                    out = paired_cascade(dit, up, text, z, za, sigmas, lr_steps=lr_steps, start=start)
+                px = head.decode(out["h"], out["temb"], (latent_t, height // 32, width // 32)).float()
+            torch.cuda.synchronize()
+            seconds = time.perf_counter() - t0
+            ref = item["pixels"].cuda().permute(3, 0, 1, 2).float().div(127.5).sub(1)[None]
+            r = rows[name]
+            r["seconds"].append(seconds)
+            r["lpips"].append(lpips_clip(lp, px, ref))
+            r["hf"].append(hf_energy(px) / hf_energy(ref))
+            r["mean_diff"].append(float((px.mean(dim=(0, 2, 3, 4)) - ref.mean(dim=(0, 2, 3, 4))).abs().mean()))
+            r["std_ratio"].append(float(px.std(dim=(0, 2, 3, 4)).mean() / ref.std(dim=(0, 2, 3, 4)).mean()))
+            if k < args.sheets:
+                clips.setdefault(k, {"teacher 4-step": item["pixels"]})[name] = u8(px)
+        summary = {key: (sorted(v[1:])[len(v[1:]) // 2] if key == "seconds" else sum(v) / len(v))
+                   for key, v in rows[name].items()}
+        print(f"LOT_H3 kind=pih3_cascade4 variant={name} " + " ".join(f"{k}={v:.4f}" for k, v in summary.items()),
+              flush=True)
+    args.out.mkdir(parents=True, exist_ok=True)
+    for k, clip_set in clips.items():
+        sheet(clip_set, args.out / f"sheet_p{k}.jpg", columns=4, tile_w=320)
+    summary = {name: {key: (sorted(v[1:])[len(v[1:]) // 2] if key == "seconds" else sum(v) / len(v))
+                      for key, v in r.items()} for name, r in rows.items()}
+    (args.out / "cascade4.json").write_text(json.dumps({"summary": summary, "rows": rows}, indent=1) + "\n")
+    print(json.dumps(summary, indent=1))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -746,6 +851,13 @@ def main() -> None:
     m.add_argument("--up", type=Path, default=Path(UP_DEFAULT))
     m.add_argument("--seed", type=int, default=0)
     m.add_argument("--check", action="store_true")
+    c = sub.add_parser("cascade4", help="paired pi-H3 4-step cascades against the stored teacher (no training)")
+    c.add_argument("--data", type=Path, required=True)
+    c.add_argument("--folder", default="768x512_f39")
+    c.add_argument("--out", type=Path, required=True)
+    c.add_argument("--held", type=int, default=8)
+    c.add_argument("--sheets", type=int, default=4)
+    c.add_argument("--up", type=Path, default=Path(UP_DEFAULT))
     e = sub.add_parser("eval")
     e.add_argument("--data", type=Path, required=True)
     e.add_argument("--folder", default="768x512_f39")
@@ -759,7 +871,7 @@ def main() -> None:
                    help="merged: the int8 pi-H3 adapter merged (deployment); bypass: unmerged (what dmd trains on)")
     e.add_argument("--rank", type=int, default=32)
     args = p.parse_args()
-    {"teacher": teacher, "train": train, "dmd": dmd_train, "eval": evaluate}[args.cmd](args)
+    {"teacher": teacher, "train": train, "dmd": dmd_train, "eval": evaluate, "cascade4": cascade4}[args.cmd](args)
 
 
 if __name__ == "__main__":
