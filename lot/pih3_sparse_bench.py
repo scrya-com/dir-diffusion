@@ -43,7 +43,15 @@ def main() -> None:
     p.add_argument("--prompts", type=int, default=3, help="held-out prompts; the first is a warm-up for times")
     p.add_argument("--holdout", type=int, default=8)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--spark-check", action="store_true",
+                   help="only pi-H3 2-step dense vs Spark-Attn: --warmup untimed calls each, then every prompt timed, "
+                        "LPIPS of Spark against dense per prompt, one contact sheet per size")
+    p.add_argument("--time-only", action="store_true",
+                   help="timing pass: per variant --warmup untimed calls, then --reps timed ones (no scores)")
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--reps", type=int, default=3)
     args = p.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
 
     from pih3_comfy_reference import ADAPTER, CHECKPOINT, FINAL_STEP_SIZE_SCALE, MAX_RAW_T, FixedNoise, call, \
         comfy_setup
@@ -85,9 +93,9 @@ def main() -> None:
                 model.set_model_patch_replace(lambda args, extra: {"img": args["img"]}, "dit", "double_block", index)
         return model
 
-    models = {4: adapter(4), 2: adapter(2)}
+    models = {4: adapter(4), 2: adapter(2)} if not args.spark_check else {2: adapter(2)}
     sigmas = {s: call(mappings, "pi-Flow Scheduler", model=models[s], steps=s, min_raw_t=0.0, max_raw_t=MAX_RAW_T[s],
-                      final_step_size_scale=FINAL_STEP_SIZE_SCALE)[0] for s in (2, 4)}
+                      final_step_size_scale=FINAL_STEP_SIZE_SCALE)[0] for s in models}
     (sampler,) = call(mappings, "KSamplerSelect", sampler_name="euler")
 
     def generate(model, steps, text, width, height, frames, seed):
@@ -114,6 +122,58 @@ def main() -> None:
                 "mean_diff": float((a.mean(dim=(0, 2, 3, 4)) - b.mean(dim=(0, 2, 3, 4))).abs().mean()),
                 "std_ratio": float(a.std(dim=(0, 2, 3, 4)).mean() / b.std(dim=(0, 2, 3, 4)).mean())}
 
+    if args.spark_check:
+        texts = [load_text(str(te)) for te in prompts]
+        report = []
+        for size in args.sizes:
+            width, height = (int(v) for v in size.split("x"))
+            for frames in args.frames:
+                name = f"{width}x{height}_f{frames}"
+                clips, times, lpips_rows = {}, {}, []
+                for label, model in (("2-step dense", models[2]), ("2-step spark", with_attention(models[2], "spark", ""))):
+                    for _ in range(args.warmup):                    # Spark compiles over more than one call
+                        generate(model, 2, texts[0], width, height, frames, 0)
+                    times[label] = []
+                    for index, text in enumerate(texts):
+                        u8, seconds = generate(model, 2, text, width, height, frames, index)
+                        times[label].append(round(seconds, 2))
+                        clips[(label, index)] = u8
+                for index in range(len(texts)):
+                    lpips_rows.append(round(score(clips[("2-step spark", index)], clips[("2-step dense", index)])["lpips"], 4))
+                sheet({f"p{i} {label}": clips[(label, i)] for i in range(len(texts))
+                       for label in ("2-step dense", "2-step spark")}, args.out / f"sheet_{name}.jpg", columns=4,
+                      tile_w=320)
+                row = {"case": name, "seconds_dense": times["2-step dense"], "seconds_spark": times["2-step spark"],
+                       "lpips_spark_vs_dense": lpips_rows}
+                report.append(row)
+                print("LOT_H3 kind=pih3_spark_check " + json.dumps(row), flush=True)
+                (args.out / "spark_check.json").write_text(json.dumps(report, indent=1) + "\n")
+        print("LOT_H3 kind=pih3_sparse_done ok=1", flush=True)
+        return
+    if args.time_only:                                 # sparse kernels compile/autotune over several calls
+        timing = []
+        text = load_text(str(prompts[0]))
+        for size in args.sizes:
+            width, height = (int(v) for v in size.split("x"))
+            for frames in args.frames:
+                cases = [("4-step dense", models[4], 4)] + [
+                    (f"2-step {a}{' +h3tiny' if d else ''}", with_attention(models[2], a, d), 2) for a, d in VARIANTS]
+                for label, model, steps in cases:
+                    try:
+                        for _ in range(args.warmup):
+                            generate(model, steps, text, width, height, frames, 0)
+                        times = [generate(model, steps, text, width, height, frames, 0)[1] for _ in range(args.reps)]
+                        row = {"case": f"{width}x{height}_f{frames}", "variant": label, "frames": frames,
+                               "seconds": round(statistics.median(times), 2), "all": [round(t, 2) for t in times]}
+                    except torch.OutOfMemoryError:
+                        row = {"case": f"{width}x{height}_f{frames}", "variant": label, "frames": frames,
+                               "seconds": None, "oom": 1}
+                        torch.cuda.empty_cache()
+                    timing.append(row)
+                    print("LOT_H3 kind=pih3_sparse_time " + json.dumps(row), flush=True)
+                    (args.out / "timing.json").write_text(json.dumps(timing, indent=1) + "\n")
+        print("LOT_H3 kind=pih3_sparse_done ok=1", flush=True)
+        return
     table = []
     for size in args.sizes:
         width, height = (int(v) for v in size.split("x"))

@@ -245,6 +245,32 @@ Gate (≤ 1.0 s, detail ≥ 0.95, LPIPS clearly below 0.473, same scene): **no v
 
 Contact sheets: `/media/2TB/lora-data/h3_lot/pih3/distill/cascade4/sheet_p*.jpg`.
 
+## Spark-Attn (2026-11-22)
+
+Spark-Attn (github.com/zechengtang/Spark-H3) on pi-H3 2-step DWD, on the authors' ComfyUI path.
+
+**Installed into the ComfyUI-pih3 tree only:**
+- `ComfyUI-Spark-H3-0.2.0-linux-x86_64-sm120-cu130.zip`, SHA-256 verified, in `custom_nodes`.
+- Its `spark_h3_kitchen 0.2.37` wheel in `.pyoverlay`, with `--no-deps`. install.py was read and not run: it would have pip-installed into the shared Python.
+- ComfyUI-piFlow fast-forwarded to v1.4.2.
+
+**Wiring:** as in `pi-H3-DWD-Spark-SM120.json`: `MiniMaxH3SparkAttentionSM120`, `speed` mode, top-k ratio 0.2, `min_tokens` 12288. It runs on ComfyUI v0.46.2.
+
+**Check:** `lot/pih3_sparse_bench.py --spark-check`, 39 frames, 2 prompts, 2 warm-up calls each (Spark compiles over more than one call).
+
+| 39 frames | Dense 2-step s | Spark 2-step s | LPIPS Spark vs dense (p0, p1) |
+|---|---|---|---|
+| 768×512 | 1.39, 1.38 | 1.43, 1.43 | 0.000, 0.000 |
+| 1344×768 | 4.96, 5.00 | 5.03, 5.15 | 0.000, 0.133 |
+
+- **Spark gives no speed at 39 frames.** With the authors' `min_tokens` 12288 it stays dense below about 12k tokens: all of 768×512, and 1344×768's shorter prompts. Where it engages at 1344×768, the clip is the same scene with small differences, at no gain.
+- **Its gain is on long clips.** From the stopped grid run, 124 frames:
+  - 768×512: 4.92 s against 6.49 s dense.
+  - 1344×768: 12.9 s against 29.6 s dense (2.3×).
+  - Against dense 2-step there it scores LPIPS 0.36–0.37, with the same pose and motion and changed clothing detail; one clip showed a dark smudge.
+
+Sheets: `/media/2TB/lora-data/h3_lot/pih3/spark_check/sheet_*.jpg`.
+
 ## Files
 
 | Path | What |
