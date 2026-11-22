@@ -47,20 +47,26 @@ cd lot
 D=/media/2TB/lora-data/h3_lot/pih3/distill
 
 # 0. The learned latent x2 (once; about 10 minutes). Interpolated latents are what ghost.
+#    The runs use latent_up_v2 (the default of --up): /media/2TB/lora-data/h3_lot/pih3/cascade/latent_up_v2/latent_up.pt
 python3 latent_up_h3.py --out $D/latent_up --width 160 --blocks 8 --steps 24000
 
-# 1. Teacher clips: pi-H3 4-step, full resolution. 500 training clips plus 8 held-out prompts (about 30 minutes)
-python3 pih3_distill.py teacher --out $D/data --size 768x512 --frames 39 --train 500 --holdout 8
+# 1. Teacher clips: pi-H3 4-step, full resolution, into $D/768x512_f39/{train,held}. 500 training clips plus the
+#    held-out prompts (--holdout per cache: 8 stills + 8 clips = 16), 3.6 s a clip, about 30 minutes. Resumes.
+python3 pih3_distill.py teacher --out $D --size 768x512 --frames 39 --train 500 --holdout 8
 
-# 2. A quick check (4 steps, prints s_per_step and peak_gb), then the run
-python3 pih3_distill.py train --data $D/data --out $D/run_a --up $D/latent_up/latent_up.pt --check
-python3 pih3_distill.py train --data $D/data --out $D/run_a --up $D/latent_up/latent_up.pt --steps 3000
-python3 pih3_distill.py train --data $D/data --out $D/run_b --up $D/latent_up/latent_up.pt --steps 3000 --drop h3tiny
+# 2. A quick check (4 steps, prints s_per_step and peak_gb), then the runs (run B first: it can meet the speed gate)
+python3 pih3_distill.py train --data $D --out $D/run_b --check --drop h3tiny
+python3 pih3_distill.py train --data $D --out $D/run_b --steps 1000 --drop h3tiny
+python3 pih3_distill.py train --data $D --out $D/run_a --steps 1500
 
 # 3. Held-out gate: time, LPIPS against the teacher, detail as a fraction of the teacher's, contact sheets
-python3 pih3_distill.py eval --data $D/data --out $D/eval_a --up $D/latent_up/latent_up.pt \
-  --lora $D/run_a/lora_1000.pt $D/run_a/lora_2000.pt $D/run_a/lora_3000.pt
+python3 pih3_distill.py eval --data $D --out $D/eval_b --drop h3tiny --lora $D/run_b/lora_500.pt $D/run_b/lora_1000.pt
 ```
+
+Measured on an RTX 5090: 6.3–6.5 s a training step at 768×512 × 39 frames, 28.6 GB peak (rank 32, both steps and
+the DWD head in the graph). LPIPS runs on one 256-pixel full-resolution crop (`--lpips-crop`) of 4 frames
+(`--lpips-frames`) of one native block; the whole frame runs out of memory. `--eval-every 250` (default) scores 8
+held-out clips (`--eval-held`) inside the run, at the start too (the untrained cascade), into `log.jsonl`.
 
 Checkpoints go to `run_*/lora_<step>.pt` every 250 steps. The log is `run_*/log.jsonl`. Resume with
 `--resume run_a/lora_<step>.pt --start-step <step>`. `eval` always includes two baselines with no LoRA: `cascade`
