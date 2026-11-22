@@ -18,6 +18,8 @@ Explainers: [scrya.com/dir_diffusion](https://scrya.com/dir_diffusion) and [scry
 
 ## News
 
+- **2026-11-22: pi-H3 is the reference model** (branch `feat/pi-h3`). pi-H3, by Hansheng Chen, Shengqu Cai, Jiaming Song, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas, is the official 2- and 4-step H3 with DWD ([Lakonik/pi-H3](https://huggingface.co/Lakonik/pi-H3)). It plugs into our benchmarks with `--generator pih3`. On an RTX 5090, a 39-frame 768×512 clip takes 1.55 s at 2 steps, or 1.31 s with H3-Tiny's 8 blocks dropped. Our DiR + DWD takes 4.1 s. [`docs/PIH3.md`](docs/PIH3.md).
+- **2026-11-22: training pi-H3 + DiR + MPEG (in progress, branch `exp/pih3-cascade`).** Starting at half resolution, MPEG style, is about 2× faster but soft, because pi-H3 was never trained for it. A DiR-style LoRA now learns to make that fast path match pi-H3 4-step. Recipe and commands: [`docs/PIH3_TRAIN.md`](docs/PIH3_TRAIN.md).
 - **2026-11-21: DWD weights** on Hugging Face: [johndpope/dir-diffusion-h3-dwd](https://huggingface.co/johndpope/dir-diffusion-h3-dwd). Run them with the `feat/accel` branch (below).
 - **2026-11-20: DiR + DWD at any resolution (branch `feat/accel`, experimental).** The published DWD stack decodes sizes it was not trained on (LPIPS 0.14–0.18 against the VAE from 384×256 to 1344×768). With DWD the DiT is over 90% of the time, so the next gains are fewer tokens and fewer iterations: half resolution + DWD is 1.0 s for a 1.6 s clip at 768×512. [`docs/ACCEL.md`](docs/ACCEL.md).
 - **2026-11-20: DiR + MPEG two-track.** About 2× faster end to end (768×512: 2.7 s against 5.5 s per 39-frame clip), as a different video, not the same one sooner. [`docs/TWO_TRACK.md`](docs/TWO_TRACK.md).
@@ -116,12 +118,15 @@ DWD decodes only the published DiR checkpoint's final iteration: with base H3, T
 |---|---|
 | DiR generator (DMD distillation) | [`DIR_CHEATSHEET.md`](DIR_CHEATSHEET.md): samples, cache, the recipe that works, renders |
 | DWD decoder | [`docs/DWD.md`](docs/DWD.md), recipe section: collect, ridge, final-iteration LoRA, refit, refiner |
+| pi-H3 fast path (pi-H3 + DiR + MPEG, in progress) | [`docs/PIH3_TRAIN.md`](docs/PIH3_TRAIN.md): teacher clips, LoRA distillation, held-out gate |
 | Streaming (experimental) | [`DIR_CHEATSHEET.md`](DIR_CHEATSHEET.md) section 6; Neighbor Forcing in [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md) |
 
 ## Docs
 
 - [`docs/DIR.md`](docs/DIR.md): how DiR works on H3, every result (what refines, what doesn't, video, Turbo, eDMD), speed and memory, status.
 - [`docs/DWD.md`](docs/DWD.md): decoding without the VAE: design, results, speed, recipe.
+- [`docs/PIH3.md`](docs/PIH3.md): pi-H3 as a generator here: setup, parity with the authors' ComfyUI path, results, two-track, the cascade, block dropping.
+- [`docs/PIH3_TRAIN.md`](docs/PIH3_TRAIN.md): training the pi-H3 2-step fast path (half resolution, then full) to match 4-step.
 - [`docs/TWO_TRACK.md`](docs/TWO_TRACK.md): DiR inside MPEG-Diffusion's two-track sampler: one-command benchmark, results.
 - [`docs/SOULX_LIVEACT.md`](docs/SOULX_LIVEACT.md): Neighbor Forcing and ConvKV memory.
 - [`docs/FILES.md`](docs/FILES.md): what every script does.
