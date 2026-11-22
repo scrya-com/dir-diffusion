@@ -218,6 +218,33 @@ A bypass LoRA was trained on the 2-step fast path, with H3-Tiny's 8 blocks dropp
 
 No run beat the untrained cascade by enough, matched the scene, and kept the detail. The table, the contact sheets and the next ideas are in [`PIH3_TRAIN.md`](PIH3_TRAIN.md#results-2026-11-22-the-gate-fails).
 
+## The paired 4-step cascade, no training (2026-11-22): fails the gate on detail and time
+
+The pi-H3 4-step adapter as a cascade (`pih3_distill.py cascade4`):
+- The half-resolution steps run on the teacher's own noise, pooled (`2 avgpool2x2(z)`).
+- The handoff is latent_up_v2, re-noised with `z` itself at the grid's last σ (0.696).
+- One full-resolution step finishes it.
+
+8 held-out prompts, 768×512, 39 frames, against pi-H3 4-step at full resolution with the same seeds:
+
+| Variant | s | LPIPS | Detail | Colour shift | Contrast | Scene, by eye |
+|---|---|---|---|---|---|---|
+| teacher replay (check) | 3.06 | 0.005 | 0.99 | 0.000 | 1.00 | same |
+| 4-step full, h3tiny drop | 2.61 | 0.397 | 1.08 | 0.102 | 1.01 | same pose, outfit changes |
+| **3+1 cascade** | 1.38 | 0.450 | 0.67 | 0.070 | 0.96 | **same** (pose, outfit, background), soft |
+| 3+1 cascade, h3tiny drop | 1.17 | 0.463 | 0.72 | 0.084 | 0.98 | same, soft |
+| 2+1, first step skipped | 1.20 | 0.614 | 0.81 | 0.124 | 1.12 | broken: close-up jump-cuts to full body |
+| 2+1, first step skipped, h3tiny drop | 1.02 | 0.620 | 0.83 | 0.130 | 1.13 | broken |
+| 2-step full, h3tiny drop (fallback) | 1.32 | 0.422 | 1.01 | 0.061 | 1.01 | same pose, different outfit |
+
+Gate (≤ 1.0 s, detail ≥ 0.95, LPIPS clearly below 0.473, same scene): **no variant passes.**
+- **Pairing works for the scene.** The 3+1 cascade lands on the teacher's video: the first time any LR-started path has.
+- **But it is soft** (detail 0.67–0.72) **and too slow** (1.17–1.38 s).
+- **Skipping the first step breaks the clip.**
+- **Dropping H3-Tiny's blocks is not free.** It shifts colour (0.08–0.10 mean difference) and changes clothing, even at 4 steps at full resolution.
+
+Contact sheets: `/media/2TB/lora-data/h3_lot/pih3/distill/cascade4/sheet_p*.jpg`.
+
 ## Files
 
 | Path | What |
