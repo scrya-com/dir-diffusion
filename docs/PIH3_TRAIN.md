@@ -86,30 +86,34 @@ On the held-out prompts, at 768×512, 39 frames:
 If the student does not beat `full2drop` (1.31 s, sharp), that stays the recommended fast path. A pass is then
 checked at 1344×768.
 
-## Results
+## Results (2026-11-22): the gate fails
 
-In progress. The gate result will go here, with the eval table and the contact sheets.
+All rows: 8 held-out prompts, 768×512, 39 frames, against the pi-H3 4-step teacher, H3-Tiny's 8 blocks dropped.
 
-**Regression (latent MSE + LPIPS) blurs.** Held-out eval, 8 clips, against the 4-step teacher, H3-Tiny's blocks dropped:
+| Run, step | Loss | LPIPS ↓ | Detail (hf) | Latent MSE | Colour shift | Contrast (std ratio) |
+|---|---|---|---|---|---|---|
+| Untrained cascade (step 0) | | 0.473 | 0.82 | 1.15 | | |
+| run_b, 250 | MSE + 0.2·LPIPS | 0.455 | 0.41 | 0.40 | | |
+| run_b2, 250 | 0.25·MSE + 1.0·LPIPS | 0.445 | 0.52 | 0.46 | | |
+| dmd_b, 250 | DMD + 0.05·MSE | 0.520 | 1.11 | 0.69 | 0.055 | 0.78 |
+| dmd_b2, 500 (from dmd_b 250) | DMD + 0.5·MSE | 0.449 | 0.68 | 0.46 | 0.049 | 0.66 |
 
-| | LPIPS | Detail (hf) | Latent MSE |
-|---|---|---|---|
-| Step 0 (untrained cascade) | 0.473 | 0.82 | 1.149 |
-| run_b, MSE + 0.2·LPIPS, step 250 | 0.455 | 0.41 | 0.404 |
-| run_b2, 0.25·MSE + 1.0·LPIPS, step 250 | 0.445 | 0.52 | 0.458 |
+Gate: LPIPS clearly below the untrained cascade, detail ≥ 0.95, same scene. **No run passes.** The time gate was not measured: the other criteria failed first.
 
-- The layout moves toward the teacher's, but detail collapses. Regressing onto a teacher that is a chaotic function of its noise averages the detail away, so both runs were stopped at step 250.
-- **A bug taints both runs.** With `--drop`, `backward()` ran after the drop context had exited. Activation checkpointing then recomputed the skipped blocks as real blocks, so the gradients were wrong. There was no error, because the shapes match. Fixed in `af8b51b`: `backward()` now runs inside the same switches (drop, adapter, LoRAs). The runs were not repeated: the blur conclusion is the likely one regardless.
+What the contact sheets show (`/media/2TB/lora-data/h3_lot/pih3/distill/dmd_b/sheet_{0,250}_p*.jpg`, `dmd_b2/sheet_{250,500}_p*.jpg`):
+- **Regression blurs.** It pulls the layout toward the teacher's and averages the detail away (0.41–0.52). The teacher is a chaotic function of its noise, so the regression target is effectively a mean.
+- **DMD restores detail but not the scene.**
+  - With a weak anchor (0.05), DMD gives sharp, clean frames (detail 1.11). But they keep the untrained cascade's composition, not the teacher's.
+  - It also picks up base H3's look, the real score: busier, ornate detail, warmer, and flatter contrast (0.78). An outfit went from black to beige.
+- **A stronger anchor (0.5) trades the detail back** (0.68) for LPIPS. Contrast gets worse (0.66): the person reads washed out and partly see-through.
+- **Why.** The pairing (pooled noise → the teacher's video) is what would fix the scene drift, but only regression enforces it, and regression blurs. DMD with base H3 as the real score pulls toward base H3's distribution, not pi-H3's.
 
-**Next: distribution matching** (`pih3_distill.py dmd`), as the DiR generator was trained:
-- **Real score:** base H3, through a switchable, unmerged pi-H3 adapter.
-- **Fake score:** a rank-16 fake LoRA.
-- **Anchor:** the latent MSE to the teacher at 0.05.
-- **Cost (RTX 5090, 768×512):** about 13.5 s a step, 29.8 GB peak.
+What might work next (not run):
+- **A pi-H3 real score instead of base H3** for DMD (pi-H3 4-step's velocity, or the pi-H3 2-step adapter itself), so the look is pi-H3's. It needs a second adapter state on the card: switchable, as `BypassAdapter` does for base H3.
+- **A GAN / feature discriminator** (DMD2) in place of the latent anchor.
+- **Noise pairing that the half-resolution step can actually follow:** e.g. the teacher's own LR-equivalent trajectory, not pooled noise.
 
-```bash
-python3 pih3_distill.py dmd --data $D --out $D/dmd_b --steps 1000 --drop h3tiny --fake-rank 16
-```
+A bug invalidated part of the regression evidence. Until `af8b51b`, `backward()` ran outside the drop context, so run_b and run_b2 back-propagated through the skipped blocks. The DMD runs are after the fix.
 
 ## Credits
 

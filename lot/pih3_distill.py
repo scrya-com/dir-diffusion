@@ -640,7 +640,7 @@ def evaluate(args) -> None:
     for ckpt in args.lora or []:
         variants.append((f"{Path(ckpt).parent.name}/{Path(ckpt).stem}" + (f"_{args.drop}" if args.drop else ""),
                          ckpt, args.drop))
-    rows = {name: {"seconds": [], "lpips": [], "hf": []} for name, _c, _d in variants}
+    rows = {name: {"seconds": [], "lpips": [], "hf": [], "mean_diff": [], "std_ratio": []} for name, _c, _d in variants}
     clips = {}
     for name, ckpt, drop in variants:
         if ckpt:
@@ -672,6 +672,9 @@ def evaluate(args) -> None:
             rows[name]["seconds"].append(seconds)
             rows[name]["lpips"].append(lpips_clip(lp, px.float(), ref))
             rows[name]["hf"].append(hf_energy(px) / hf_energy(ref))
+            pxf = px.float()
+            rows[name]["mean_diff"].append(float((pxf.mean(dim=(0, 2, 3, 4)) - ref.mean(dim=(0, 2, 3, 4))).abs().mean()))
+            rows[name]["std_ratio"].append(float(pxf.std(dim=(0, 2, 3, 4)).mean() / ref.std(dim=(0, 2, 3, 4)).mean()))
             if k < args.sheets:
                 clips.setdefault(k, {"teacher 4-step": item["pixels"]})[name] = u8(px)
         print(f"LOT_H3 kind=pih3_distill_eval variant={name} " + " ".join(

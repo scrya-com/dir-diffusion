@@ -208,6 +208,16 @@ By eye (`p1_*.mp4` in the bench folders):
 
 **Block dropping** (`dropscan`, 4-step): skipping H3-Tiny's 8 blocks, or the 8 least sensitive of a per-block scan (4, 6, 8, 11, 13, 15, 16, 17), gives a clean clip 16% faster with no training, at 1.5–2× the same-seed floor (LPIPS 0.14–0.49 against 0.07–0.26). 12 blocks still hold; 16 change the scene.
 
+## Training the fast path (branch `exp/pih3-cascade`, 2026-11-22): fails the gate
+
+A bypass LoRA was trained on the 2-step fast path, with H3-Tiny's 8 blocks dropped. The path: 1 step at half resolution, latent_up_v2, 1 step at full resolution. Two families of loss were tried against pi-H3 4-step: regression (latent MSE + LPIPS on DWD pixels), and DMD (base H3 as the real score, a fake LoRA, the latent MSE as an anchor).
+
+- **Regression** blurs: detail 0.41–0.52 of the teacher's.
+- **DMD** restores detail (1.11), but keeps another scene and picks up base H3's flatter, busier look.
+- **A stronger anchor** trades the detail back (0.68).
+
+No run beat the untrained cascade by enough, matched the scene, and kept the detail. The table, the contact sheets and the next ideas are in [`PIH3_TRAIN.md`](PIH3_TRAIN.md#results-2026-11-22-the-gate-fails).
+
 ## Files
 
 | Path | What |
