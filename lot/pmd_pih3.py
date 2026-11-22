@@ -315,7 +315,7 @@ def held_eval(model: FastPMD, head, lp, items, sheet_path: Path | None = None, s
     dit = model.dit
     was = dit.training
     dit.eval()
-    rows = {"lpips": [], "hf": [], "lat": [], "div": [], "seconds": []}
+    rows = {"lpips": [], "hf": [], "lat": [], "mean_diff": [], "std_ratio": [], "div": [], "seconds": []}
     try:
         for path in items:
             item = torch.load(path, weights_only=False)
@@ -335,6 +335,10 @@ def held_eval(model: FastPMD, head, lp, items, sheet_path: Path | None = None, s
             ref = item["pixels"].cuda().permute(3, 0, 1, 2).float().div(127.5).sub(1)[None]
             rows["lpips"].append(lpips_clip(lp, px, ref))
             rows["hf"].append(hf_energy(px) / hf_energy(ref))
+            # colour and contrast against the teacher, as pih3_distill.held_eval: |mean difference| per RGB channel
+            # ([-1, 1] units) and the ratio of the standard deviations (1.0 = the teacher's contrast)
+            rows["mean_diff"].append(float((px.mean(dim=(0, 2, 3, 4)) - ref.mean(dim=(0, 2, 3, 4))).abs().mean()))
+            rows["std_ratio"].append(float(px.std(dim=(0, 2, 3, 4)).mean() / ref.std(dim=(0, 2, 3, 4)).mean()))
             rows["lat"].append(float(torch.nn.functional.mse_loss(out["latent"], item["latent"].cuda().float())))
             if not baseline:
                 with model.student_mode():
