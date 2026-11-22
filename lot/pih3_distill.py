@@ -487,8 +487,11 @@ def dmd_train(args) -> None:
     head = PiH3Head(adapter.dwd, dit.final_layer.norm.eps)
     gen_params = [p for p in gen_net.parameters() if p.requires_grad]
     fake_params = [p for p in fake_net.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(gen_params, lr=args.lr, betas=(0.0, 0.95), weight_decay=0.0, foreach=False)
-    fake_opt = torch.optim.AdamW(fake_params, lr=args.fake_lr, betas=(0.0, 0.95), weight_decay=0.0, foreach=False)
+    import bitsandbytes as bnb                       # 8-bit Adam states: the fp32 ones left no headroom at 29.8 GB
+
+    opt = bnb.optim.AdamW8bit(gen_params, lr=args.lr, betas=(0.0, 0.95), weight_decay=0.0)
+    fake_opt = bnb.optim.AdamW8bit(fake_params, lr=args.fake_lr, betas=(0.0, 0.95), weight_decay=0.0)
+    head.to("cpu")                                   # on the card only for the held-out eval
     up = load_up_net(args.up)
     sigmas = pih3_sigmas(2)
     rng = random.Random(args.seed)
@@ -508,9 +511,12 @@ def dmd_train(args) -> None:
 
         lp = getattr(run_eval, "lp", None) or lpips.LPIPS(net="vgg", verbose=False).cuda().eval().requires_grad_(False)
         run_eval.lp = lp
+        head.to("cuda")
         with use_networks(gen_net, fake_net, gen=True, fake=False):
             row = {"step": step, "eval": held_eval(dit, head, up, lp, held, sigmas, args.drop,
                                                    sheet_path=args.out / f"sheet_{step}.jpg")}
+        head.to("cpu")
+        torch.cuda.empty_cache()
         print("LOT_H3 kind=pih3_distill_eval " + json.dumps(row), flush=True)
         log.write(json.dumps(row) + "\n")
         log.flush()
@@ -609,13 +615,23 @@ def evaluate(args) -> None:
     refuse_if_card_busy(4.0)
     folder = args.data / args.folder
     items = sorted((folder / "held").glob("*.pt"))[:args.held]
-    dit, network, head = load_student(lora=None, train=False)
+    if args.adapter == "bypass":                     # the form the DMD student trained on (unmerged pi-H3 adapter)
+        from h3_musubi import load_dit, make_lora
+
+        dit = load_dit(device="cuda", swap=0)
+        bypass = BypassAdapter(dit, adapter_path(2))
+        network = make_lora(dit, args.rank)
+        network.to("cuda", torch.float32).requires_grad_(False)
+        head = PiH3Head(bypass.dwd, dit.final_layer.norm.eps)
+    else:                                             # the deployment form: merged int8 adapter + bypass LoRA
+        dit, network, head = load_student(rank=args.rank, lora=None, train=False)
     up = load_up_net(args.up)
     lp = lpips.LPIPS(net="vgg", verbose=False).cuda().eval().requires_grad_(False)
     sigmas = pih3_sigmas(2)
     variants = [("cascade", None, args.drop), ("full2drop", None, "h3tiny")]
     for ckpt in args.lora or []:
-        variants.append((Path(ckpt).stem + (f"_{args.drop}" if args.drop else ""), ckpt, args.drop))
+        variants.append((f"{Path(ckpt).parent.name}/{Path(ckpt).stem}" + (f"_{args.drop}" if args.drop else ""),
+                         ckpt, args.drop))
     rows = {name: {"seconds": [], "lpips": [], "hf": []} for name, _c, _d in variants}
     clips = {}
     for name, ckpt, drop in variants:
@@ -726,6 +742,9 @@ def main() -> None:
     e.add_argument("--held", type=int, default=16)
     e.add_argument("--sheets", type=int, default=4)
     e.add_argument("--up", type=Path, default=Path(UP_DEFAULT))
+    e.add_argument("--adapter", choices=("merged", "bypass"), default="merged",
+                   help="merged: the int8 pi-H3 adapter merged (deployment); bypass: unmerged (what dmd trains on)")
+    e.add_argument("--rank", type=int, default=32)
     args = p.parse_args()
     {"teacher": teacher, "train": train, "dmd": dmd_train, "eval": evaluate}[args.cmd](args)
 
