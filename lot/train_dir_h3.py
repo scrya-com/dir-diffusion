@@ -870,7 +870,8 @@ def main() -> None:
             "tau_floor": str(args.tau_floor), "read_noise": args.read_noise, "tau_max": args.tau_max, "precise_teacher": args.precise_teacher, "fake_loss_weight": args.fake_loss_weight,
             "fake_grad_clip": args.fake_grad_clip, "weight_decay": args.weight_decay, "lr_warmup": args.lr_warmup,
             "fake_first": args.fake_first, "lr": args.lr, "fake_lr": args.fake_lr, "fake_source": args.fake_source, "frames": FRAMES, "eval_frames": EVAL_FRAMES, "fake_warmup": args.fake_warmup, "dmd_draws": args.dmd_draws, "eval_taus": list(args.eval_taus),
-            "swap": args.swap, "gpu": torch.cuda.get_device_name(device)}
+            "swap": args.swap, "gpu": torch.cuda.get_device_name(device),
+            "base_lokr": os.environ.get("LOT_H3_BASE_LOKR") or None}
     (args.out / "config.json").write_text(json.dumps(meta, indent=1))
 
     def save(tag: str) -> None:

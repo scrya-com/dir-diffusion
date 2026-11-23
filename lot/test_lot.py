@@ -1950,6 +1950,38 @@ def test_nf_dir_trainer_on_cpu():
         train_nf_h3.dmd_target = original
 
 
+def test_base_lokr_hook():
+    """base_lokr: the hook adds strength * x @ kron(w1, w2).T to the layer's output and removes cleanly."""
+    import tempfile
+
+    from safetensors.torch import save_file
+
+    from base_lokr import apply_base_lokr, kron_apply
+
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(5, 3, 24, generator=g)
+    w1, w2 = torch.randn(4, 3, generator=g), torch.randn(5, 8, generator=g)
+    assert torch.allclose(kron_apply(x, w1, w2), x @ torch.kron(w1, w2).T, atol=1e-4)
+    root = torch.nn.Module()
+    root.blocks = torch.nn.ModuleList([torch.nn.Module()])
+    root.blocks[0].fc = torch.nn.Linear(24, 20)
+    plain = root.blocks[0].fc(x)
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/iso.safetensors"
+        save_file({"diffusion_model.blocks.0.fc.lokr_w1": w1, "diffusion_model.blocks.0.fc.lokr_w2": w2,
+                   "diffusion_model.blocks.0.fc.alpha": torch.tensor(1.0)}, path)
+        handle = apply_base_lokr(root, path + ":0.6", dtype=torch.float32)
+        assert torch.allclose(root.blocks[0].fc(x), plain + 0.6 * x @ torch.kron(w1, w2).T, atol=1e-4)
+        handle.remove()
+        assert torch.equal(root.blocks[0].fc(x), plain)
+        save_file({"diffusion_model.blocks.9.fc.lokr_w1": w1, "diffusion_model.blocks.9.fc.lokr_w2": w2}, path)
+        try:
+            apply_base_lokr(root, path)
+            raise AssertionError("a LoKr layer with no module was accepted")
+        except ValueError:
+            pass
+
+
 def main():
     tests = [
         test_shape_and_centers,
@@ -2005,6 +2037,7 @@ def main():
         test_nf_memory_independent_reference,
         test_nf_dir_hooks_and_samplers,
         test_nf_dir_trainer_on_cpu,
+        test_base_lokr_hook,
     ]
     for test in tests:
         test()

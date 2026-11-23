@@ -150,6 +150,13 @@ def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, trai
     if train:
         dit.enable_gradient_checkpointing()
         dit.train()
+    base_lokr = os.environ.get("LOT_H3_BASE_LOKR")
+    if base_lokr:
+        # a frozen LoKr (e.g. an isometric style adapter) as part of the base: every forward, teacher included
+        from base_lokr import apply_base_lokr
+
+        dit._base_lokr = apply_base_lokr(dit, base_lokr)
+        print(f"LOT_H3 kind=base_lokr spec={base_lokr} layers={len(dit._base_lokr.handles)}", flush=True)
     return dit
 
 
