@@ -25,6 +25,8 @@ DiR runs inside ComfyUI's own H3 model (`comfy/ldm/minimax/model.py`). It uses t
 | **DiR H3 DWD Loader** (experimental) | Paths to the final-iteration LoRA, the pixel head and the refiner. Local paths or `hf://owner/repo/file`. Blank `refiner_path` skips the refiner. | `refine_dwd_h3.cache` (LoRA), `train_dwd_h3.load_head`, `refine_dwd_h3.Refiner` |
 | **DiR H3 DWD Sampler** (experimental) | Same inputs as the sampler plus `DWD_H3` → IMAGE (head + refiner, no VAE) and LATENT (the plain DiR latent, to VAE-decode for comparison). | `dwd_h3.DWDHead.decode`, `refine_dwd_h3.refine_clip` |
 
+**Loader `style_lora` / `style_strength`:** an optional MiniMax H3 LoRA or LoKr, such as an isometric style adapter. It runs in bypass beside the generator LoRA, summed per layer in one injection, so DWD's re-run sees it too. Use this input rather than a Load LoRA (Bypass) node upstream: ComfyUI keeps one bypass injection per model, so the generator LoRA would replace an upstream one, and the loader refuses that model. Results: `docs/ISO.md`.
+
 **Loader `lora_mode`:**
 - `bypass (as trained)` is the only mode: the LoRA runs beside the int8 weights through ComfyUI's bypass LoRA, as musubi-tuner trained it (bit-identical to musubi's `up(down(x)) * alpha / rank` arithmetic in bf16). A merge mode was removed: merging re-quantizes the int8 ConvRot weights, and this generator does not tolerate that (see GPU parity below).
 
@@ -68,6 +70,7 @@ These are in `../` (dir-diffusion's `comfyui/`), in API format (`*_api.json`) an
 - `dir_h3_video_api.json` / `dir_h3_video.json`: DiR + VAE Decode.
 - `dir_dwd_h3_video_api.json` / `dir_dwd_h3_video.json`: DiR + DWD (IMAGE without the VAE), plus a VAE Decode of the same latent for A/B.
 - `dir_dwd_h3_ref2va_api.json` / `dir_dwd_h3_ref2va.json`: the same with Ref2VA conditioning (one reference image as `<Picture 1>`).
+- `dir_dwd_h3_iso_api.json` / `dir_dwd_h3_iso.json`: DiR + DWD with the isometric style LoKr on the loader's `style_lora`.
 
 `tools/api_to_ui.py` regenerates the UI files from the API files.
 

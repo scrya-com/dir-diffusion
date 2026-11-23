@@ -1,0 +1,158 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "H3 DiT (pruned int8, the one DiR was trained on)"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  }
+ },
+ "4": {
+  "class_type": "DiRH3Loader",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "source": "johndpope/dir-diffusion-h3",
+   "lora_mode": "bypass (as trained)",
+   "strength": 1.0,
+   "tag": "",
+   "ema": false,
+   "style_lora": "scrya_iso_scene.safetensors",
+   "style_strength": 1.0
+  },
+  "_meta": {
+   "title": "DiR H3 Loader + isometric style LoKr (bypass, summed with the generator LoRA; 1.5 = stronger)"
+  }
+ },
+ "5": {
+  "class_type": "MiniMaxH3ImageToVideo",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ],
+   "prompt": "scrya_iso_scene, A photorealistic 3D isometric view of a cozy bakery interior, a baker kneading dough at a wooden counter, shelves of bread, warm morning light through the window, locked-off isometric camera.",
+   "width": 768,
+   "height": 512,
+   "length": 39
+  },
+  "_meta": {
+   "title": "t2va 768x512, 39 frames; start the prompt with the trigger scrya_iso_scene"
+  }
+ },
+ "6": {
+  "class_type": "DiRH3DWDLoader",
+  "inputs": {
+   "lora_path": "/media/2TB/lora-data/h3_lot/dwd/wB/dwd_ft_lora.pt",
+   "head_path": "/media/2TB/lora-data/h3_lot/dwd/wB_head/dwd_head_ridge.pt",
+   "refiner_path": "/media/2TB/lora-data/h3_lot/dwd/wG/refiner_best.pt",
+   "lora_strength": 1.0
+  },
+  "_meta": {
+   "title": "DWD weights (local paths until published; hf://owner/repo/file also works)"
+  }
+ },
+ "7": {
+  "class_type": "DiRH3DWDSampler",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "dir": [
+    "4",
+    1
+   ],
+   "positive": [
+    "5",
+    0
+   ],
+   "latent": [
+    "5",
+    1
+   ],
+   "seed": 7,
+   "noise_device": "gpu",
+   "sigmas": "",
+   "mix_state": "from run",
+   "dwd": [
+    "6",
+    0
+   ],
+   "refine": true,
+   "head_dtype": "float32"
+  },
+  "_meta": {
+   "title": "DiR + DWD: IMAGE without the VAE; LATENT is the plain DiR latent"
+  }
+ },
+ "8": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "7",
+    0
+   ],
+   "filename_prefix": "dir_h3/iso_dwd",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  },
+  "_meta": {
+   "title": "DWD decode (head + refiner)"
+  }
+ },
+ "9": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "7",
+    1
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE decode of the same latent, for A/B (bypass to save time)"
+  }
+ },
+ "10": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "9",
+    0
+   ],
+   "filename_prefix": "dir_h3/iso_vae",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  }
+ }
+}

@@ -401,6 +401,53 @@ def test_tiny(pack):
     except ValueError as error:
         check("tiny H3: keyframe conditioning is refused", "keyframes" in str(error), str(error)[:80])
 
+    # style LoRA (a LoKr, as fizgig's isometric adapters) summed with the generator LoRA in one bypass injection;
+    # lot's reference: the same LoKr as base_lokr forward hooks on the musubi model
+    import tempfile
+
+    from safetensors.torch import save_file
+
+    import base_lokr
+
+    g = torch.Generator().manual_seed(21)
+    lokr = {}
+    for name in ("blocks.1.attn.qkv_proj", "blocks.1.mlp.fc1", "blocks.2.attn.out_proj"):
+        layer = musubi.get_submodule(name)
+        o, i = layer.out_features, layer.in_features
+        lokr[f"diffusion_model.{name}.lokr_w1"] = torch.randn(2, 2, generator=g) * 0.5
+        lokr[f"diffusion_model.{name}.lokr_w2"] = torch.randn(o // 2, i // 2, generator=g) * (0.5 / (i // 2) ** 0.5)
+        lokr[f"diffusion_model.{name}.alpha"] = torch.tensor(1.0)
+    styled = nodes_mod.apply_generator_lora(patcher, gen_state, 1.0, "bypass (as trained)", lokr, 0.7)
+    with tempfile.TemporaryDirectory() as tmp:
+        save_file(lokr, f"{tmp}/style.safetensors")
+        hooks = base_lokr.apply_base_lokr(musubi, f"{tmp}/style.safetensors:0.7", dtype=torch.float32)
+        try:
+            with torch.inference_mode():
+                want_style = dir_h3.dir_sample(musubi, head_l, text, height=16 * H, width=16 * W, latent_t=T, iters=4,
+                                               seed=seed, sigmas=sigmas, device="cpu")[0]
+        finally:
+            hooks.remove()
+    with torch.inference_mode():
+        got_style = runtime.sample(styled, copy.deepcopy(head_v), positive, latent, seed=seed, sigmas=sigmas,
+                                   mix_state=False, noise_device="cpu", disable_pbar=True)["estimate"]
+        plain_again = runtime.sample(lora_patcher, copy.deepcopy(head_v), positive, latent, seed=seed, sigmas=sigmas,
+                                     mix_state=False, noise_device="cpu", disable_pbar=True)["estimate"]
+    check("tiny H3: style LoKr + generator LoRA (one bypass injection) == lot dir_sample with base_lokr hooks",
+          rel(got_style, want_style) < 1e-4, f"rel {rel(got_style, want_style):.1e}")
+    check("tiny H3: the style LoKr changes the result (it is applied)", rel(got_style, plain_again) > 1e-2,
+          f"rel {rel(got_style, plain_again):.2e}")
+    check("tiny H3: after a styled run the plain model is unchanged (no hook left behind)",
+          rel(plain_again, want) < 1e-4, f"rel {rel(plain_again, want):.1e}")
+    try:
+        stacked = patcher.clone()
+        stacked.set_injections("bypass_lora", [])
+        stacked.injections["bypass_lora"] = [object()]
+        nodes_mod.apply_generator_lora(stacked, gen_state, 1.0, "bypass (as trained)")
+        check("tiny H3: an upstream bypass LoRA is refused (it would be replaced)", False, "no error")
+    except ValueError as error:
+        check("tiny H3: an upstream bypass LoRA is refused (it would be replaced)", "style_lora" in str(error),
+              str(error)[:80])
+
     # Ref2VA: a reference image adds clean ref_img rows; the hooks rewrite only the target video and audio
     ref = {"kind": "image", "latent_h": H, "latent_w": W,
            "latent": torch.randn(1, 24, 1, H, W, generator=torch.Generator().manual_seed(3))}

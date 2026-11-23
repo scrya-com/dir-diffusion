@@ -109,16 +109,86 @@ def load_dir_bundle(source: str, tag: str = "", ema: bool = False):
     return DirBundle(head, meta, source), lora
 
 
-def apply_generator_lora(model, lora: dict, strength: float, mode: str):
-    """The generator LoRA on MODEL. Every ``lora_down`` must map to a layer (``load_dir_run`` refuses missing keys)."""
+class _SumAdapter:
+    """One bypass adapter per layer that adds several adapters' ``h`` (the DiR generator LoRA and a style LoRA/LoKr).
+
+    ComfyUI keeps one bypass injection per model under the key ``"bypass_lora"`` and one adapter per layer, so a
+    second ``load_bypass_lora_for_models`` replaces the first; stacking needs both in one injection."""
+
+    _SHAPE = ("is_conv", "conv_dim", "kernel_size", "in_channels", "out_channels", "kw_dict")
+
+    def __init__(self, parts):
+        self.parts = list(parts)          # [(adapter, strength)]
+        self.multiplier = 1.0
+        self.weights = None               # the hook's device move skips it; parts move on first use
+        self._device = None
+
+    def h(self, x: torch.Tensor, base_out: torch.Tensor) -> torch.Tensor:
+        from comfy.weight_adapter.bypass import BypassForwardHook
+
+        if self._device != x.device:
+            for adapter, _s in self.parts:
+                BypassForwardHook._move_adapter_weights_to_device(type("_H", (), {"adapter": adapter})(), x.device)
+            self._device = x.device
+        total = None
+        for adapter, strength in self.parts:
+            for name in self._SHAPE:
+                if hasattr(self, name):
+                    setattr(adapter, name, getattr(self, name))
+            adapter.multiplier = self.multiplier * strength
+            out = adapter.h(x, base_out)
+            total = out if total is None else total + out
+        return total
+
+    def g(self, y: torch.Tensor) -> torch.Tensor:
+        return y
+
+
+def _adapters(model, state: dict, what: str) -> dict:
+    import comfy.weight_adapter
+
     key_map = comfy.lora.model_lora_keys_unet(model.model, {})
-    loaded = comfy.lora.load_lora(comfy.lora_convert.convert_lora(lora), key_map)
-    expected = sum(1 for k in lora if k.endswith(".lora_down.weight"))
-    if len(loaded) != expected:
-        raise RuntimeError(f"generator LoRA: {len(loaded)} of {expected} modules map onto this model; is it MiniMax H3?")
+    loaded = comfy.lora.load_lora(comfy.lora_convert.convert_lora(state), key_map)
+    other = [k for k, v in loaded.items() if not isinstance(v, comfy.weight_adapter.WeightAdapterBase)]
+    if other:
+        raise ValueError(f"{what}: {len(other)} patches are not LoRA-type adapters (e.g. {other[0]}); bypass needs adapters")
+    return loaded
+
+
+def apply_generator_lora(model, lora: dict, strength: float, mode: str, style: dict | None = None,
+                         style_strength: float = 1.0):
+    """The generator LoRA on MODEL in bypass, plus an optional style LoRA/LoKr (``style``) summed per layer.
+    Every ``lora_down`` must map to a layer (``load_dir_run`` refuses missing keys)."""
+    import comfy.weight_adapter
+
     if not mode.startswith("bypass"):
         raise ValueError(f"lora_mode {mode!r}: only bypass is supported (merging re-quantizes the int8 weights)")
-    return comfy.sd.load_bypass_lora_for_models(model, None, lora, strength, 0)[0]
+    if model.get_injections("bypass_lora"):
+        raise ValueError("DiR H3 Loader: this model already has a bypass LoRA (e.g. Load LoRA (Bypass)); the DiR "
+                         "generator LoRA would replace it. Give that LoRA to the loader's style_lora input instead")
+    gen = _adapters(model, lora, "generator LoRA")
+    expected = sum(1 for k in lora if k.endswith(".lora_down.weight"))
+    if len(gen) != expected:
+        raise RuntimeError(f"generator LoRA: {len(gen)} of {expected} modules map onto this model; is it MiniMax H3?")
+    parts = {k: [(a, strength)] for k, a in gen.items()}
+    if style:
+        styled = _adapters(model, style, "style LoRA")
+        if not styled:
+            raise ValueError("style LoRA: no layer maps onto this model; is it a MiniMax H3 LoRA?")
+        for k, a in styled.items():
+            parts.setdefault(k, []).append((a, style_strength))
+        log.info("DiR H3: style LoRA on %d layers (%d shared with the generator LoRA)", len(styled),
+                 sum(1 for k in styled if k in gen))
+    patched = model.clone()
+    manager = comfy.weight_adapter.BypassInjectionManager()
+    sd_keys = set(patched.model.state_dict().keys())
+    for key, adapters in parts.items():
+        if key not in sd_keys:
+            raise RuntimeError(f"LoRA key {key} is not in the model")
+        manager.add_adapter(key, adapters[0][0] if len(adapters) == 1 and adapters[0][1] == 1.0 else _SumAdapter(adapters),
+                            strength=1.0)
+    patched.set_injections("bypass_lora", manager.create_injections(patched.model))
+    return patched
 
 
 def _check_h3(model) -> None:
@@ -159,16 +229,25 @@ class DiRH3Loader(io.ComfyNode):
                                 tooltip="intermediate save, e.g. _3 for lora_gen_3.safetensors"),
                 io.Boolean.Input("ema", default=False, optional=True, advanced=True,
                                  tooltip="load the *_ema copy"),
+                io.Combo.Input("style_lora", options=["none"] + folder_paths.get_filename_list("loras"), default="none",
+                               optional=True,
+                               tooltip="a MiniMax H3 LoRA/LoKr (e.g. an isometric style) run in bypass beside the "
+                                       "generator LoRA, summed per layer. Use this, not a Load LoRA node upstream"),
+                io.Float.Input("style_strength", default=1.0, min=-2.0, max=4.0, step=0.01, optional=True),
             ],
             outputs=[io.Model.Output(), DirSpec.Output(display_name="dir")],
         )
 
     @classmethod
-    def execute(cls, model, source, lora_mode, strength, tag="", ema=False) -> io.NodeOutput:
+    def execute(cls, model, source, lora_mode, strength, tag="", ema=False, style_lora="none",
+                style_strength=1.0) -> io.NodeOutput:
         _check_h3(model)
         bundle, lora = load_dir_bundle(source, tag, ema)
         log.info("DiR H3: %r", bundle)
-        return io.NodeOutput(apply_generator_lora(model, lora, strength, lora_mode), bundle)
+        style = None
+        if style_lora and style_lora != "none":
+            style = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", style_lora), safe_load=True)
+        return io.NodeOutput(apply_generator_lora(model, lora, strength, lora_mode, style, style_strength), bundle)
 
 
 def _sampler_inputs():
