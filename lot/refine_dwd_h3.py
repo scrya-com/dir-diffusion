@@ -72,7 +72,7 @@ class Refiner(nn.Module):
     """``(N, 9, H, W)`` (previous, current, next frame) -> residual for the current frame. Zero-initialised
     output, so an untrained refiner returns the DWD frame unchanged."""
 
-    def __init__(self, base: int = 48, latent: bool | int = False, grid: int = 0, grid_blocks: int = 4):
+    def __init__(self, base: int = 48, latent: bool | int = False, grid: int = 0, grid_blocks: int = 4, feat: int = 0):
         super().__init__()
         b = base
         # latent: False, True (the frame's 24-channel latent) or a channel count (CONTEXT_CH: neighbouring latent
@@ -88,7 +88,12 @@ class Refiner(nn.Module):
         self.grid_width, self.grid_blocks = (grid, grid_blocks) if grid else (0, 0)
         if grid and not self.latent:
             raise ValueError("the latent-grid path needs a latent input")
-        self.grid = LatentPath(self.latent_ch, grid, grid_blocks, 4 * b) if grid else None
+        # feat: DiT feature channels (a PCA of the DWD head's standardised [h, s] tokens, see ``feats``), nearest-
+        # upsampled from the 32 px token grid to the latent grid and read by the grid path beside the latent
+        self.feat_ch = int(feat)
+        if self.feat_ch and not grid:
+            raise ValueError("DiT features enter through the latent-grid path: give grid")
+        self.grid = LatentPath(self.latent_ch + self.feat_ch, grid, grid_blocks, 4 * b) if grid else None
         self.u2 = nn.ConvTranspose2d(4 * b, 2 * b, 4, stride=2, padding=1)
         self.m2 = Block(2 * b)
         self.u1 = nn.ConvTranspose2d(2 * b, b, 4, stride=2, padding=1)
@@ -97,14 +102,16 @@ class Refiner(nn.Module):
         nn.init.zeros_(self.out.weight)
         nn.init.zeros_(self.out.bias)
 
-    def forward(self, x, lat=None):
-        """``lat`` ``(N, 24, H/16, W/16)``: the current frame's latent, for a ``latent=True`` refiner."""
+    def forward(self, x, lat=None, feat=None):
+        """``lat`` ``(N, 24, H/16, W/16)``: the current frame's latent, for a ``latent=True`` refiner; ``feat``
+        ``(N, feat, H/16, W/16)``: its latent frame's DiT features on the latent grid, for a ``feat`` refiner."""
         inp = x if not self.latent else torch.cat([x, F.interpolate(lat.to(x.dtype), scale_factor=16, mode="nearest")], 1)
         h1 = self.e1(self.inp(inp))
         h2 = self.e2(self.d1(h1))
         h = self.d2(h2)
         if self.grid is not None:
-            h = h + self.grid(lat.to(x.dtype))
+            g = lat.to(x.dtype) if not self.feat_ch else torch.cat([lat.to(x.dtype), feat.to(x.dtype)], 1)
+            h = h + self.grid(g)
         h = self.mid(h)
         h = self.m2(self.u2(h) + h2)
         h = self.m1(self.u1(h) + h1)
@@ -117,7 +124,7 @@ CONTEXT_CH = 3 * 24 + 4
 def spec_of(saved: dict) -> dict:
     """Constructor arguments of a saved refiner (``refiner_best.pt`` or ``refiner_last.pt``), old files included."""
     return {"base": saved.get("base", 48), "latent": saved.get("latent_spec", saved.get("latent", False)),
-            "grid": saved.get("grid", 0), "grid_blocks": saved.get("grid_blocks", 4)}
+            "grid": saved.get("grid", 0), "grid_blocks": saved.get("grid_blocks", 4), "feat": saved.get("feat", 0)}
 
 
 def init_from(model: Refiner, saved: dict) -> list[str]:
@@ -144,6 +151,11 @@ def init_from(model: Refiner, saved: dict) -> list[str]:
                 new[:, 9 + 1:9 + 72:3] = old[:, 9:]
             elif old.shape[1] != 9:
                 raise SystemExit(f"--init: cannot widen {old.shape[1]} input channels to {value.shape[1]}")
+            own[name] = new
+        elif name == "grid.inp.weight" and old.shape != value.shape and old.shape[0] == value.shape[0] \
+                and old.shape[1] < value.shape[1] and old.shape[2:] == value.shape[2:]:
+            new = torch.zeros_like(value)                   # DiT-feature channels start at zero: same function
+            new[:, :old.shape[1]] = old
             own[name] = new
         elif old.shape != value.shape:
             raise SystemExit(f"--init: {name} is {tuple(old.shape)}, the model wants {tuple(value.shape)} (base?)")
@@ -199,7 +211,8 @@ def frame_groups(latent_t: int) -> list[int]:
 
 
 @torch.no_grad()
-def refine_clip(model: Refiner, clip: torch.Tensor, latent: torch.Tensor | None = None, chunk: int = 8) -> torch.Tensor:
+def refine_clip(model: Refiner, clip: torch.Tensor, latent: torch.Tensor | None = None, chunk: int = 8,
+                feat: torch.Tensor | None = None) -> torch.Tensor:
     """``(1, 3, F, H, W)`` in [-1, 1] -> refined clip, same shape. H and W must be multiples of 4 (16 with a
     latent). ``latent`` ``(1, 24, T, H/16, W/16)`` for a ``latent=True`` refiner."""
     frames = clip[0].permute(1, 0, 2, 3)
@@ -209,7 +222,13 @@ def refine_clip(model: Refiner, clip: torch.Tensor, latent: torch.Tensor | None 
         lat = frame_context(latent[0].float().cpu(), list(range(frames.shape[0]))).to(frames.device)
     elif model.latent:
         lat = latent[0][:, frame_groups(latent.shape[2])].permute(1, 0, 2, 3).float()          # (F, 24, h, w)
-    out = torch.cat([model(x[i:i + chunk], None if lat is None else lat[i:i + chunk])
+    ft = None
+    if getattr(model, "feat_ch", 0):
+        if feat is None:
+            raise ValueError("this refiner reads DiT features: pass feat (T, K, H/32, W/32)")
+        ft = feat_frames(feat.to(frames.device), frame_groups(feat.shape[0]))
+    out = torch.cat([model(x[i:i + chunk], None if lat is None else lat[i:i + chunk],
+                           None if ft is None else ft[i:i + chunk])
                      for i in range(0, x.shape[0], chunk)])
     return out.clamp(-1, 1).permute(1, 0, 2, 3).unsqueeze(0)
 
@@ -231,6 +250,17 @@ def read_mp4_u8(path: Path) -> torch.Tensor:
 def clip_latent(pair: dict) -> torch.Tensor:
     """The clip's stored final latent ``(1, 24, T, H/16, W/16)`` (beside its VAE target)."""
     return torch.load(Path(pair["vae"]).with_suffix(".pt"), map_location="cpu", mmap=True, weights_only=True)["latent"]
+
+
+def clip_feat(pair: dict) -> torch.Tensor:
+    """The clip's DiT features ``(T, K, H/32, W/32)`` (``feats`` phase), fp16."""
+    return torch.load(pair["feat"], map_location="cpu", mmap=True, weights_only=True)["feat"]
+
+
+def feat_frames(feat: torch.Tensor, groups: list[int]) -> torch.Tensor:
+    """``(T, K, h, w)`` token-grid features -> ``(len(groups), K, 2h, 2w)`` on the latent grid, one per pixel frame
+    (its own latent frame), nearest-upsampled."""
+    return feat[groups].repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
 
 
 # ------------------------------------------------------------------------------------------- cache
@@ -284,6 +314,106 @@ def cache(args) -> None:
     print(f"LOT_H3 kind=refine_cache_done pairs={len(pairs)} out={out} ok=1", flush=True)
 
 
+def feats(args) -> None:
+    """GPU: the DiT features of every pair's final iteration, as a ``--k``-dim PCA per token, for a ``--feat``
+    refiner. The DWD head's own standardisation (``DWDHead.features``: ``[h, s]`` minus mean, over scale) is
+    reduced with the top ``--k`` eigenvectors of its covariance over ``--stat-clips`` training clips. First
+    ``--verify`` clips are decoded with the head from the recomputed tokens and compared with the stored DWD mp4:
+    the features must be the ones that made those pixels. Writes OUT/<pair>.pt ``{"feat": (T, K, H/32, W/32)}``,
+    OUT/basis.pt and OUT/pairs.json (the input pairs with ``feat``)."""
+    from gpu_guard import refuse_if_busy
+
+    refuse_if_busy("refine_dwd_h3.py")
+    from dir_h3 import generator_step, load_dir_run, use_networks
+    from dwd_h3 import psnr as clip_psnr
+    from h3_musubi import load_dit, make_lora
+
+    dev = torch.device("cuda")
+    pairs = json.loads(args.pairs.read_text())
+    if args.folders:
+        pairs = [p for p in pairs if p["folder"] in args.folders or (p["held"] and args.all_held)]
+    rng = random.Random(0)
+    by_folder: dict = {}
+    for p in pairs:
+        by_folder.setdefault((p["folder"], p["held"]), []).append(p)
+    pairs = []
+    for (folder, held), group in sorted(by_folder.items()):
+        pairs += group if held or not args.train_per_folder else rng.sample(group, min(args.train_per_folder, len(group)))
+    dit = load_dit(device=dev, swap=0)
+    gen_head, net, _ = load_dir_run(args.run, dit)
+    saved = torch.load(args.lora, map_location="cpu", weights_only=True)
+    lora = make_lora(dit, saved["rank"])
+    lora.load_state_dict(saved["lora"], strict=False)
+    lora.to(dev, torch.float32)
+    lora.requires_grad_(False)
+    for module in lora.unet_loras:
+        module.enabled = any(k.startswith(module.lora_name + ".") for k in saved["lora"])
+    head = load_head(args.head, dev)
+    store: dict = {}
+    dit.final_layer.video_out.register_forward_pre_hook(lambda _m, a: store.__setitem__("h", a[0][0]))
+    keys = ("state", "prev", "text", "audio_seed", "sigma", "r", "s", "shape")
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    @torch.no_grad()
+    def features(pair):
+        d = load(Path(pair["vae"]).with_suffix(".pt"), dev, keys)
+        with use_networks(net, None, gen=True, fake=False):
+            generator_step(dit, gen_head, d["state"], d["prev"], d["r"], d["text"], sigma=d["sigma"],
+                           audio_generator=torch.Generator(dev).manual_seed(d["audio_seed"]))
+        return store["h"].float(), d["s"], d["shape"]
+
+    t0 = time.time()
+    basis_path = args.out / "basis.pt"
+    if basis_path.exists():
+        basis = torch.load(basis_path, map_location=dev, weights_only=True)["basis"]
+        print(f"LOT_H3 kind=refine_feats basis=existing k={basis.shape[1]}", flush=True)
+    else:
+        check = [p for p in pairs if not args.folders or p["folder"] in args.folders]
+        for pair in ([p for p in check if p["held"]] + [p for p in check if not p["held"]])[:args.verify]:
+            h, s_rows, shape = features(pair)
+            with torch.no_grad():
+                pix = head.decode(h, s_rows, *shape)
+            stored = read_mp4(Path(pair["dwd"])).to(dev)
+            got = clip_psnr(pix.clamp(-1, 1), stored)
+            print(f"LOT_H3 kind=refine_feats verify={Path(pair['dwd']).name} psnr_vs_stored_dwd={got:.2f}", flush=True)
+            if got < args.verify_db:
+                raise SystemExit(f"recomputed tokens decode to {got:.1f} dB of the stored DWD mp4 (< {args.verify_db}): "
+                                 "wrong LoRA, head, hook or iteration")
+        d_in = head.mean.shape[0]
+        cov = torch.zeros(d_in, d_in, dtype=torch.float64, device=dev)
+        n = 0
+        train = [p for p in pairs if not p["held"]]
+        for pair in rng.sample(train, min(args.stat_clips, len(train))):
+            h, s_rows, _shape = features(pair)
+            z = head.features(h, s_rows).double()
+            cov += z.T @ z
+            n += z.shape[0]
+        cov /= n
+        evals, evecs = torch.linalg.eigh(cov)
+        basis = evecs[:, -args.k:].flip(1).float()                       # (d_in, K), largest first
+        kept = (evals[-args.k:].sum() / evals.sum()).item()
+        torch.save({"basis": basis.cpu(), "mean": head.mean.cpu(), "scale": head.scale.cpu(), "k": args.k,
+                    "variance_kept": kept, "head": str(args.head), "lora": str(args.lora)}, basis_path)
+        print(f"LOT_H3 kind=refine_feats basis k={args.k} variance_kept={kept:.3f} tokens={n} "
+              f"min={(time.time() - t0) / 60:.1f}", flush=True)
+    out_pairs = []
+    for i, pair in enumerate(pairs):
+        dst = args.out / f"{Path(pair['dwd']).stem}.pt"
+        if not dst.exists():
+            h, s_rows, shape = features(pair)
+            f = (head.features(h, s_rows) @ basis).half()                     # (N, K)
+            t, th, tw = shape
+            tmp = dst.with_suffix(".tmp")
+            torch.save({"feat": f.reshape(t, th, tw, -1).permute(0, 3, 1, 2).contiguous().cpu()}, tmp)
+            tmp.replace(dst)
+        out_pairs.append({**pair, "feat": str(dst)})
+        if (i + 1) % 100 == 0:
+            print(f"LOT_H3 kind=refine_feats done={i + 1}/{len(pairs)} min={(time.time() - t0) / 60:.1f}", flush=True)
+    (args.out / "pairs.json").write_text(json.dumps(out_pairs, indent=1))
+    print(f"LOT_H3 kind=refine_feats_done pairs={len(out_pairs)} held={sum(p['held'] for p in out_pairs)} "
+          f"out={args.out} ok=1", flush=True)
+
+
 # ------------------------------------------------------------------------------------------- train
 
 class Crops(torch.utils.data.IterableDataset):
@@ -296,9 +426,9 @@ class Crops(torch.utils.data.IterableDataset):
     """
 
     def __init__(self, pairs: list[dict], crop: int, per_clip: int, seed: int, pool: int = 128, latent: bool = False,
-                 context: bool = False):
+                 context: bool = False, feat: bool = False):
         self.pairs, self.crop, self.per_clip, self.seed, self.pool = pairs, crop, per_clip, seed, pool
-        self.latent, self.context = latent or context, context
+        self.latent, self.context, self.feat = latent or context or feat, context, feat
 
     def __iter__(self):
         info = torch.utils.data.get_worker_info()
@@ -310,7 +440,9 @@ class Crops(torch.utils.data.IterableDataset):
             f, h, w, _ = a.shape
             if a.shape != b.shape or f < 2 or h < c or w < c:
                 continue
-            lat = group = None
+            lat = group = ft = None
+            if self.feat:
+                ft = clip_feat(p).float()                                             # (T, K, h/32, w/32)
             if self.latent:
                 lat = clip_latent(p)[0]                                               # (24, T, h/16, w/16)
                 if pixel_frame_count(lat.shape[1]) != f:
@@ -330,6 +462,9 @@ class Crops(torch.utils.data.IterableDataset):
                 elif self.latent:
                     item += (lat[:, [group[t], group[t + 1]], top // 16:(top + c) // 16,
                                  left // 16:(left + c) // 16].permute(1, 0, 2, 3).float(),)
+                if self.feat:
+                    item += (feat_frames(ft, [group[t], group[t + 1]])[:, :, top // 16:(top + c) // 16,
+                                                                       left // 16:(left + c) // 16].contiguous(),)
                 pool.append(item)
             while len(pool) > self.pool:
                 yield pool.pop(rng.randrange(len(pool)))
@@ -344,7 +479,8 @@ def evaluate(model: Refiner, pairs: list[dict], net, dev, limit: int = 2) -> tup
     for k, p in enumerate(pairs):
         dwd = read_mp4(Path(p["dwd"])).to(dev)
         vae = read_mp4(Path(p["vae"])).to(dev)
-        ref = refine_clip(model, dwd, clip_latent(p).to(dev) if model.latent else None)
+        ref = refine_clip(model, dwd, clip_latent(p).to(dev) if model.latent else None,
+                          feat=clip_feat(p).float() if model.feat_ch else None)
         t = latent_frames(dwd.shape[2])
         dv = vae[:, :, 1:] - vae[:, :, :-1]
         for name, clip, store in (("refined", ref, rows), ("dwd", dwd, base)):
@@ -385,13 +521,22 @@ def train(args) -> None:
     import lpips
 
     dev = torch.device(args.device)
-    pairs = json.loads((args.out / "cache" / "pairs.json").read_text())
+    pairs = json.loads((args.pairs or args.out / "cache" / "pairs.json").read_text())
     train_pairs = [p for p in pairs if not p["held"]]
     held = [p for p in pairs if p["held"]]
     latent_spec = CONTEXT_CH if args.latent_context else args.latent
     args.latent = bool(args.latent or args.latent_context)
-    model = Refiner(args.base, latent=latent_spec, grid=args.latent_grid, grid_blocks=args.grid_blocks).to(dev)
-    spec = {"base": args.base, "latent": latent_spec, "grid": model.grid_width, "grid_blocks": model.grid_blocks}
+    feat_k = 0
+    if args.feat:
+        missing = [p["dwd"] for p in pairs if "feat" not in p]
+        if missing:
+            raise SystemExit(f"--feat: {len(missing)} pairs have no DiT features (run feats), e.g. {missing[0]}")
+        feat_k = clip_feat(pairs[0]).shape[1]
+    model = Refiner(args.base, latent=latent_spec, grid=args.latent_grid, grid_blocks=args.grid_blocks,
+                    feat=feat_k).to(dev)
+    spec = {"base": args.base, "latent": latent_spec, "grid": model.grid_width, "grid_blocks": model.grid_blocks,
+            "feat": feat_k}
+    feat_basis = str(Path(pairs[0]["feat"]).parent / "basis.pt") if feat_k else None   # mean, scale, PCA basis
     net = lpips.LPIPS(net="vgg", verbose=False).to(dev).eval().requires_grad_(False)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     last_path = args.out / "refiner_last.pt"
@@ -426,7 +571,8 @@ def train(args) -> None:
     print(f"LOT_H3 kind=refine params={sum(p.numel() for p in model.parameters())} train_pairs={len(train_pairs)} "
           f"held={len(held)}", flush=True)
     loader = torch.utils.data.DataLoader(Crops(train_pairs, args.crop, args.per_clip, seed=step, pool=args.pool,
-                                               latent=args.latent, context=args.latent_context), batch_size=args.batch,
+                                               latent=args.latent, context=args.latent_context, feat=bool(feat_k)),
+                                         batch_size=args.batch,
                                          num_workers=args.workers, persistent_workers=True, prefetch_factor=4)
     t_start = time.time() - elapsed * 60
     next_eval = (math.floor(elapsed / args.eval_minutes) + 1) * args.eval_minutes * 60
@@ -437,7 +583,7 @@ def train(args) -> None:
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step, "best": best,
                     "elapsed": (time.time() - t_start) / 60, "log": log, "base": args.base,
                     "latent": args.latent, "latent_spec": latent_spec, "grid": model.grid_width,
-                    "grid_blocks": model.grid_blocks,
+                    "grid_blocks": model.grid_blocks, "feat": feat_k, "feat_basis": feat_basis,
                     "ema_model": None if ema_model is None else ema_model.state_dict()}, tmp)
         tmp.replace(last_path)
 
@@ -447,7 +593,8 @@ def train(args) -> None:
         x = batch[0].to(dev, non_blocking=True).flatten(0, 1).float() / 127.5 - 1      # (2B, 9, c, c): frame pairs
         y = batch[1].to(dev, non_blocking=True).flatten(0, 1).float() / 127.5 - 1
         lat = batch[2].to(dev, non_blocking=True).flatten(0, 1) if args.latent else None
-        pred = model(x, lat)
+        ft = batch[3].to(dev, non_blocking=True).flatten(0, 1) if feat_k else None
+        pred = model(x, lat, ft)
         l1 = (pred - y).abs().mean()
         lp = net(pred.clamp(-1, 1), y).mean()
         pp, yy = pred.unflatten(0, (-1, 2)), y.unflatten(0, (-1, 2))
@@ -486,7 +633,8 @@ def train(args) -> None:
                 best = m["refined"]["lpips"]
                 torch.save({"model": judged.state_dict(), "base": args.base, "latent": args.latent,
                             "latent_spec": latent_spec, "grid": model.grid_width,
-                            "grid_blocks": model.grid_blocks, "step": step}, args.out / "refiner_best.pt")
+                            "grid_blocks": model.grid_blocks, "feat": feat_k, "feat_basis": feat_basis,
+                            "step": step}, args.out / "refiner_best.pt")
                 write_videos(keep, args.out / "videos")
                 print(f"LOT_H3 kind=refine_save step={step} lpips={best:.4f} out={args.out}", flush=True)
             del keep
@@ -543,7 +691,22 @@ def main() -> None:
     c.add_argument("--head", type=Path, required=True)
     c.add_argument("--out", type=Path, required=True)
     c.add_argument("--train-per-folder", type=int, default=500)
+    q = sub.add_parser("feats", help="GPU: DiT features (PCA of the head's standardised tokens) for a --feat refiner")
+    q.add_argument("--run", type=Path, required=True)
+    q.add_argument("--pairs", type=Path, required=True, help="a cache's pairs.json (vae mp4s beside light samples)")
+    q.add_argument("--lora", type=Path, required=True, help="the DWD LoRA that made the pairs' DWD mp4s")
+    q.add_argument("--head", type=Path, required=True, help="the head that made them")
+    q.add_argument("--out", type=Path, required=True)
+    q.add_argument("--folders", nargs="+", default=None, help="only these folders' pairs")
+    q.add_argument("--all-held", action="store_true", help="with --folders: keep every folder's held-out pairs")
+    q.add_argument("--train-per-folder", type=int, default=0, help="0: all")
+    q.add_argument("--k", type=int, default=128)
+    q.add_argument("--stat-clips", type=int, default=150)
+    q.add_argument("--verify", type=int, default=5)
+    q.add_argument("--verify-db", type=float, default=35.0)
     t = sub.add_parser("train", help="train the refiner on cached pairs")
+    t.add_argument("--pairs", type=Path, default=None, help="pairs.json (default OUT/cache/pairs.json)")
+    t.add_argument("--feat", action="store_true", help="read the pairs' DiT features (feats phase) in the grid path")
     t.add_argument("--out", type=Path, required=True)
     t.add_argument("--minutes", type=float, default=240)
     t.add_argument("--eval-minutes", type=float, default=20)
@@ -590,7 +753,7 @@ def main() -> None:
         setproctitle(f"dwd:refine-{args.phase} {args.out.name if hasattr(args, 'out') else ''}")
     except ImportError:
         pass
-    {"cache": cache, "train": train, "bench": bench}[args.phase](args)
+    {"cache": cache, "feats": feats, "train": train, "bench": bench}[args.phase](args)
 
 
 if __name__ == "__main__":
