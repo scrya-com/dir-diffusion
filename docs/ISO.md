@@ -112,16 +112,19 @@ pi-H3 clips conditioned on an image push in steadily, whatever the prompt says.
 
 **Cause: pi-H3's distillation under image conditioning.** It is not Spark, the step count, LoRAs or the prompt, and base H3 does not do it.
 
-**With the isometric LoKr on pi-H3 (bypass, after the adapter), the camera stays locked:**
-- Three isometric first frames at 121 frames each, plus a Ref2VA clip, all measure 1.000 throughout.
-- The people still move: kneading, playing the arcade games, mending the net, walking.
-- The LoKr's locked-off training clips win over the drift.
+**With the isometric LoKr on pi-H3 (bypass, after the adapter): locked only on LoKr-native stills.**
+- On three isometric first frames that the same pipeline generated (768×512 landscape), and on a Ref2VA clip, zoom measured 1.000 over 121 frames, and people still moved.
+- **This does not generalise.** The Spicy session ran an A/B on non-LoKr stills (`/media/2TB/scratch-tests/iso_bypass_ab/`, 54 renders, 124 frames, seeds 7/11/23, 576×1024 portrait and 768×512).
+  - The exact graph here zoomed 2.25–2.43× on all three kimmy_at_bar seeds, and up to 1.9× on chanelle_by_piano.
+  - The LoKr also changed wardrobe and replaced or removed people.
+  - Their `iso_vs_persp` dial at −1.5 on 4-step pi-H3, with no LoKr, held about 1.0 on 6 of 6 with no wardrobe change.
+- **Use the LoKr only on stills it generated itself, or on text-to-video.** For image-to-video from other stills, use the dial guard.
 
 Rows: pi-H3 + iso image-to-video (3 scenes), the same with one base-H3 first step (not needed), and Ref2VA + iso; frames 0, 62 and 123.
 
 ![locked camera with the isometric LoKr](dwd_media/pih3_iso_locked_camera.jpg)
 
-- **Workflow:** `comfyui/pih3_2step_iso_i2v_api.json`, isometric image-to-video at 768×512, 121 frames.
+- **Workflow:** `comfyui/pih3_2step_iso_i2v_api.json`, isometric image-to-video at 768×512, 121 frames. Only for LoKr-native first frames; see above.
 - **Time:** 22–39 s per 5 s clip on the RTX 5090, including image encode and text encode.
 
 ## If the style ever needs to be distilled in
