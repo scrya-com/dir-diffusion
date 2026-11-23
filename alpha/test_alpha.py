@@ -51,9 +51,34 @@ def test_grad_reaches_head(m):
     assert head.proj_out.weight.grad is not None and head.proj_out.weight.grad.abs().sum() > 0
 
 
+def test_offset_grad(m):
+    from .h3_alpha import AlphaOffset
+    head, off = AlphaHead().cuda(), AlphaOffset().cuda()
+    torch.nn.init.normal_(off.net[-1].weight, std=1e-3)
+    x = torch.rand(1, 3, FRAMES, 256, 256, device="cuda")
+    a = torch.rand(1, 1, FRAMES, 256, 256, device="cuda")
+    z = encode(m, x)
+    za = encode(m, a.expand(-1, 3, -1, -1, -1))
+    uninstall = install(m, head, trunk_grad=True)
+    rgb, score = decode_rgba(m, z + off(z, za))
+    (ea_loss_per_sample(score, a)[0].sum() + rgb.square().mean()).backward()
+    uninstall()
+    g = off.net[-1].weight.grad
+    assert g is not None and g.abs().sum() > 0, "no gradient reached the offset net"
+    # delta = 0 reproduces RGB exactly through the grad-enabled trunk
+    off0 = AlphaOffset().cuda()
+    with torch.no_grad():
+        ref = m.decode(z.half()).float().cuda()
+        uninstall = install(m, head, trunk_grad=True)
+        rgb0, _ = decode_rgba(m, z + off0(z, za))
+        uninstall()
+    assert torch.equal(rgb0, ref), (rgb0 - ref).abs().max()
+
+
 if __name__ == "__main__":
     test_math()
     m = load_vae()
     test_rgb_unchanged(m)
     test_grad_reaches_head(m)
+    test_offset_grad(m)
     print("ALPHA_TESTS_OK")

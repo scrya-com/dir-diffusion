@@ -78,16 +78,17 @@ def _ease(t):
 
 
 def make_clips(stills: torch.Tensor, frames: int, gen: torch.Generator, modes=("static", "affine", "drift", "fade"),
-               probs=(0.15, 0.4, 0.3, 0.15)):
+               probs=(0.15, 0.4, 0.3, 0.15), return_modes: bool = False):
     """``stills`` (B, 4, H, W) straight RGBA on the GPU -> (padded RGB (B, 3, T, H, W) in [0, 1], alpha (B, 1, T, H, W))."""
     b, _, h, w = stills.shape
     dev = stills.device
     rgb, a = stills[:, :3], stills[:, 3:4]
     pm = torch.cat([rgb * a, a], 1)
     t = torch.linspace(0, 1, frames, device=dev)
-    out = []
+    out, picked = [], []
     for i in range(b):
         mode = modes[int(torch.multinomial(torch.tensor(probs), 1, generator=gen))]
+        picked.append(mode)
         r = lambda lo, hi: lo + (hi - lo) * float(torch.rand((), generator=gen))
         e = _ease(t) if mode != "static" else torch.zeros_like(t)
         tx0, ty0, tx1, ty1 = r(-.1, .1), r(-.1, .1), r(-.15, .15), r(-.15, .15)
@@ -118,7 +119,8 @@ def make_clips(stills: torch.Tensor, frames: int, gen: torch.Generator, modes=("
     alpha = clip[:, :, 3:4]
     straight = torch.where(alpha > 1e-4, clip[:, :, :3] / alpha.clamp_min(1e-4), torch.zeros_like(clip[:, :, :3]))
     padded = layerdiffuse_pad_rgb(straight.flatten(0, 1), alpha.flatten(0, 1)).view(b, frames, 3, h, w)
-    return padded.transpose(1, 2).contiguous(), alpha.transpose(1, 2).contiguous()
+    res = (padded.transpose(1, 2).contiguous(), alpha.transpose(1, 2).contiguous())
+    return res + (picked,) if return_modes else res
 
 
 def split_rows(jsonl, root, out_json, n_soft=(("effect", 100), ("translucent", 60), ("person", 60)), n_other=80,

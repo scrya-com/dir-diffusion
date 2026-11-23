@@ -18,11 +18,13 @@ score into alpha.
 
 from __future__ import annotations
 
+import contextlib
 import types
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 DEFAULT_TAPS = (11, 23, 35)
 
@@ -86,12 +88,63 @@ class AlphaHead(nn.Module):
         return coarse + res
 
 
+class AlphaOffset(nn.Module):
+    """LayerDiffuse-style latent transparency: delta = f(z_rgb, z_alpha), added to the RGB latent so the latent
+    itself carries alpha (padded RGB alone cannot: smoke, glass and fades have smooth colour). ``z_alpha`` is the
+    alpha matte encoded by the same frozen VAE, so it lines up with ``z_rgb`` through the VAE's temporal chunking.
+    Zero-initialised output: delta = 0 at step 0."""
+
+    def __init__(self, ch: int = 24, hidden: int = 128, layers: int = 4):
+        super().__init__()
+        mods, c = [], 2 * ch
+        for _ in range(layers):
+            mods += [nn.Conv3d(c, hidden, (3, 3, 3), padding=1), nn.GroupNorm(8, hidden), nn.SiLU()]
+            c = hidden
+        mods.append(nn.Conv3d(hidden, ch, (1, 3, 3), padding=(0, 1, 1)))
+        self.net = nn.Sequential(*mods)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, z_rgb: torch.Tensor, z_alpha: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([z_rgb, z_alpha], 1).float())
+
+
 def _unpatchify(output, b, t, h, w, c, pt, p):
     output = output.view(b, t, h, w, c, pt, p, p)
     return output.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(b, c, t * pt, h * p, w * p)
 
 
-def rgba_forward(decoder, head: AlphaHead, x: torch.Tensor) -> torch.Tensor:
+class _EagerTrunk:
+    """Make the frozen decoder trunk differentiable w.r.t. its input: ComfyUI's fused kernels (``rms_rope``,
+    fp16 ``linear_input_act``) have no backward, so route them through comfy_kitchen's eager torch versions."""
+
+    def __enter__(self):
+        import comfy.model_management as mm
+        from comfy.ldm.minimax import vae as h3vae
+        from comfy_kitchen.backends.eager import rope as eager_rope
+
+        def rms_rope(attn, query, key, rotary_pos_emb):
+            return eager_rope.rms_rope_split_half(query, key, rotary_pos_emb, attn.qk_norm_scale.to(query.device),
+                                                  epsilon=attn.norm_q.eps, rot_dim=rotary_pos_emb.shape[-3] * 2)
+
+        self.mm, self.cls = mm, h3vae.Attention
+        self.prev_train, self.prev_rope = mm.in_training, h3vae.Attention.rms_rope
+        mm.in_training = True
+        h3vae.Attention.rms_rope = rms_rope
+        return self
+
+    def __exit__(self, *exc):
+        self.mm.in_training = self.prev_train
+        self.cls.rms_rope = self.prev_rope
+
+
+def _eager_block(block, h, rope):
+    # the eager context must also hold when checkpointing recomputes the block during backward
+    with _EagerTrunk():
+        return block(h, rope)
+
+
+def rgba_forward(decoder, head: AlphaHead, x: torch.Tensor, trunk_grad: bool = False) -> torch.Tensor:
     """``ViT3DDecoder.forward`` plus the alpha head: (B, 24, T, H, W) -> (B, 4, 4T, 16H, 16W), channel 3 = score.
     The decoder trunk runs without gradients; only the head is trained."""
     from comfy.ldm.minimax import vae as h3vae
@@ -100,7 +153,10 @@ def rgba_forward(decoder, head: AlphaHead, x: torch.Tensor) -> torch.Tensor:
     b, _c, lt, lh, lw = x.shape
     taps = []
     want = set(head.taps)
-    with torch.no_grad():
+    grad = trunk_grad and torch.is_grad_enabled()
+    ctx = torch.enable_grad() if grad else torch.no_grad()
+    eager = _EagerTrunk() if grad else contextlib.nullcontext()
+    with ctx, eager:
         h = decoder.x_embedder(x.flatten(2).transpose(1, 2))
         n = h.shape[1]
         h = torch.cat([h, comfy.ops.cast_to_input(decoder.register_tokens, h).expand(b, -1, -1),
@@ -110,9 +166,12 @@ def rgba_forward(decoder, head: AlphaHead, x: torch.Tensor) -> torch.Tensor:
                                           device=x.device, dtype=ids.dtype)], dim=1)
         rope = decoder.pos_embed(ids)
         for i, block in enumerate(decoder.transformer_blocks):
-            h = block(h, rope)
+            if trunk_grad and torch.is_grad_enabled():
+                h = torch.utils.checkpoint.checkpoint(_eager_block, block, h, rope, use_reentrant=False)
+            else:
+                h = block(h, rope)
             if i in want:
-                taps.append(h[:, :n].detach())
+                taps.append(h[:, :n] if trunk_grad else h[:, :n].detach())
         rgb = decoder.proj_out(decoder.norm_out(h))
         rgb = h3vae.unpatchify(rgb[:, :n], b, lt, lh, lw, decoder.out_channels, decoder.patch_size_t, decoder.patch_size)
     coarse = _unpatchify(head.tokens(taps), b, lt, lh, lw, 1, head.patch_t, head.patch)
@@ -120,14 +179,14 @@ def rgba_forward(decoder, head: AlphaHead, x: torch.Tensor) -> torch.Tensor:
     return torch.cat([rgb.to(score.dtype), score], 1)
 
 
-def install(vae_model, head: AlphaHead):
+def install(vae_model, head: AlphaHead, trunk_grad: bool = False):
     """Make ``MiniMaxH3VideoVAE.decode`` return (B, 4, T, H, W): RGB in [0, 1] plus the raw alpha score.
     Returns an ``uninstall`` callable. Pass a 4-channel ``output_buffer`` on the GPU to keep gradients cheap."""
     dec = vae_model.decoder
     orig_forward, orig_finalize, orig_shape = dec.forward, vae_model._finalize_pixels, vae_model.decode_output_shape
 
     def forward(self, x):
-        return rgba_forward(self, head, x)
+        return rgba_forward(self, head, x, trunk_grad=trunk_grad)
 
     def finalize(self, part):
         return torch.cat([orig_finalize(part[:, :3]), part[:, 3:].float()], 1)
