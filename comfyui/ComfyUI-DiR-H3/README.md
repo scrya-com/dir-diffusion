@@ -58,7 +58,7 @@ The refiner's latent is that base estimate: `refine_dwd_h3.py` trained on `colle
 ## Limits
 
 - Text-to-video, which is what DiR was trained on, and Ref2VA references (MiniMax H3 Reference to Video). First/last-frame conditioning, denoise masks and PDD heads are refused.
-- Ref2VA: keep the fl2va DiT. It reads the reference rows (RTX 5090, `hub.png`, 512x768x39, seed 7: identity held with both the VAE and DWD). On `minimax_h3_ref2va_pruned_int8_convrot` the DiR latent is fine through the VAE but DWD decodes to a patch grid: its LoRA and head were trained on fl2va features. Audio stays silent (DiR's silent-audio rows); reference audio is read but not generated.
+- Ref2VA on `minimax_h3_ref2va_pruned_int8_convrot`: give the DWD loader the head refit on that DiT's features, `/media/2TB/lora-data/h3_lot/dwd/wB_head_ref2va/dwd_head_ridge.pt` (`train_dwd_h3.py collect --light` with `LOT_H3_CHECKPOINT` at the ref2va file, 2 x 300 iso + atlas prompts, then `targets`, `refit`, `refit --solve-only`; held-out PSNR 26.45 dB vs 26.69 for the fl2va head). With the fl2va head the ref2va DiT decodes to a patch grid. RTX 5090, `hub.png`, 512x768x39, seed 7: DWD vs VAE 31.5 dB (`docs/dwd_media/ref2va_refit_grid.jpg`). The fl2va DiT also reads Ref2VA references and works with the stock head. Audio stays silent (DiR's silent-audio rows); reference audio is read but not generated.
 - Batch size 1. Width and height must be multiples of 32.
 - The run was trained at 512×768, 39 frames (12 latent frames).
 - DWD is experimental. Its weights are local research files, not yet published, and its fp16 / bf16 head accuracy is unchecked.
