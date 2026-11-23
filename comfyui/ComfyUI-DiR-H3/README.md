@@ -24,6 +24,7 @@ DiR runs inside ComfyUI's own H3 model (`comfy/ldm/minimax/model.py`). It uses t
 | **DiR H3 Sampler** | MODEL, DIR_H3, positive conditioning, an H3 AV latent (sets size and length), seed → LATENT. Runs the R iterations. | `dir_h3.dir_sample` / `generator_step` |
 | **DiR H3 DWD Loader** (experimental) | Paths to the final-iteration LoRA, the pixel head and the refiner. Local paths or `hf://owner/repo/file`. Blank `refiner_path` skips the refiner. | `refine_dwd_h3.cache` (LoRA), `train_dwd_h3.load_head`, `refine_dwd_h3.Refiner` |
 | **DiR H3 DWD Sampler** (experimental) | Same inputs as the sampler plus `DWD_H3` → IMAGE (head + refiner, no VAE) and LATENT (the plain DiR latent, to VAE-decode for comparison). | `dwd_h3.DWDHead.decode`, `refine_dwd_h3.refine_clip` |
+| **DiR H3 Face Detailer** (experimental) | MODEL, DIR_H3, a close-up conditioning (Ref2VA keeps identity), VAE, IMAGE → IMAGE. One face box per clip (insightface, CPU; or `box`), cropped, upscaled to `crop_size`, re-noised to DiR's sigma at `start_iteration`, finished by DiR, colour-matched and feathered back. For faces too small for H3's 32 px tokens. | — |
 
 **Loader `style_lora` / `style_strength`:** an optional MiniMax H3 LoRA or LoKr, such as an isometric style adapter. It runs in bypass beside the generator LoRA, summed per layer in one injection, so DWD's re-run sees it too. Use this input rather than a Load LoRA (Bypass) node upstream: ComfyUI keeps one bypass injection per model, so the generator LoRA would replace an upstream one, and the loader refuses that model. Results: `docs/ISO.md`.
 
@@ -71,6 +72,7 @@ These are in `../` (dir-diffusion's `comfyui/`), in API format (`*_api.json`) an
 - `dir_dwd_h3_video_api.json` / `dir_dwd_h3_video.json`: DiR + DWD (IMAGE without the VAE), plus a VAE Decode of the same latent for A/B.
 - `dir_dwd_h3_ref2va_api.json` / `dir_dwd_h3_ref2va.json`: the same with Ref2VA conditioning (one reference image as `<Picture 1>`).
 - `dir_dwd_h3_iso_api.json` / `dir_dwd_h3_iso.json`: DiR + DWD with the isometric style LoKr on the loader's `style_lora`.
+- `dir_dwd_h3_ref2va_iso_face_api.json` / `dir_dwd_h3_ref2va_iso_face.json`: Ref2VA + isometric + the face detailer (close-up conditioning from a second Ref2VA node with the same reference).
 
 `tools/api_to_ui.py` regenerates the UI files from the API files.
 

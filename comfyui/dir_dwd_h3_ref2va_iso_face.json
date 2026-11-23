@@ -1,0 +1,883 @@
+{
+ "id": "ed0e180c-080a-5a84-9112-9c39d9ce0904",
+ "revision": 0,
+ "last_node_id": 14,
+ "last_link_id": 20,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "UNETLoader",
+   "pos": [
+    0,
+    0
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      1
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "UNETLoader"
+   },
+   "widgets_values": [
+    "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+    "default"
+   ],
+   "title": "H3 DiT fl2va (DiR/DWD's base; it reads Ref2VA refs. ref2va breaks DWD)"
+  },
+  {
+   "id": 2,
+   "type": "CLIPLoader",
+   "pos": [
+    0,
+    300
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "CLIP",
+     "type": "CLIP",
+     "links": [
+      2,
+      13
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPLoader"
+   },
+   "widgets_values": [
+    "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "minimax",
+    "default"
+   ]
+  },
+  {
+   "id": 3,
+   "type": "VAELoader",
+   "pos": [
+    0,
+    600
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "VAE",
+     "type": "VAE",
+     "links": [
+      3,
+      11,
+      14,
+      18
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAELoader"
+   },
+   "widgets_values": [
+    "minimax_h3_video_vae_fp16.safetensors"
+   ]
+  },
+  {
+   "id": 4,
+   "type": "DiRH3Loader",
+   "pos": [
+    420,
+    0
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 1
+    }
+   ],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      4,
+      15
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "dir",
+     "type": "DIR_H3",
+     "links": [
+      5,
+      16
+     ],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "DiRH3Loader"
+   },
+   "widgets_values": [
+    "johndpope/dir-diffusion-h3",
+    "bypass (as trained)",
+    1.0,
+    "",
+    false,
+    "scrya_iso_scene.safetensors",
+    1.0
+   ],
+   "title": "DiR H3 Loader + isometric style LoKr (1.0; 1.5 = stronger diorama)"
+  },
+  {
+   "id": 5,
+   "type": "MiniMaxH3ReferenceToVideo",
+   "pos": [
+    420,
+    300
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 2
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 3
+    },
+    {
+     "name": "audio_vae",
+     "type": "VAE",
+     "link": null
+    },
+    {
+     "name": "ref_images",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    },
+    {
+     "name": "ref_videos",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    },
+    {
+     "name": "ref_video_audios",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    },
+    {
+     "name": "ref_audios",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "links": [
+      6
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      7
+     ],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "MiniMaxH3ReferenceToVideo"
+   },
+   "widgets_values": [
+    "scrya_iso_scene, A photorealistic 3D isometric view of the woman from <Picture 1> working at a desk in a small cozy office, bookshelves, a desk lamp, a window with evening light, she types and glances up, locked-off isometric camera.",
+    768,
+    512,
+    39,
+    "match"
+   ],
+   "title": "Ref2VA 768x512, 39 frames: trigger scrya_iso_scene first, the reference as <Picture 1>"
+  },
+  {
+   "id": 6,
+   "type": "DiRH3DWDLoader",
+   "pos": [
+    0,
+    900
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "dwd",
+     "type": "DWD_H3",
+     "links": [
+      8
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "DiRH3DWDLoader"
+   },
+   "widgets_values": [
+    "/media/2TB/lora-data/h3_lot/dwd/wB/dwd_ft_lora.pt",
+    "/media/2TB/lora-data/h3_lot/dwd/wB_head/dwd_head_ridge.pt",
+    "/media/2TB/lora-data/h3_lot/dwd/wG/refiner_best.pt",
+    1.0
+   ],
+   "title": "DWD weights (local paths until published; hf://owner/repo/file also works)"
+  },
+  {
+   "id": 7,
+   "type": "DiRH3DWDSampler",
+   "pos": [
+    840,
+    0
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 8,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 4
+    },
+    {
+     "name": "dir",
+     "type": "DIR_H3",
+     "link": 5
+    },
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "link": 6
+    },
+    {
+     "name": "latent",
+     "type": "LATENT",
+     "link": 7
+    },
+    {
+     "name": "dwd",
+     "type": "DWD_H3",
+     "link": 8
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      9,
+      19
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      10
+     ],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "DiRH3DWDSampler"
+   },
+   "widgets_values": [
+    7,
+    "fixed",
+    "gpu",
+    "",
+    "from run",
+    true,
+    "float32"
+   ],
+   "title": "DiR + DWD: IMAGE without the VAE; LATENT is the plain DiR latent"
+  },
+  {
+   "id": 8,
+   "type": "SaveAnimatedWEBP",
+   "pos": [
+    1260,
+    0
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 9,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 9
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": [],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveAnimatedWEBP"
+   },
+   "widgets_values": [
+    "dir_h3/ref2va_iso_dwd",
+    24.0,
+    false,
+    90,
+    "default"
+   ],
+   "title": "DWD decode (head + refiner)"
+  },
+  {
+   "id": 9,
+   "type": "VAEDecode",
+   "pos": [
+    1260,
+    300
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 10,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "samples",
+     "type": "LATENT",
+     "link": 10
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 11
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      12
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAEDecode"
+   },
+   "widgets_values": [],
+   "title": "VAE decode of the same latent, for A/B (bypass to save time)"
+  },
+  {
+   "id": 10,
+   "type": "SaveAnimatedWEBP",
+   "pos": [
+    1680,
+    0
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 12,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 12
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": [],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveAnimatedWEBP"
+   },
+   "widgets_values": [
+    "dir_h3/ref2va_iso_vae",
+    24.0,
+    false,
+    90,
+    "default"
+   ]
+  },
+  {
+   "id": 11,
+   "type": "LoadImage",
+   "pos": [
+    0,
+    1200
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [],
+     "slot_index": 0
+    },
+    {
+     "name": "MASK",
+     "type": "MASK",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoadImage"
+   },
+   "widgets_values": [
+    "hub.png"
+   ],
+   "title": "Reference image"
+  },
+  {
+   "id": 12,
+   "type": "MiniMaxH3ReferenceToVideo",
+   "pos": [
+    420,
+    600
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 7,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 13
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 14
+    },
+    {
+     "name": "audio_vae",
+     "type": "VAE",
+     "link": null
+    },
+    {
+     "name": "ref_images",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    },
+    {
+     "name": "ref_videos",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    },
+    {
+     "name": "ref_video_audios",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    },
+    {
+     "name": "ref_audios",
+     "type": "COMFY_AUTOGROW_V3",
+     "link": null
+    }
+   ],
+   "outputs": [
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "links": [
+      17
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "MiniMaxH3ReferenceToVideo"
+   },
+   "widgets_values": [
+    "scrya_iso_scene, close-up of the woman from <Picture 1> seen from above at an isometric angle, her face and shoulders, red wavy hair, black zip jacket, sharp detailed face, clear eyes and mouth, soft warm light.",
+    512,
+    512,
+    39,
+    "match"
+   ],
+   "title": "Close-up conditioning for the face crop (same reference)"
+  },
+  {
+   "id": 13,
+   "type": "DiRH3FaceDetailer",
+   "pos": [
+    1260,
+    600
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 11,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 15
+    },
+    {
+     "name": "dir",
+     "type": "DIR_H3",
+     "link": 16
+    },
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "link": 17
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 18
+    },
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 19
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      20
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "report",
+     "type": "STRING",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "DiRH3FaceDetailer"
+   },
+   "widgets_values": [
+    7,
+    "fixed",
+    2,
+    512,
+    3.0,
+    0.15,
+    true,
+    ""
+   ],
+   "title": "Face detailer: redraw the face at 512 px with DiR from iteration 2"
+  },
+  {
+   "id": 14,
+   "type": "SaveAnimatedWEBP",
+   "pos": [
+    1680,
+    300
+   ],
+   "size": [
+    380,
+    260
+   ],
+   "flags": {},
+   "order": 13,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 20
+    }
+   ],
+   "outputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "links": [],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "SaveAnimatedWEBP"
+   },
+   "widgets_values": [
+    "dir_h3/ref2va_iso_face",
+    24.0,
+    false,
+    90,
+    "default"
+   ]
+  }
+ ],
+ "links": [
+  [
+   1,
+   1,
+   0,
+   4,
+   0,
+   "MODEL"
+  ],
+  [
+   2,
+   2,
+   0,
+   5,
+   0,
+   "CLIP"
+  ],
+  [
+   3,
+   3,
+   0,
+   5,
+   1,
+   "VAE"
+  ],
+  [
+   4,
+   4,
+   0,
+   7,
+   0,
+   "MODEL"
+  ],
+  [
+   5,
+   4,
+   1,
+   7,
+   1,
+   "DIR_H3"
+  ],
+  [
+   6,
+   5,
+   0,
+   7,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   7,
+   5,
+   1,
+   7,
+   3,
+   "LATENT"
+  ],
+  [
+   8,
+   6,
+   0,
+   7,
+   4,
+   "DWD_H3"
+  ],
+  [
+   9,
+   7,
+   0,
+   8,
+   0,
+   "IMAGE"
+  ],
+  [
+   10,
+   7,
+   1,
+   9,
+   0,
+   "LATENT"
+  ],
+  [
+   11,
+   3,
+   0,
+   9,
+   1,
+   "VAE"
+  ],
+  [
+   12,
+   9,
+   0,
+   10,
+   0,
+   "IMAGE"
+  ],
+  [
+   13,
+   2,
+   0,
+   12,
+   0,
+   "CLIP"
+  ],
+  [
+   14,
+   3,
+   0,
+   12,
+   1,
+   "VAE"
+  ],
+  [
+   15,
+   4,
+   0,
+   13,
+   0,
+   "MODEL"
+  ],
+  [
+   16,
+   4,
+   1,
+   13,
+   1,
+   "DIR_H3"
+  ],
+  [
+   17,
+   12,
+   0,
+   13,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   18,
+   3,
+   0,
+   13,
+   3,
+   "VAE"
+  ],
+  [
+   19,
+   7,
+   0,
+   13,
+   4,
+   "IMAGE"
+  ],
+  [
+   20,
+   13,
+   0,
+   14,
+   0,
+   "IMAGE"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.8,
+   "offset": [
+    0,
+    0
+   ]
+  }
+ },
+ "version": 0.4
+}

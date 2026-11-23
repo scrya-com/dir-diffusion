@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import importlib
 import importlib.util
 import json
 import os
@@ -67,7 +68,8 @@ def load_pack():
 def test_import(pack):
     nodes = asyncio.run(asyncio.run(pack.comfy_entrypoint()).get_node_list())
     names = sorted(n.__name__ for n in nodes)
-    check("entrypoint lists 4 nodes", names == ["DiRH3DWDLoader", "DiRH3DWDSampler", "DiRH3Loader", "DiRH3Sampler"], str(names))
+    check("entrypoint lists 5 nodes", names == ["DiRH3DWDLoader", "DiRH3DWDSampler", "DiRH3FaceDetailer", "DiRH3Loader",
+                                              "DiRH3Sampler"], str(names))
     for node in nodes:
         info = node.GET_NODE_INFO_V1()
         check(f"schema {node.__name__}", bool(info["output"]) and "required" in info["input"], f"outputs={info['output']}")
@@ -467,6 +469,53 @@ def test_tiny(pack):
     n_video = T * (H // 2) * (W // 2)
     check("tiny H3: Ref2VA + DWD tokens are the target video rows only",
           tuple(b["dwd_tokens"].shape[:1]) == (n_video,), str(tuple(b["dwd_tokens"].shape)))
+
+    # face detailer: the DiR part is the ordinary sampler from a re-noised crop, x0 fed as the previous estimate
+    fd = importlib.import_module(f"{PACK.name}.face_detailer")
+    x0 = torch.randn(1, 24, T, H, W, generator=torch.Generator().manual_seed(8))
+    for start in (3, 2):
+        with torch.inference_mode():
+            got = runtime.sample(lora_patcher, copy.deepcopy(head_v), positive, latent, seed=seed, sigmas=sigmas,
+                                 mix_state=False, noise_device="cpu", disable_pbar=True,
+                                 loop=fd.detail_loop(x0, start))["estimate"]
+            z = torch.randn(1, 24, T, H, W, generator=torch.Generator("cpu").manual_seed(seed))
+            state, est = sigmas[start] * z + (1 - sigmas[start]) * x0, x0
+            for r in range(start, 4):
+                est = dir_h3.generator_step(musubi, head_l, state, est, r, text, sigma=sigmas[r],
+                                            audio_generator=torch.Generator("cpu").manual_seed(seed + 1)).float()
+                if r < 3:
+                    state = dir_h3.next_state(state, est, sigmas[r], sigmas[r + 1])
+        check(f"tiny H3: face detailer DiR from iteration {start} == lot generator_step on the re-noised crop",
+              rel(got, est) < 1e-4, f"rel {rel(got, est):.1e}")
+
+    # geometry and paste, with an identity 'VAE' and a sampler that returns the crop unchanged
+    class PixelVAE:
+        def encode(self, px):
+            return px.permute(3, 0, 1, 2).unsqueeze(0)
+
+        def decode(self, lat):
+            return lat[0].permute(1, 2, 3, 0)
+
+    frames = torch.rand(5, 96, 160, 3, generator=torch.Generator().manual_seed(2))
+    bundle = type("B", (), {"sigmas": sigmas, "mix_state": False, "head": None})()
+    same = lambda *_a, loop=None, **_k: {"estimate": loop(lambda *a: None, torch.zeros(1), 0, sigmas, False)[0]}
+    out, report = fd.detail(None, bundle, None, PixelVAE(), frames, seed=0, start_iteration=3, crop_size=128,
+                            expand=1.0, feather=0.0, color_match=False, box="40 20 88 68", sample_fn=same)
+    inside = (slice(None), slice(20, 68), slice(40, 88))
+    outside = torch.ones(96, 160, dtype=torch.bool)
+    outside[20:68, 40:88] = False
+    check("face detailer: pixels outside the box are untouched", torch.equal(out[:, outside], frames[:, outside]))
+    check("face detailer: an identity redraw pastes back the same crop (resize round trip only)",
+          rel(out[inside], frames[inside]) < 0.2, report + f"; rel {rel(out[inside], frames[inside]):.2f}")
+    box = fd.clip_box([(10, 10, 20, 22), None, (14, 12, 24, 24)], 160, 96, expand=3.0, aspect=1.0)
+    check("face detailer: clip box is square, inside the frame and covers every face",
+          box[2] - box[0] == box[3] - box[1] and box[0] >= 0 and box[1] >= 0 and box[2] <= 160 and box[3] <= 96
+          and box[0] <= 10 and box[1] <= 10 and box[2] >= 24 and box[3] >= 24, str(box))
+    check("face detailer: crop shape is a multiple of 32 with the long side crop_size",
+          fd.crop_shape((0, 0, 90, 60), 512) == (512, 352), str(fd.crop_shape((0, 0, 90, 60), 512)))
+    m = fd.feather_mask(40, 60, 0.25)
+    check("face detailer: feather mask is 1 inside and fades to ~0 at the edge", m[20, 30] == 1 and m[0, 0] < 0.05,
+          f"{m[20, 30]:.2f} {m[0, 0]:.3f}")
 
 
 # ------------------------------------------------------------------------------------- 5. real files

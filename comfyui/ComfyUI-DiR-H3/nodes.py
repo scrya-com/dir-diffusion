@@ -394,4 +394,52 @@ class DiRH3DWDSampler(io.ComfyNode):
         return io.NodeOutput(image, result["latent"])
 
 
-NODES = [DiRH3Loader, DiRH3Sampler, DiRH3DWDLoader, DiRH3DWDSampler]
+class DiRH3FaceDetailer(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="DiRH3FaceDetailer",
+            display_name="DiR H3 Face Detailer",
+            category="model/minimax/dir",
+            description=("Redraw a small face at a higher resolution: one face box for the clip (insightface, or "
+                         "'box'), cropped, upscaled to crop_size, re-noised to DiR's sigma at start_iteration and "
+                         "finished by DiR, then colour-matched and blended back. Give it a close-up prompt; with "
+                         "MiniMax H3 Reference to Video the reference keeps the identity."),
+            inputs=[
+                io.Model.Input("model", tooltip="the DiR H3 Loader's MODEL (generator LoRA, and style LoRA if any)"),
+                DirSpec.Input("dir"),
+                io.Conditioning.Input("positive", tooltip="conditioning for the crop: a close-up prompt "
+                                                           "(Ref2VA: 'the woman from <Picture 1>, close-up ...')"),
+                io.Vae.Input("vae", tooltip="the H3 video VAE (encodes and decodes the crop)"),
+                io.Image.Input("images", tooltip="the decoded video (DWD or VAE)"),
+                io.Int.Input("seed", default=7, min=0, max=0xFFFFFFFFFFFFFFFF, control_after_generate=True),
+                io.Int.Input("start_iteration", default=2, min=0, max=3,
+                             tooltip="first DiR iteration run on the crop (sigma 1 / 0.947 / 0.857 / 0.667 for the "
+                                     "published run): lower redraws more and holds the original less"),
+                io.Int.Input("crop_size", default=512, min=128, max=1024, step=32,
+                             tooltip="long side of the crop the face is redrawn at"),
+                io.Float.Input("expand", default=3.0, min=1.0, max=8.0, step=0.1,
+                               tooltip="face box grown this many times (3: head and shoulders)"),
+                io.Float.Input("feather", default=0.15, min=0.0, max=0.5, step=0.01),
+                io.Boolean.Input("color_match", default=True),
+                io.String.Input("box", default="", optional=True,
+                                tooltip="x0 y0 x1 y1 in pixels instead of detection (e.g. a body box)"),
+            ],
+            outputs=[io.Image.Output(), io.String.Output(display_name="report")],
+        )
+
+    @classmethod
+    def execute(cls, model, dir, positive, vae, images, seed, start_iteration, crop_size, expand, feather,
+                color_match, box="") -> io.NodeOutput:
+        from . import face_detailer
+
+        _check_h3(model)
+        bundle = copy.copy(dir)
+        bundle.head = copy.deepcopy(dir.head)
+        out, report = face_detailer.detail(model, bundle, positive, vae, images, seed=seed,
+                                           start_iteration=start_iteration, crop_size=crop_size, expand=expand,
+                                           feather=feather, color_match=color_match, box=box)
+        return io.NodeOutput(out, report)
+
+
+NODES = [DiRH3Loader, DiRH3Sampler, DiRH3DWDLoader, DiRH3DWDSampler, DiRH3FaceDetailer]
