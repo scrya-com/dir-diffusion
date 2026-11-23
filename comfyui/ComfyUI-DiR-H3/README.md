@@ -54,7 +54,8 @@ The refiner's latent is that base estimate: `refine_dwd_h3.py` trained on `colle
 
 ## Limits
 
-- Text-to-video only, which is what DiR was trained on. First/last-frame or reference conditioning, denoise masks and PDD heads are refused.
+- Text-to-video, which is what DiR was trained on, and Ref2VA references (MiniMax H3 Reference to Video). First/last-frame conditioning, denoise masks and PDD heads are refused.
+- Ref2VA: keep the fl2va DiT. It reads the reference rows (RTX 5090, `hub.png`, 512x768x39, seed 7: identity held with both the VAE and DWD). On `minimax_h3_ref2va_pruned_int8_convrot` the DiR latent is fine through the VAE but DWD decodes to a patch grid: its LoRA and head were trained on fl2va features. Audio stays silent (DiR's silent-audio rows); reference audio is read but not generated.
 - Batch size 1. Width and height must be multiples of 32.
 - The run was trained at 512×768, 39 frames (12 latent frames).
 - DWD is experimental. Its weights are local research files, not yet published, and its fp16 / bf16 head accuracy is unchecked.
@@ -66,6 +67,7 @@ These are in `../` (dir-diffusion's `comfyui/`), in API format (`*_api.json`) an
 
 - `dir_h3_video_api.json` / `dir_h3_video.json`: DiR + VAE Decode.
 - `dir_dwd_h3_video_api.json` / `dir_dwd_h3_video.json`: DiR + DWD (IMAGE without the VAE), plus a VAE Decode of the same latent for A/B.
+- `dir_dwd_h3_ref2va_api.json` / `dir_dwd_h3_ref2va.json`: the same with Ref2VA conditioning (one reference image as `<Picture 1>`).
 
 `tools/api_to_ui.py` regenerates the UI files from the API files.
 

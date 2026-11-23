@@ -175,7 +175,7 @@ def _sampler_inputs():
     return [
         io.Model.Input("model", tooltip="MODEL from DiR H3 Loader"),
         DirSpec.Input("dir"),
-        io.Conditioning.Input("positive", tooltip="MiniMax H3 text conditioning (no first/last frame)"),
+        io.Conditioning.Input("positive", tooltip="MiniMax H3 text conditioning, or MiniMax H3 Reference to Video (Ref2VA) conditioning; no first/last frame"),
         io.Latent.Input("latent", tooltip="MiniMax H3 AV latent: sets width, height and length"),
         io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True),
         io.Combo.Input("noise_device", options=NOISE_DEVICES, default="gpu",

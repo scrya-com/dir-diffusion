@@ -165,11 +165,18 @@ class DirRun:
         return torch.cat([t_emb, new.unsqueeze(0)], dim=0), t_emb.shape[0]
 
 
+# Ref2VA reference rows (MiniMax H3 Reference to Video) are clean conditioning rows with their own segments and
+# timestep rows: the hooks leave them as ComfyUI built them and rewrite only the target video and audio.
+# First/last-frame keyframe rows ("cond", "cond_audio") stay refused.
+ALLOWED_KINDS = {"text", "audio", "video", "ref_img", "ref_audio"}
+
+
 def _target_spans(layout) -> tuple[tuple[int, int], tuple[int, int]]:
     kinds = {kind for _a, _b, kind in layout.segments}
-    if kinds - {"text", "audio", "video"}:
-        raise ValueError(f"DiR for H3 is text-to-video only: this conditioning adds {sorted(kinds - {'text', 'audio', 'video'})} "
-                         "rows (first/last frame or references). Use a plain prompt")
+    if kinds - ALLOWED_KINDS:
+        raise ValueError(f"DiR for H3 takes text or Ref2VA references only: this conditioning adds "
+                         f"{sorted(kinds - ALLOWED_KINDS)} rows (first/last frame keyframes). Use a plain prompt "
+                         "or MiniMax H3 Reference to Video")
     video = next((a, b) for a, b, kind in layout.segments if kind == "video")
     audio = next((a, b) for a, b, kind in layout.segments if kind == "audio")
     return video, audio

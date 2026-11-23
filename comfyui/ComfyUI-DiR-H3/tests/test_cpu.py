@@ -399,7 +399,27 @@ def test_tiny(pack):
                            latent, seed=seed, sigmas=sigmas, mix_state=False, noise_device="cpu", disable_pbar=True)
         check("tiny H3: keyframe conditioning is refused", False, "no error")
     except ValueError as error:
-        check("tiny H3: keyframe conditioning is refused", "text-to-video" in str(error), str(error)[:80])
+        check("tiny H3: keyframe conditioning is refused", "keyframes" in str(error), str(error)[:80])
+
+    # Ref2VA: a reference image adds clean ref_img rows; the hooks rewrite only the target video and audio
+    ref = {"kind": "image", "latent_h": H, "latent_w": W,
+           "latent": torch.randn(1, 24, 1, H, W, generator=torch.Generator().manual_seed(3))}
+    ref_positive = [[text, {"minimax_refs": [ref]}]]
+    with torch.inference_mode():
+        a = runtime.sample(lora_patcher, copy.deepcopy(head_v), ref_positive, latent, seed=seed, sigmas=sigmas,
+                           mix_state=False, noise_device="cpu", disable_pbar=True)
+        b = runtime.sample(lora_patcher, copy.deepcopy(head_v), ref_positive, latent, seed=seed, sigmas=sigmas,
+                           mix_state=False, noise_device="cpu", disable_pbar=True, dwd_lora=dwd_lora)
+        plain = runtime.sample(lora_patcher, copy.deepcopy(head_v), positive, latent, seed=seed, sigmas=sigmas,
+                               mix_state=False, noise_device="cpu", disable_pbar=True)
+    check("tiny H3: Ref2VA reference conditioning runs, finite", bool(torch.isfinite(a["estimate"]).all()))
+    check("tiny H3: the reference changes the result (refs are read)", rel(a["estimate"], plain["estimate"]) > 1e-3,
+          f"rel {rel(a['estimate'], plain['estimate']):.2e}")
+    check("tiny H3: Ref2VA + DWD: LATENT unchanged by the DWD capture", rel(b["estimate"], a["estimate"]) < 1e-5,
+          f"rel {rel(b['estimate'], a['estimate']):.1e}")
+    n_video = T * (H // 2) * (W // 2)
+    check("tiny H3: Ref2VA + DWD tokens are the target video rows only",
+          tuple(b["dwd_tokens"].shape[:1]) == (n_video,), str(tuple(b["dwd_tokens"].shape)))
 
 
 # ------------------------------------------------------------------------------------- 5. real files
