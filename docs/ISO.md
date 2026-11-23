@@ -179,3 +179,20 @@ So use the fix with the **4-step** adapter for clips with people; 2-step holds t
 ## If the style ever needs to be distilled in
 
 `LOT_H3_BASE_LOKR=PATH[:STRENGTH]` (`lot/base_lokr.py`, read by `h3_musubi.load_dit`) makes the LoKr part of the frozen base in every `lot/` script. In `train_dir_h3.py`, the teacher, generator and fake then all see base + adapter: DMD with an isometric teacher. In `train_dwd_h3.py`, collect, refit and ft see it too. ComfyUI's styled path matches `dir_sample` + `base_lokr` on the tiny CPU H3 (`tests/test_cpu.py`).
+
+## Face detailer on pi-H3 output
+
+The DiR face detailer needs only decoded frames, so it also post-processes pi-H3 clips. I tested it on the three camera-locked pi-H3 2-step clips (`cam_static` −2, `max_raw_t` 1.0; 121 frames, seed 7). Each pass used a Ref2VA reference (the clip's first frame) and a close-up face prompt. The 5090 was shared with another training run.
+
+![before | start 3 | start 2, frames 0 / 60 / 120](dwd_media/pih3_face_detailer.jpg)
+
+| Clip | Face box | Upscale | Frame-to-frame change in the face crop: before / start 3 / start 2 |
+|---|---|---|---|
+| bartender, 576×1024 | 141 px | 3.6× | 1.93 / 2.34 / 2.70 |
+| pianist, 576×1024 | 163 px | 3.1× | 3.09 / 3.42 / 3.61 |
+| reader, 1248×832 | 258 px | 2.0× | 1.52 / 1.61 / 1.76 |
+
+- **Detail:** at these sizes pi-H3's faces were not smeared to begin with. Start 3 adds sharper eyes, hair and skin texture and keeps the face recognisable.
+- **Start 2 changes the person:** the reader gains glasses he never had, the bartender gains stubble, and the pianist turns further towards the camera. Use start 3 on pi-H3.
+- **Flicker:** the face crop changes 5–20% more from frame to frame; no seam is visible.
+- **Where it should matter:** small faces in wide isometric shots (about 30 px), as in the DiR test above. That case is untested on pi-H3.
