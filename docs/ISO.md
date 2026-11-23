@@ -130,6 +130,41 @@ Rows: pi-H3 + iso image-to-video (3 scenes), the same with one base-H3 first ste
 - **Workflow:** `comfyui/pih3_2step_iso_i2v_api.json`, isometric image-to-video at 768×512, 121 frames. Only for LoKr-native first frames; see above.
 - **Time:** 22–39 s per 5 s clip on the RTX 5090, including image encode and text encode.
 
+## Fixing pi-H3's image-conditioned camera drift
+
+**Cause:** the drift is pi-H3's own. With a first frame, pi-H3 pushes in (or sometimes pulls out), and base H3 at 20 steps does not. The SFW reproduction is public at https://huggingface.co/datasets/johndpope/pi-H3-zoom-repro and reported on `Lakonik/pi-H3`.
+
+**Fix, no training: a camera dial at −2 plus `max_raw_t` 1.0.**
+- The dial is `cam_static`: 6 prompt pairs × 4 subjects, "camera on a tripod" vs "camera pushes in", built with ComfyUI-Dials `DialsMakeDial` (post-refiner hook).
+  - File: `/media/2TB/lora-data/dials/cam_static.safetensors`, also in ComfyUI `models/loras/dials/`.
+  - Pairs: `comfyui/dials/cam_static_pairs.txt`.
+- `max_raw_t` 1.0 makes the pi-Flow scheduler start from pure noise instead of 0.93.
+- Workflow: `comfyui/pih3_2step_i2v_camlock_api.json`.
+
+Zoom from frame 0 to the end of 121 frames, pi-H3 2-step, seed 7:
+
+| First frame | No fix | dial −2 | `max_raw_t` 1.0 | **both** |
+|---|---|---|---|---|
+| bartender, 576×1024 | 1.89 | 1.00 | 1.02 | **1.00** |
+| pianist, 576×1024 | 1.38 | 1.00 | 1.00 | **1.00** |
+| reader, 1248×832 | 2.15 | 1.96 | 1.26 | **1.00** |
+
+Other things tried:
+
+| Tried | Result |
+|---|---|
+| dial at −1 | 1.62 on the bartender |
+| the `iso_vs_persp` dial at −1.5 | 1.62 on the bartender |
+| base H3 for the first 4 steps, then pi-H3 | camera locked, but dark blotch artifacts and 74 s per clip |
+
+**Is the motion preserved?** The people keep moving: the reader turns his page, the bartender polishes, the pianist plays. Cost: nothing extra, 21–46 s a clip on the RTX 5090, the same as without the fix.
+
+Rows: the reader before the fix and with it; then the bartender and pianist with the fix. Frames 0 / 62 / 123.
+
+![camera lock](dwd_media/pih3_camlock.jpg)
+
+**Not yet tested:** the 4-step adapter, Spark attention, LoRAs, and the Spicy session's stills.
+
 ## If the style ever needs to be distilled in
 
 `LOT_H3_BASE_LOKR=PATH[:STRENGTH]` (`lot/base_lokr.py`, read by `h3_musubi.load_dit`) makes the LoKr part of the frozen base in every `lot/` script. In `train_dir_h3.py`, the teacher, generator and fake then all see base + adapter: DMD with an isometric teacher. In `train_dwd_h3.py`, collect, refit and ft see it too. ComfyUI's styled path matches `dir_sample` + `base_lokr` on the tiny CPU H3 (`tests/test_cpu.py`).

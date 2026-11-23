@@ -1,0 +1,190 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "MiniMaxH3ImageToVideo",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ],
+   "prompt": "A photorealistic 3D isometric cutaway view of a hotel lobby bar, a bartender in a white shirt and black waistcoat polishing a glass behind a marble counter, warm lamps, bottles on shelves. Static locked-off camera, no zoom, no camera movement.",
+   "width": 576,
+   "height": 1024,
+   "length": 121,
+   "first_frame": [
+    "30",
+    0
+   ]
+  }
+ },
+ "13": {
+  "class_type": "Load LakonLab Adapter",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "adapter_name": "pi_h3_2step_dwd_adapter_int8_convrot.safetensors",
+   "adapter_strength": 1.0
+  }
+ },
+ "14": {
+  "class_type": "MiniMaxH3SigmaShift",
+  "inputs": {
+   "model": [
+    "13",
+    0
+   ],
+   "shift_video": 12.0,
+   "shift_audio": 3.0
+  }
+ },
+ "15": {
+  "class_type": "pi-Flow Scheduler",
+  "inputs": {
+   "model": [
+    "61",
+    0
+   ],
+   "steps": 2,
+   "min_raw_t": 0.0,
+   "max_raw_t": 1.0,
+   "final_step_size_scale": 0.6
+  },
+  "_meta": {
+   "title": "pi-Flow scheduler: max_raw_t 1.0 (start from pure noise), the second half of the fix"
+  }
+ },
+ "16": {
+  "class_type": "BasicGuider",
+  "inputs": {
+   "model": [
+    "61",
+    0
+   ],
+   "conditioning": [
+    "5",
+    0
+   ]
+  }
+ },
+ "17": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 7
+  }
+ },
+ "18": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler"
+  }
+ },
+ "19": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "17",
+    0
+   ],
+   "guider": [
+    "16",
+    0
+   ],
+   "sampler": [
+    "18",
+    0
+   ],
+   "sigmas": [
+    "15",
+    0
+   ],
+   "latent_image": [
+    "5",
+    1
+   ]
+  }
+ },
+ "20": {
+  "class_type": "DWD Decode",
+  "inputs": {
+   "samples": [
+    "19",
+    0
+   ]
+  }
+ },
+ "21": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "20",
+    0
+   ],
+   "filename_prefix": "pih3/camlock",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  }
+ },
+ "30": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "hfrepro_576x1024_p0.png"
+  },
+  "_meta": {
+   "title": "first frame"
+  }
+ },
+ "63": {
+  "class_type": "DialsLoadDial",
+  "inputs": {
+   "dial_name": "dials/cam_static.safetensors"
+  },
+  "_meta": {
+   "title": "cam_static dial (dials/cam_static.safetensors): camera on a tripod vs pushing in"
+  }
+ },
+ "61": {
+  "class_type": "DialsApplyDial",
+  "inputs": {
+   "model": [
+    "14",
+    0
+   ],
+   "dial": [
+    "63",
+    0
+   ],
+   "strength": -2.0
+  },
+  "_meta": {
+   "title": "apply at -2 (feeds the scheduler and the guider)"
+  }
+ }
+}
