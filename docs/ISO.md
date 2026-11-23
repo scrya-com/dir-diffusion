@@ -163,7 +163,18 @@ Rows: the reader before the fix and with it; then the bartender and pianist with
 
 ![camera lock](dwd_media/pih3_camlock.jpg)
 
-**Not yet tested:** the 4-step adapter, Spark attention, LoRAs, and the Spicy session's stills.
+**4-step, Spark and production stills (Spicy session A/B, 2026-11-23).** 5 stills, including 2 live isometric beats, 3 seeds each, 576×1024, 124 frames:
+
+| Arm | Camera held | Notes |
+|---|---|---|
+| Old production: 4-step + `iso_vs_persp` −1.5, `max_raw_t` 0.96 | 10/15 | the 5 failures are push-ins up to 2.1× |
+| **4-step + Spark + `cam_static` −2 + `max_raw_t` 1.0** | **15/15** | room scale ≤ 1.017, background SSIM ≥ 0.86, wardrobe and identity stable, ~85% of the old motion (most of the old surplus was zoom) |
+| Same + `iso_vs_persp` −1 stacked | 15/15 | no overshoot; no better than `cam_static` alone |
+| 2-step camlock graph (`pih3_2step_i2v_camlock_api.json`) | 15/15 | **identity fails in 2/3 clips on one live still**: a person walks out and a stranger appears; sparkle artifacts on some seeds |
+
+So use the fix with the **4-step** adapter for clips with people; 2-step holds the camera but is weaker on identity. Production now runs the 4-step version (engine `pih3cam`): 90.6 s a clip and 22 GB peak on an RTX PRO 4000. Data: `/media/2TB/scratch-tests/camlock_ab/findings.md`.
+
+**Not yet tested:** character/style LoRAs.
 
 ## If the style ever needs to be distilled in
 
