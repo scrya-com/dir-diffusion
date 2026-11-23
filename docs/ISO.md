@@ -44,6 +44,33 @@ RTX 5090, `hub.png`, 768×512, 39 frames, seed 7. Rows: no style (DWD), iso 1.0 
 - **DWD:** matches the VAE decode.
 - **Checkpoint:** the ref2va checkpoint is not usable with DWD yet, because the head is being refit on its features.
 
+## Face detailer
+
+In these wide isometric shots a face is about 2×2 DiT tokens, too few for eyes or a mouth. The VAE and DWD decodes are equally smeared, so the decode is not the cause. Two-track cannot fix it either: its full-resolution steps come too late to redraw features (`docs/TWO_TRACK.md`).
+
+**DiR H3 Face Detailer** fixes this in a second pass:
+1. Finds one face box for the clip.
+2. Upscales the crop to 512 px, so the face gets roughly 16×16 tokens.
+3. Re-noises the crop and finishes it with DiR's last iterations, using a close-up Ref2VA prompt with the same reference.
+4. Blends it back.
+
+The workflow is `comfyui/dir_dwd_h3_ref2va_iso_face.json`.
+
+RTX 5090, same three scenes and seed. Columns: before (DWD), detailer from iteration 3 (σ 0.667, 1 forward), from iteration 2 (σ 0.857, 2 forwards), and the full frame with iteration 2.
+
+![before | start 3 | start 2 | full frame](dwd_media/face_detailer_grid.jpg)
+
+| Scene | Box (px) | Upscale | Motion in box: before / start 3 / start 2 |
+|---|---|---|---|
+| office | 179 | 2.9× | 1.87 / 1.52 / 1.80 |
+| coffee shop | 233 | 2.2× | 6.77 / 6.00 / 6.26 |
+| spaceship (she faces away) | 163 | 3.1× | 6.43 / 6.02 / 6.40 |
+
+- **Faces:** the coffee-shop face goes from a smear to eyes, nose and mouth that match the reference. The office face gets sharper eyes and brows. The back view barely changes.
+- **Flicker and seams:** no added flicker, and no visible seam.
+- **Which start to use:** start 3 keeps closer to the original; start 2 redraws a little more.
+- **Limit:** the redrawn face is pasted back at its original size (about 30 px of face). Detail finer than the output resolution is lost, so for close-ups render larger.
+
 ## If the style ever needs to be distilled in
 
 `LOT_H3_BASE_LOKR=PATH[:STRENGTH]` (`lot/base_lokr.py`, read by `h3_musubi.load_dit`) makes the LoKr part of the frozen base in every `lot/` script. In `train_dir_h3.py`, the teacher, generator and fake then all see base + adapter: DMD with an isometric teacher. In `train_dwd_h3.py`, collect, refit and ft see it too. ComfyUI's styled path matches `dir_sample` + `base_lokr` on the tiny CPU H3 (`tests/test_cpu.py`).
