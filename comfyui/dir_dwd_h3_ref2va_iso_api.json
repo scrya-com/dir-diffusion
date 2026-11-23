@@ -1,0 +1,172 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "H3 DiT fl2va (DiR/DWD's base; it reads Ref2VA refs. ref2va breaks DWD)"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  }
+ },
+ "4": {
+  "class_type": "DiRH3Loader",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "source": "johndpope/dir-diffusion-h3",
+   "lora_mode": "bypass (as trained)",
+   "strength": 1.0,
+   "tag": "",
+   "ema": false,
+   "style_lora": "scrya_iso_scene.safetensors",
+   "style_strength": 1.0
+  },
+  "_meta": {
+   "title": "DiR H3 Loader + isometric style LoKr (1.0; 1.5 = stronger diorama)"
+  }
+ },
+ "5": {
+  "class_type": "MiniMaxH3ReferenceToVideo",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ],
+   "prompt": "scrya_iso_scene, A photorealistic 3D isometric view of the woman from <Picture 1> working at a desk in a small cozy office, bookshelves, a desk lamp, a window with evening light, she types and glances up, locked-off isometric camera.",
+   "width": 768,
+   "height": 512,
+   "length": 39,
+   "ref_image_size": "match",
+   "ref_images.ref_image_0": [
+    "11",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Ref2VA 768x512, 39 frames: trigger scrya_iso_scene first, the reference as <Picture 1>"
+  }
+ },
+ "6": {
+  "class_type": "DiRH3DWDLoader",
+  "inputs": {
+   "lora_path": "/media/2TB/lora-data/h3_lot/dwd/wB/dwd_ft_lora.pt",
+   "head_path": "/media/2TB/lora-data/h3_lot/dwd/wB_head/dwd_head_ridge.pt",
+   "refiner_path": "/media/2TB/lora-data/h3_lot/dwd/wG/refiner_best.pt",
+   "lora_strength": 1.0
+  },
+  "_meta": {
+   "title": "DWD weights (local paths until published; hf://owner/repo/file also works)"
+  }
+ },
+ "7": {
+  "class_type": "DiRH3DWDSampler",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "dir": [
+    "4",
+    1
+   ],
+   "positive": [
+    "5",
+    0
+   ],
+   "latent": [
+    "5",
+    1
+   ],
+   "seed": 7,
+   "noise_device": "gpu",
+   "sigmas": "",
+   "mix_state": "from run",
+   "dwd": [
+    "6",
+    0
+   ],
+   "refine": true,
+   "head_dtype": "float32"
+  },
+  "_meta": {
+   "title": "DiR + DWD: IMAGE without the VAE; LATENT is the plain DiR latent"
+  }
+ },
+ "8": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "7",
+    0
+   ],
+   "filename_prefix": "dir_h3/ref2va_iso_dwd",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  },
+  "_meta": {
+   "title": "DWD decode (head + refiner)"
+  }
+ },
+ "9": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "7",
+    1
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE decode of the same latent, for A/B (bypass to save time)"
+  }
+ },
+ "10": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "9",
+    0
+   ],
+   "filename_prefix": "dir_h3/ref2va_iso_vae",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  }
+ },
+ "11": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "hub.png"
+  },
+  "_meta": {
+   "title": "Reference image"
+  }
+ }
+}
