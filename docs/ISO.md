@@ -118,6 +118,9 @@ pi-H3 clips conditioned on an image push in steadily, whatever the prompt says.
   - The exact graph here zoomed 2.25–2.43× on all three kimmy_at_bar seeds, and up to 1.9× on chanelle_by_piano.
   - The LoKr also changed wardrobe and replaced or removed people.
   - Their `iso_vs_persp` dial at −1.5 on 4-step pi-H3, with no LoKr, held about 1.0 on 6 of 6 with no wardrobe change.
+  - **What a dial is:** a prompt-embedding offset, the mean of (perspective − isometric) over 28 matched prompt pairs, taken after H3's text refiner. It is added at a strength to every prompt token. Negative strength means more isometric; −2 or below overshoots into a white void.
+  - **Files:** `/media/2TB/lora-data/dials/iso_vs_persp.safetensors` (with `iso_nocut.safetensors`), applied with the ComfyUI-Dials pack (`DialsLoadDial` + `DialsApplyDial`, after the attention node, feeding both the guider and the scheduler).
+  - **Write-up:** `/media/2TB/scratch-tests/iso_dial/findings.md`.
 - **Use the LoKr only on stills it generated itself, or on text-to-video.** For image-to-video from other stills, use the dial guard.
 
 Rows: pi-H3 + iso image-to-video (3 scenes), the same with one base-H3 first step (not needed), and Ref2VA + iso; frames 0, 62 and 123.
