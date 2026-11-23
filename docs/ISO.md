@@ -91,6 +91,39 @@ RTX 5090, 768×512, 39 frames, seed 7. Rows: pi-H3 2-step; + iso LoKr in bypass 
   - The face detailer runs on DiR's sampler.
   - Our DiR loader takes exactly 4 sigmas, so a 2-iteration DiR would need retraining.
 
+## pi-H3 camera zoom, and why the isometric path is immune
+
+pi-H3 clips conditioned on an image push in steadily, whatever the prompt says.
+- **How it was measured:** ORB features + a similarity fit from the first frame to later frames. The fit recovers synthetic 1.05/1.15/1.3 zooms exactly.
+- **The clip:** a 1248×832, 158-frame image-to-video run (4-step adapter, Spark attention).
+- **Every variant used the same image and seed:**
+
+| Variant | Zoom at 25 / 50 / 75 / 100% |
+|---|---|
+| as recorded | 1.29 / 1.77 / 2.25 / 2.46 |
+| no Spark attention | 1.28 / 1.72 / 2.20 / 2.47 |
+| 2-step adapter | 1.26 / 1.64 / 2.15 / 2.68 |
+| adapter strength 0.8 / 0.6 | 2.47 / 2.44 at the end |
+| max_raw_t 1.0 (start from pure noise) | 1.08 / 1.28 / 1.53 / 1.67 |
+| first frame = last frame | 1.50 / 2.64 / 1.63 / 1.00 (in, then back out) |
+| image as a Ref2VA reference instead | 1.11 / 1.29 / 1.53 / 1.73 |
+| no image | 1.00 throughout |
+| **base H3, 20 steps, same first frame** | **1.00 throughout** (488 s) |
+
+**Cause: pi-H3's distillation under image conditioning.** It is not Spark, the step count, LoRAs or the prompt, and base H3 does not do it.
+
+**With the isometric LoKr on pi-H3 (bypass, after the adapter), the camera stays locked:**
+- Three isometric first frames at 121 frames each, plus a Ref2VA clip, all measure 1.000 throughout.
+- The people still move: kneading, playing the arcade games, mending the net, walking.
+- The LoKr's locked-off training clips win over the drift.
+
+Rows: pi-H3 + iso image-to-video (3 scenes), the same with one base-H3 first step (not needed), and Ref2VA + iso; frames 0, 62 and 123.
+
+![locked camera with the isometric LoKr](dwd_media/pih3_iso_locked_camera.jpg)
+
+- **Workflow:** `comfyui/pih3_2step_iso_i2v_api.json`, isometric image-to-video at 768×512, 121 frames.
+- **Time:** 22–39 s per 5 s clip on the RTX 5090, including image encode and text encode.
+
 ## If the style ever needs to be distilled in
 
 `LOT_H3_BASE_LOKR=PATH[:STRENGTH]` (`lot/base_lokr.py`, read by `h3_musubi.load_dit`) makes the LoKr part of the frozen base in every `lot/` script. In `train_dir_h3.py`, the teacher, generator and fake then all see base + adapter: DMD with an isometric teacher. In `train_dwd_h3.py`, collect, refit and ft see it too. ComfyUI's styled path matches `dir_sample` + `base_lokr` on the tiny CPU H3 (`tests/test_cpu.py`).
