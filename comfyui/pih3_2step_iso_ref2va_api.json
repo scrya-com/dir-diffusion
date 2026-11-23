@@ -1,0 +1,188 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "H3 DiT fl2va (pi-H3's base)"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "type": "minimax",
+   "device": "default"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  }
+ },
+ "11": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "hub.png"
+  }
+ },
+ "5": {
+  "class_type": "MiniMaxH3ReferenceToVideo",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ],
+   "prompt": "scrya_iso_scene, A photorealistic 3D isometric view of the woman from <Picture 1> walking through a tiny coffee shop, wooden counter, espresso machine, hanging plants, warm light, locked-off isometric camera.",
+   "width": 768,
+   "height": 512,
+   "length": 39,
+   "ref_image_size": "match",
+   "ref_images.ref_image_0": [
+    "11",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Ref2VA: reference as <Picture 1>, trigger scrya_iso_scene first"
+  }
+ },
+ "13": {
+  "class_type": "Load LakonLab Adapter",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "adapter_name": "pi_h3_2step_dwd_adapter_int8_convrot.safetensors",
+   "adapter_strength": 1.0
+  },
+  "_meta": {
+   "title": "pi-H3 2-step adapter (with its DWD head)"
+  }
+ },
+ "12": {
+  "class_type": "LoraLoaderBypassModelOnly",
+  "inputs": {
+   "model": [
+    "13",
+    0
+   ],
+   "lora_name": "scrya_iso_scene.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "isometric LoKr in BYPASS after the pi-H3 adapter (the adapter replaces adaLN and blocks 46-49, so a LoRA before it loses those parts)"
+  }
+ },
+ "14": {
+  "class_type": "MiniMaxH3SigmaShift",
+  "inputs": {
+   "model": [
+    "12",
+    0
+   ],
+   "shift_video": 12.0,
+   "shift_audio": 3.0
+  }
+ },
+ "15": {
+  "class_type": "pi-Flow Scheduler",
+  "inputs": {
+   "model": [
+    "14",
+    0
+   ],
+   "steps": 2,
+   "min_raw_t": 0.0,
+   "max_raw_t": 0.93,
+   "final_step_size_scale": 0.6
+  },
+  "_meta": {
+   "title": "pi-Flow scheduler, 2 steps (official settings)"
+  }
+ },
+ "16": {
+  "class_type": "BasicGuider",
+  "inputs": {
+   "model": [
+    "14",
+    0
+   ],
+   "conditioning": [
+    "5",
+    0
+   ]
+  }
+ },
+ "17": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 7
+  }
+ },
+ "18": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler"
+  }
+ },
+ "19": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "17",
+    0
+   ],
+   "guider": [
+    "16",
+    0
+   ],
+   "sampler": [
+    "18",
+    0
+   ],
+   "sigmas": [
+    "15",
+    0
+   ],
+   "latent_image": [
+    "5",
+    1
+   ]
+  }
+ },
+ "20": {
+  "class_type": "DWD Decode",
+  "inputs": {
+   "samples": [
+    "19",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "pi-H3 DWD decode (no VAE)"
+  }
+ },
+ "21": {
+  "class_type": "SaveAnimatedWEBP",
+  "inputs": {
+   "images": [
+    "20",
+    0
+   ],
+   "filename_prefix": "pih3/iso_ref2va",
+   "fps": 24.0,
+   "lossless": false,
+   "quality": 90,
+   "method": "default"
+  }
+ }
+}

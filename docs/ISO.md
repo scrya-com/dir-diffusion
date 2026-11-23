@@ -71,6 +71,26 @@ RTX 5090, same three scenes and seed. Columns: before (DWD), detailer from itera
 - **Which start to use:** start 3 keeps closer to the original; start 2 redraws a little more.
 - **Limit:** the redrawn face is pasted back at its original size (about 30 px of face). Detail finer than the output resolution is lost, so for close-ups render larger.
 
+## Two steps: pi-H3 + isometric (the fast path)
+
+Speed comes first, so the isometric style and Ref2VA were tried on pi-H3's 2-step adapter (LakonLab, by Hansheng Chen, Shengqu Cai, Jiaming Song, Gordon Wetzstein, Xinchen Yan and Leonidas Guibas) with its own DWD decode. Nothing was trained.
+
+Workflows (API format, ComfyUI-piFlow nodes): `comfyui/pih3_2step_iso_api.json` (text) and `comfyui/pih3_2step_iso_ref2va_api.json` (Ref2VA).
+
+RTX 5090, 768×512, 39 frames, seed 7. Rows: pi-H3 2-step; + iso LoKr in bypass after the adapter; + iso LoKr in bypass before it; DiR 4 iterations + iso, for comparison.
+
+![pi-H3 2-step with and without the isometric LoKr, and DiR](dwd_media/pih3_iso_grid.jpg)
+
+- **Style:** the iso LoKr carries through pi-H3's two steps. The arcade and the coffee shop become cutaway dioramas; the bakery less so than with DiR.
+- **Ref2VA:** the reference identity holds, and the person is drawn larger than with DiR.
+- **Placing the LoKr:** after the adapter and before it look almost the same.
+  - The adapter replaces adaLN in every block and all of blocks 46–49 as weight patches, so a LoRA placed before it loses those parts.
+  - Put the LoKr after the adapter, in bypass. Never merge it into the int8 weights.
+- **Speed:** about 4 s per clip warm, including the text encode. DiR + DWD took 21–37 s per run here, model loading included; earlier benchmarks put its warm time at about 4.5 s.
+- **Not yet ported:**
+  - The face detailer runs on DiR's sampler.
+  - Our DiR loader takes exactly 4 sigmas, so a 2-iteration DiR would need retraining.
+
 ## If the style ever needs to be distilled in
 
 `LOT_H3_BASE_LOKR=PATH[:STRENGTH]` (`lot/base_lokr.py`, read by `h3_musubi.load_dit`) makes the LoKr part of the frozen base in every `lot/` script. In `train_dir_h3.py`, the teacher, generator and fake then all see base + adapter: DMD with an isometric teacher. In `train_dwd_h3.py`, collect, refit and ft see it too. ComfyUI's styled path matches `dir_sample` + `base_lokr` on the tiny CPU H3 (`tests/test_cpu.py`).
