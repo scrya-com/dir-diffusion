@@ -35,6 +35,7 @@ DATA = Path("/media/2TB/alpha/data")
 TE = Path("/media/2TB/alpha/te")
 SCENES = Path("/media/2TB/alpha/scenes_768x512.pt")
 W, H, FRAMES = 768, 512, 39
+EVAL_ALIGNED_SIGMA = 0.6  # half the eval clips: a level where the redraw matches the clip
 
 
 def te_path(image: str) -> Path:
@@ -118,14 +119,16 @@ def evaluate(env, head, rows, out, step, scenes, n=60, log=print):
         rng = random.Random(10_000 + i)
         kind, mode = kinds[i % len(kinds)], modes[(i // len(kinds)) % len(modes)]
         clip, alpha, kind, mode = sample_clip(env, row, gen, rng, scenes, train=False, kind=kind, mode=mode)
-        h, temb, g = dit_tokens(env, clip, row["image"], env["sigmas"][i % 2], 10_000 + i)
+        sig = env["sigmas"][0] if i % 2 == 0 else EVAL_ALIGNED_SIGMA
+        h, temb, g = dit_tokens(env, clip, row["image"], sig, 10_000 + i)
         rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g)
         f = min(score.shape[2], alpha.shape[1])
         rgb, score, a, c = rgb[0, :, :f], score[0, :, :f], alpha[:, :f], clip[:, :f]
         mse = float((((rgb + 1) / 2 - c) ** 2).mean())
         psnrs.append(-10 * math.log10(max(mse, 1e-10)))
         m = metrics(score[None], a[None])
-        for key in ("all", "bg:" + kind, "mode:" + mode, row["category"]):
+        m["rgb_psnr"] = psnrs[-1]
+        for key in ("all", "bg:" + kind, "mode:" + mode, row["category"], f"sigma:{sig:.3f}"):
             for k, v in m.items():
                 if not math.isnan(v):
                     acc.setdefault(key, {}).setdefault(k, []).append(v)
@@ -182,7 +185,8 @@ def train(args):
     while step < args.steps:
         row = rng.choice(train_rows)
         clip, alpha, kind, mode = sample_clip(env, row, gen, rng, scenes)
-        sigma = rng.choice(env["sigmas"])
+        sigma = (rng.choice(env["sigmas"]) if rng.random() < args.real_sigma_frac
+                 else rng.uniform(*args.train_sigma))  # lower noise: pi-H3 redraws what it was shown, so alpha lines up
         h, temb, g = dit_tokens(env, clip, row["image"], sigma, rng.randrange(1 << 30))
         n_out = sum(1 + 4 * (min(5, g[0] - b) - 1) for b in range(0, g[0], 5))  # DWD frames for this grid
         idx = torch.tensor(sorted(rng.sample(range(min(n_out, alpha.shape[1])), args.train_frames)), device="cuda")
@@ -216,6 +220,9 @@ def main():
     p.add_argument("--eval-n", type=int, default=60)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--pih3-steps", type=int, default=2, choices=(2, 4), help="which pi-H3 adapter's DWD decoder")
+    p.add_argument("--train-sigma", type=float, nargs=2, default=[0.45, 0.75],
+                   help="noise range for most steps: low enough that pi-H3's last step redraws the clip it is shown")
+    p.add_argument("--real-sigma-frac", type=float, default=0.25, help="share of steps at the real last-step sigma")
     p.add_argument("--train-frames", type=int, default=8, help="frames per step through the pixel refiner")
     args = p.parse_args()
     if args.cmd == "pool":
