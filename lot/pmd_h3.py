@@ -261,6 +261,7 @@ def pmd_step(student, teacher, z: torch.Tensor, sigma: float, k: int, tilts, noi
                                    / targets[0].norm().clamp_min(1e-12)) if len(targets) > 1 else 0.0
     stats["draw_spread"] = float((cached - cached.mean(0)).pow(2).sum(dim=tuple(range(1, cached.ndim))).mean().sqrt()
                                  / cached.mean(0).norm().clamp_min(1e-12))
+    stats["draw_grad"] = float(grads.flatten(1).norm(dim=1).mean()) if backward else 0.0   # |dloss/dx| per draw
     stats["extra"] = 0.0
     if backward:
         with torch.enable_grad():
