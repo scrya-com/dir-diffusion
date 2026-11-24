@@ -27,3 +27,21 @@ The 8 decoder blocks it reads are the same frozen blocks DiR's Stage 1 decoder u
 - **Overfit test** (3 fixed clips, sigma 0.6, 300 steps): soft_mae 0.290 -> 0.120, edge_mae 0.388 -> 0.069, still falling. The head and its gradients work; `a4` was data (the 0.865 share) and a small, noisy step (one clip, 8 frames).
 - Fair reference for matting from colour alone: P1's VAE head **without** its latent offset, about 0.21 (0.158 used the true matte in the latent).
 - `a5`: `--real-sigma-frac 0 --accum 4`. If it overfits but stalls well above the gate, the next step is Stage B (a last-step LoRA so the DiT itself carries alpha), not more head tuning.
+
+## Stage B: a last-step LoRA in a second pass (`alpha/train_stage_b.py`)
+
+Stage A plateaued: a5's sigma-0.6 soft_mae went 0.312 -> 0.266 (step 250) -> 0.256 (step 500), edge 0.376 -> 0.241, every background in 0.26-0.31. A head reading pi-H3's RGB tokens is matting from colour, and it tops out near 0.25 (fair reference for colour-only matting: P1 without its offset, ~0.21).
+
+Stage B lets pi-H3 itself carry alpha, without touching its RGB:
+- **RGB pass:** pi-H3 2-step's ordinary last step, LoRA off, fused DWD decode. Bit-identical to pi-H3 by construction.
+- **Alpha pass:** block 42's input from that forward reruns blocks 42-49 with a rank-32 LoRA on (checkpointed), then `dwd_norm_out` -> the frozen Sol refiner (`lot/pih3_dwd.py`, eager) -> the alpha head (warm-started from a5).
+- Loss: EA + band (alpha only). Trained at sigma 0.45-0.75, 4 clips per step.
+
+**Gate (set before the run):**
+- sigma-0.6 soft_mae < 0.10 and edge_mae < 0.08 (unchanged).
+- RGB identical with and without the alpha pass (asserted: the B = 0 alpha pass reproduces the RGB pass's block output; the RGB pass never sees the LoRA).
+- Added seconds per 768x512x39 clip on the RTX 5090, measured by `--check` (estimate before measuring: about +0.2 s on 1.55 s).
+- Deployment check by eye: about 8 real pi-H3 2-step generations from noise (camera-lock schedule) on smoke / glass / hair captions, RGBA composites over a checker. The trained sigma range never includes pi-H3's real last step (0.865), so this is the only test of what a user would get.
+- **Early stop:** if sigma-0.6 soft_mae at step 250 is not below 0.22 (clearly under Stage A's plateau), stop: even DiT capacity cannot matte from this input.
+
+Consequences: one alpha LoRA per generator (DiR would need its own); ComfyUI needs a custom node that reruns the last 8 blocks with the LoRA at the last step only.
