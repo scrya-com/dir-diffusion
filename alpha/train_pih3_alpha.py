@@ -203,20 +203,22 @@ def train(args):
     gen = torch.Generator().manual_seed(args.seed + step)
     t0 = time.time()
     while step < args.steps:
-        row = rng.choice(train_rows)
-        clip, alpha, kind, mode = sample_clip(env, row, gen, rng, scenes)
-        sigma = (rng.choice(env["sigmas"]) if rng.random() < args.real_sigma_frac
-                 else rng.uniform(*args.train_sigma))  # lower noise: pi-H3 redraws what it was shown, so alpha lines up
-        h, temb, g = dit_tokens(env, clip, row["image"], sigma, rng.randrange(1 << 30))
-        n_out = sum(1 + 4 * (min(5, g[0] - b) - 1) for b in range(0, g[0], 5))  # DWD frames for this grid
-        idx = torch.tensor(sorted(rng.sample(range(min(n_out, alpha.shape[1])), args.train_frames)), device="cuda")
-        _rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g, frames=idx)
-        target = alpha[:, idx][None]                                        # (1, 1, k, H, W)
-        loss = ea_loss_per_sample(score, target)[0].mean()
-        if args.band_weight > 0:                                            # soft pixels are a few % of the frame
-            loss = loss + args.band_weight * band_loss(score, target)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        for _a in range(args.accum):                                     # several clips per optimiser step
+            row = rng.choice(train_rows)
+            clip, alpha, kind, mode = sample_clip(env, row, gen, rng, scenes)
+            sigma = (rng.choice(env["sigmas"]) if rng.random() < args.real_sigma_frac
+                     else rng.uniform(*args.train_sigma))  # lower noise: pi-H3 redraws what it was shown, so alpha lines up
+            h, temb, g = dit_tokens(env, clip, row["image"], sigma, rng.randrange(1 << 30))
+            n_out = sum(1 + 4 * (min(5, g[0] - b) - 1) for b in range(0, g[0], 5))  # DWD frames for this grid
+            idx = torch.tensor(sorted(rng.sample(range(min(n_out, alpha.shape[1])), args.train_frames)), device="cuda")
+            _rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g, frames=idx)
+            target = alpha[:, idx][None]                                        # (1, 1, k, H, W)
+            loss = ea_loss_per_sample(score, target)[0].mean()
+            if args.band_weight > 0:                                            # soft pixels are a few % of the frame
+                loss = loss + args.band_weight * band_loss(score, target)
+            (loss / args.accum).backward()
+            del score, h, temb
         torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
         opt.step()
         sched.step()
@@ -233,9 +235,62 @@ def train(args):
     log("ALPHA_TRAIN_DONE")
 
 
+def overfit(args):
+    """Can the head fit a few fixed clips? Fixed clips, noise, frames and sigma; scored on the same clips. Separates a
+    pipeline bug (it cannot) from data, steps or missing information (it can)."""
+    from setproctitle import setproctitle
+    from .alpha_math import ea_loss_per_sample, ea_score_to_alpha
+    from .pih3_alpha import AlphaDWDHead, rgba_decode
+    setproctitle("alpha:pih3-A overfit")
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    subset = json.loads((TE / "subset.json").read_text())
+    rows = {json.loads(l)["image"]: json.loads(l) for l in open(DATA / "t2rgba_train.jsonl")}
+    pick = [rows[i] for i in subset["train"] if te_path(i).is_file() and rows[i]["category"] in ("effect", "translucent", "person")][:args.overfit]
+    scenes = torch.load(SCENES) if SCENES.is_file() else None
+    env = setup(args.pih3_steps)
+    clips = []
+    for k, row in enumerate(pick):                                     # fixed clips + their DiT tokens, once
+        gen, rng = torch.Generator().manual_seed(500 + k), random.Random(500 + k)
+        clip, alpha, kind, mode = sample_clip(env, row, gen, rng, scenes, train=False, kind=("gradient", "scene", "padded")[k % 3], mode="affine")
+        h, temb, g = dit_tokens(env, clip, row["image"], 0.6, 500 + k)
+        clips.append((h, temb, g, alpha, row["category"], kind))
+    head = AlphaDWDHead().cuda()
+    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.0)
+    frames = torch.arange(0, 32, 4, device="cuda")                    # fixed 8 frames
+    for step in range(args.steps + 1):
+        if step % 50 == 0:
+            head.eval()
+            res = []
+            with torch.no_grad():
+                for h, temb, g, alpha, cat, kind in clips:
+                    _rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g, frames=frames)
+                    m = metrics(score, alpha[:, frames][None])
+                    res.append(m)
+            head.train()
+            print(f"OVERFIT step={step} soft_mae={np.mean([r['soft_mae'] for r in res]):.4f} "
+                  f"edge_mae={np.mean([r['edge_mae'] for r in res]):.4f} mae={np.mean([r['mae'] for r in res]):.4f}", flush=True)
+        if step == args.steps:
+            break
+        h, temb, g, alpha, _c, _k = clips[step % len(clips)]
+        _rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g, frames=frames)
+        target = alpha[:, frames][None]
+        loss = ea_loss_per_sample(score, target)[0].mean() + args.band_weight * band_loss(score, target)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        h, temb, g, alpha, _c, _k = clips[0]
+        rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g)
+        f = min(score.shape[2], alpha.shape[1])
+        from .data import load_rgba  # noqa: F401
+        grid(torch.zeros(3, f, H, W, device="cuda"), alpha[:, :f], rgb[0, :, :f], ea_score_to_alpha(score[0, :, :f]), out / "overfit.jpg")
+    print("OVERFIT_DONE", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("cmd", choices=["pool", "train", "eval"])
+    p.add_argument("cmd", choices=["pool", "train", "eval", "overfit"])
     p.add_argument("--out", default="/media/2TB/alpha/runs/a1")
     p.add_argument("--steps", type=int, default=4000)
     p.add_argument("--lr", type=float, default=2e-4)
@@ -247,6 +302,8 @@ def main():
                    help="noise range for most steps: low enough that pi-H3's last step redraws the clip it is shown")
     p.add_argument("--real-sigma-frac", type=float, default=0.25, help="share of steps at the real last-step sigma")
     p.add_argument("--band-weight", type=float, default=1.0, help="EA loss on the soft + edge band, added to the frame's")
+    p.add_argument("--overfit", type=int, default=3, help="overfit: how many fixed clips")
+    p.add_argument("--accum", type=int, default=1, help="clips per optimiser step")
     p.add_argument("--train-frames", type=int, default=8, help="frames per step through the pixel refiner")
     args = p.parse_args()
     if args.cmd == "pool":
@@ -254,6 +311,8 @@ def main():
         build_scene_pool(Path("/run/media/johndpope/2TB/ComfyUI/output"), SCENES)
     elif args.cmd == "train":
         train(args)
+    elif args.cmd == "overfit":
+        overfit(args)
     else:
         from .pih3_alpha import AlphaDWDHead
         rows = {json.loads(l)["image"]: json.loads(l) for l in open(DATA / "t2rgba_train.jsonl")}
