@@ -1,0 +1,172 @@
+{
+ "rows": [
+  {
+   "sample": "iso/held_0000_0.pt",
+   "v0.2": {
+    "lpips": 0.1313,
+    "psnr": 25.35,
+    "decode_s": 0.2049
+   },
+   "stage1": {
+    "lpips": 0.1213,
+    "psnr": 25.32,
+    "decode_s": 0.0588
+   }
+  },
+  {
+   "sample": "iso/held_0001_0.pt",
+   "v0.2": {
+    "lpips": 0.1391,
+    "psnr": 23.15,
+    "decode_s": 0.2616
+   },
+   "stage1": {
+    "lpips": 0.1261,
+    "psnr": 23.14,
+    "decode_s": 0.0819
+   }
+  },
+  {
+   "sample": "iso/held_0002_0.pt",
+   "v0.2": {
+    "lpips": 0.1269,
+    "psnr": 24.96,
+    "decode_s": 0.2628
+   },
+   "stage1": {
+    "lpips": 0.1208,
+    "psnr": 24.88,
+    "decode_s": 0.082
+   }
+  },
+  {
+   "sample": "iso/held_0003_0.pt",
+   "v0.2": {
+    "lpips": 0.1374,
+    "psnr": 25.17,
+    "decode_s": 0.2035
+   },
+   "stage1": {
+    "lpips": 0.1264,
+    "psnr": 25.21,
+    "decode_s": 0.0654
+   }
+  },
+  {
+   "sample": "atlas/held_0000_0.pt",
+   "v0.2": {
+    "lpips": 0.1058,
+    "psnr": 36.6,
+    "decode_s": 0.265
+   },
+   "stage1": {
+    "lpips": 0.1159,
+    "psnr": 35.7,
+    "decode_s": 0.0822
+   }
+  },
+  {
+   "sample": "atlas/held_0001_0.pt",
+   "v0.2": {
+    "lpips": 0.0768,
+    "psnr": 33.5,
+    "decode_s": 0.2579
+   },
+   "stage1": {
+    "lpips": 0.0785,
+    "psnr": 33.17,
+    "decode_s": 0.0825
+   }
+  },
+  {
+   "sample": "atlas/held_0002_0.pt",
+   "v0.2": {
+    "lpips": 0.1078,
+    "psnr": 32.12,
+    "decode_s": 0.2638
+   },
+   "stage1": {
+    "lpips": 0.1145,
+    "psnr": 31.51,
+    "decode_s": 0.0826
+   }
+  },
+  {
+   "sample": "atlas/held_0003_0.pt",
+   "v0.2": {
+    "lpips": 0.0817,
+    "psnr": 32.97,
+    "decode_s": 0.2639
+   },
+   "stage1": {
+    "lpips": 0.0842,
+    "psnr": 32.7,
+    "decode_s": 0.0825
+   }
+  },
+  {
+   "sample": "kc/held_0000_0.pt",
+   "v0.2": {
+    "lpips": 0.115,
+    "psnr": 26.21,
+    "decode_s": 0.1704
+   },
+   "stage1": {
+    "lpips": 0.1011,
+    "psnr": 26.22,
+    "decode_s": 0.0555
+   }
+  },
+  {
+   "sample": "kc/held_0001_0.pt",
+   "v0.2": {
+    "lpips": 0.1151,
+    "psnr": 26.73,
+    "decode_s": 0.1705
+   },
+   "stage1": {
+    "lpips": 0.1068,
+    "psnr": 26.66,
+    "decode_s": 0.0555
+   }
+  },
+  {
+   "sample": "kc/held_0002_0.pt",
+   "v0.2": {
+    "lpips": 0.1262,
+    "psnr": 27.47,
+    "decode_s": 0.1721
+   },
+   "stage1": {
+    "lpips": 0.1057,
+    "psnr": 27.93,
+    "decode_s": 0.0555
+   }
+  },
+  {
+   "sample": "kc/held_0003_0.pt",
+   "v0.2": {
+    "lpips": 0.1388,
+    "psnr": 25.73,
+    "decode_s": 0.1708
+   },
+   "stage1": {
+    "lpips": 0.125,
+    "psnr": 25.82,
+    "decode_s": 0.0555
+   }
+  }
+ ],
+ "summary": {
+  "v0.2": {
+   "lpips": 0.1168,
+   "psnr": 28.33,
+   "decode_s": 0.2223
+  },
+  "stage1": {
+   "lpips": 0.1105,
+   "psnr": 28.1883,
+   "decode_s": 0.07
+  }
+ }
+}
