@@ -1,0 +1,11 @@
+alpha/alpha_math.py adapts code from AlphaAnything
+(https://github.com/WLuLi/AlphaAnything), Copyright the AlphaAnything authors,
+licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). Changes are noted in that file.
+
+Paper: Qijie Wang, Zhixin Xu, Zhe Li, Haowei Zhu, Honghao Qiao, Bo Peng, Dawei Li,
+Bin Wang. "AlphaAnything: Extending Pretrained RGB Generators to RGBA."
+arXiv:2610.32413, 2026.
+
+The AlphaAnything training data (huggingface.co/datasets/WLuLi/AlphaAnything_Data)
+is CC BY-NC 4.0. Weights trained on it inherit a non-commercial restriction.
