@@ -1,5 +1,5 @@
 # Copyright 2026 scrya-com contributors. Licensed under the Apache License, Version 2.0.
-"""Stage A: train an alpha head on pi-H3 4-step's DWD refiner, the DiT and DWD frozen.
+"""Stage A: train an alpha head on pi-H3's DWD refiner (2-step by default, ``--pih3-steps``), the DiT and DWD frozen.
 
 Each step:
 1. a RGBA still from the AlphaAnything set is placed on a 768x512 canvas, set in motion over 39 frames and
@@ -41,7 +41,7 @@ def te_path(image: str) -> Path:
     return TE / (Path(image).stem + "_minimaxh3_te.safetensors")
 
 
-def setup():
+def setup(steps: int = 2):
     sys.path.insert(0, str(LOT))
     from accel_h3 import token_shape
     from h3_musubi import forward_video, load_vae
@@ -49,9 +49,9 @@ def setup():
     from pih3_h3 import load_pih3, pih3_sigmas
     from train_dwd_h3 import load_text
 
-    model = load_pih3(4, merge="comfy")
+    model = load_pih3(steps, merge="comfy")
     vae = load_vae(LOT_H3_VAE, decoder=False)
-    sigmas = [pih3_sigmas(4)[-2], pih3_sigmas(4, max_raw_t=1.0)[-2]]
+    sigmas = [pih3_sigmas(steps)[-2], pih3_sigmas(steps, max_raw_t=1.0)[-2]]
     return dict(model=model, vae=vae, sigmas=sigmas, forward_video=forward_video, load_text=load_text,
                 token_shape=token_shape)
 
@@ -160,8 +160,8 @@ def train(args):
     eval_rows = [rows[i] for i in subset["eval"] if te_path(i).is_file()]
     log(f"ALPHA rows train={len(train_rows)} eval={len(eval_rows)}")
     scenes = torch.load(SCENES) if SCENES.is_file() else None
-    env = setup()
-    log(f"ALPHA last-step sigmas={[round(s, 4) for s in env['sigmas']]}")
+    env = setup(args.pih3_steps)
+    log(f"ALPHA pi-H3 {args.pih3_steps}-step; last-step sigmas={[round(s, 4) for s in env['sigmas']]}")
     head = AlphaDWDHead().cuda()
     opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=0.01)
     step = 0
@@ -215,6 +215,7 @@ def main():
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-n", type=int, default=60)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--pih3-steps", type=int, default=2, choices=(2, 4), help="which pi-H3 adapter's DWD decoder")
     p.add_argument("--train-frames", type=int, default=8, help="frames per step through the pixel refiner")
     args = p.parse_args()
     if args.cmd == "pool":
@@ -226,7 +227,7 @@ def main():
         from .pih3_alpha import AlphaDWDHead
         rows = {json.loads(l)["image"]: json.loads(l) for l in open(DATA / "t2rgba_train.jsonl")}
         subset = json.loads((TE / "subset.json").read_text())
-        env = setup()
+        env = setup(args.pih3_steps)
         head = AlphaDWDHead().cuda()
         head.load_state_dict(torch.load(Path(args.out) / "alpha_dwd_head.pt", map_location="cuda")["head"])
         evaluate(env, head, [rows[i] for i in subset["eval"]], args.out, -1,
