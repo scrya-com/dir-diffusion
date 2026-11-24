@@ -309,7 +309,11 @@ def rerun_blocks(dit, tap: dict, temb: torch.Tensor, block_segments, rotation) -
     hidden = tap.pop("hidden")
     with tap["lora"]():
         for block in dit.blocks[tap["first"]:]:
-            hidden = block(hidden, temb, block_segments, rotation)
+            if tap.get("checkpoint") and torch.is_grad_enabled():  # training through the tail (alpha Stage B)
+                hidden = torch.utils.checkpoint.checkpoint(block, hidden, temb, block_segments, rotation,
+                                                           use_reentrant=False)
+            else:
+                hidden = block(hidden, temb, block_segments, rotation)
     return hidden
 
 
@@ -408,6 +412,7 @@ def _lot_forward(dit, lot, layout, latent, audio, text, tags, t_video: float, t_
         velocity = final.video_out(video_states.to(torch.float32))
         if dwd is not None:
             again = rerun_blocks(dit, dwd, temb, block_segments, rotation)
+            dwd["raw"] = again[0, lot_layout.target_video_segment.row_slice]  # the block output pi-H3's DWD reads
             again = final.norm(again[:, lot_layout.target_video_segment.row_slice])
             dwd["h"] = (again * (1.0 + scale[video_index]) + shift[video_index])[0].to(torch.float32)
     else:
