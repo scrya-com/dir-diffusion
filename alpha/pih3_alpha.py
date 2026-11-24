@@ -84,18 +84,21 @@ class AlphaDWDHead(nn.Module):
                 out.append(rest.reshape((n - 1) * PATCH_T, 1, h * PATCH, w * PATCH))
         return torch.cat(out)
 
-    def forward(self, chunks: list[torch.Tensor], rgb: torch.Tensor) -> torch.Tensor:
-        """``rgb`` ``(F, 3, H, W)`` in [-1, 1] (the refiner's own output) -> ``(F, 1, H, W)`` alpha score."""
+    def forward(self, chunks: list[torch.Tensor], rgb: torch.Tensor, frames=None) -> torch.Tensor:
+        """``rgb`` ``(F, 3, H, W)`` in [-1, 1] (the refiner's own output) -> ``(F, 1, H, W)`` alpha score, or only the
+        ``frames`` given (a training memory saver: the pixel refiner is per frame)."""
         c = self.coarse(chunks)
+        if frames is not None:
+            c, rgb = c[frames], rgb[frames]
         return c + self.refine(torch.cat([rgb.float(), c], 1))
 
 
-def rgba_decode(head_pih3, alpha_head: AlphaDWDHead, h: torch.Tensor, t_emb: torch.Tensor, grid) -> tuple:
+def rgba_decode(head_pih3, alpha_head: AlphaDWDHead, h: torch.Tensor, t_emb: torch.Tensor, grid, frames=None) -> tuple:
     """pi-H3's DWD decode plus alpha: ``(1, 3, F, H, W)`` RGB in [-1, 1] (exactly ``PiH3Head.decode``) and the
     ``(1, 1, F, H, W)`` alpha score. Only the alpha head takes gradients."""
     with torch.no_grad(), capture_refiner_tokens(head_pih3.refiner) as chunks:
         rgb = head_pih3.decode(h, t_emb, grid)                       # (1, 3, F, H, W)
     sol_h, sol_w = grid[1] * 2, grid[2] * 2                         # a DiT token is 2x2 Sol tokens
     chunks = [c.detach().view(-1, sol_h, sol_w, c.shape[-1]) for c in chunks]
-    score = alpha_head(chunks, rgb[0].transpose(0, 1))                # (F, 1, H, W)
+    score = alpha_head(chunks, rgb[0].transpose(0, 1), frames)        # (F, 1, H, W), or len(frames)
     return rgb, score.transpose(0, 1)[None]

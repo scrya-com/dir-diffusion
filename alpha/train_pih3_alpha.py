@@ -184,9 +184,10 @@ def train(args):
         clip, alpha, kind, mode = sample_clip(env, row, gen, rng, scenes)
         sigma = rng.choice(env["sigmas"])
         h, temb, g = dit_tokens(env, clip, row["image"], sigma, rng.randrange(1 << 30))
-        _rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g)
-        f = min(score.shape[2], alpha.shape[1])
-        loss = ea_loss_per_sample(score[:, :, :f], alpha[None, :, :f])[0].mean()
+        n_out = sum(1 + 4 * (min(5, g[0] - b) - 1) for b in range(0, g[0], 5))  # DWD frames for this grid
+        idx = torch.tensor(sorted(rng.sample(range(min(n_out, alpha.shape[1])), args.train_frames)), device="cuda")
+        _rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g, frames=idx)
+        loss = ea_loss_per_sample(score, alpha[:, idx][None])[0].mean()   # (1, 1, k, H, W) both
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
@@ -214,6 +215,7 @@ def main():
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-n", type=int, default=60)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--train-frames", type=int, default=8, help="frames per step through the pixel refiner")
     args = p.parse_args()
     if args.cmd == "pool":
         from .data_pih3 import build_scene_pool
