@@ -79,6 +79,26 @@ def dit_tokens(env, clip, image, sigma, seed):
     return store["hidden"], store["temb_video"], (lt, lh // 2, lw // 2)
 
 
+def band_mask(alpha):
+    """Soft pixels plus a 4-pixel band around hard edges (``metrics``' edge set)."""
+    from .data import SOFT_HI, SOFT_LO
+    soft = (alpha > SOFT_LO) & (alpha < SOFT_HI)
+    mp = lambda v: torch.nn.functional.max_pool3d(v, (1, 9, 9), 1, (0, 4, 4))
+    return soft | ((mp(alpha) + mp(-alpha)) > 0.5)
+
+
+def band_loss(score, alpha):
+    """The EA loss with its two means taken over the soft + edge band only."""
+    from .alpha_math import alpha_to_ea_coordinate, ea_pointwise_gap
+    m = band_mask(alpha).float()
+    if float(m.sum()) < 1:
+        return score.sum() * 0
+    gap = ea_pointwise_gap(score, alpha_to_ea_coordinate(alpha))
+    a = alpha.float().clamp(0, 1)
+    n = m.sum()
+    return torch.sqrt(((1 - a) * gap * m).sum() / n + 1e-12) + torch.sqrt((a * gap * m).sum() / n + 1e-12)
+
+
 def metrics(score, alpha):
     from .alpha_math import ea_score_to_alpha
     from .data import SOFT_HI, SOFT_LO
@@ -117,9 +137,9 @@ def evaluate(env, head, rows, out, step, scenes, n=60, log=print):
     for i, row in enumerate(rows[:n]):
         gen = torch.Generator().manual_seed(10_000 + i)
         rng = random.Random(10_000 + i)
-        kind, mode = kinds[i % len(kinds)], modes[(i // len(kinds)) % len(modes)]
+        kind, mode = kinds[i % len(kinds)], modes[(i // (2 * len(kinds))) % len(modes)]
         clip, alpha, kind, mode = sample_clip(env, row, gen, rng, scenes, train=False, kind=kind, mode=mode)
-        sig = env["sigmas"][0] if i % 2 == 0 else EVAL_ALIGNED_SIGMA
+        sig = env["sigmas"][0] if (i // len(kinds)) % 2 == 0 else EVAL_ALIGNED_SIGMA   # every background at both
         h, temb, g = dit_tokens(env, clip, row["image"], sig, 10_000 + i)
         rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g)
         f = min(score.shape[2], alpha.shape[1])
@@ -191,7 +211,10 @@ def train(args):
         n_out = sum(1 + 4 * (min(5, g[0] - b) - 1) for b in range(0, g[0], 5))  # DWD frames for this grid
         idx = torch.tensor(sorted(rng.sample(range(min(n_out, alpha.shape[1])), args.train_frames)), device="cuda")
         _rgb, score = rgba_decode(env["model"]["head"], head, h, temb, g, frames=idx)
-        loss = ea_loss_per_sample(score, alpha[:, idx][None])[0].mean()   # (1, 1, k, H, W) both
+        target = alpha[:, idx][None]                                        # (1, 1, k, H, W)
+        loss = ea_loss_per_sample(score, target)[0].mean()
+        if args.band_weight > 0:                                            # soft pixels are a few % of the frame
+            loss = loss + args.band_weight * band_loss(score, target)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
@@ -223,6 +246,7 @@ def main():
     p.add_argument("--train-sigma", type=float, nargs=2, default=[0.45, 0.75],
                    help="noise range for most steps: low enough that pi-H3's last step redraws the clip it is shown")
     p.add_argument("--real-sigma-frac", type=float, default=0.25, help="share of steps at the real last-step sigma")
+    p.add_argument("--band-weight", type=float, default=1.0, help="EA loss on the soft + edge band, added to the frame's")
     p.add_argument("--train-frames", type=int, default=8, help="frames per step through the pixel refiner")
     args = p.parse_args()
     if args.cmd == "pool":
