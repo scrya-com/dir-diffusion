@@ -19,6 +19,6 @@ Our DWD v0.2 for DiR is a linear head plus an 8M-parameter refiner, read after r
 | Our DWD v0.2 (LoRA + head + refiner) | 0.1168 | 28.33 | 0.222 |
 | **Stage 1** | **0.1105** | 28.19 | **0.070** |
 
-Stage 1 is better on 9 of 12 clips (all iso and kc), slightly worse on 3 atlas portraits. Its decode excludes nothing: v0.2's time also excludes the rerun of the last 8 DiT blocks with its LoRA, which Stage 1 does not need. The input-state branch is used (weight norm 0 -> 5.7), so a ComfyUI node for DiR needs it; ComfyUI-piFlow's DWD node alone does not load it.
+Stage 1 is better on 9 of 12 clips (all iso and kc), slightly worse on 3 atlas portraits. The v0.2 decode time leaves out its rerun of the last 8 DiT blocks with the LoRA, which Stage 1 does not need at all, so the real gap per clip is larger. The input-state branch is used (weight norm 0 -> 5.7), so a ComfyUI node for DiR needs it; ComfyUI-piFlow's DWD node alone does not load it.
 
 Per clip: `docs/dwd_pih3_compare.json`.
