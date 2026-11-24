@@ -265,7 +265,7 @@ Same noise per prompt, 4 held-out prompts (isometric scenes and generated portra
 
 ![DiR at 4, 2 and 1 iterations next to pi-H3 2-step](dir_r2_media/dir_1_2_4_vs_pih3.jpg)
 
-Chef clip, side by side (DiR 4 | DiR 2 | pi-H3 2-step): [`chef_4_2_pih3.mp4`](dir_r2_media/chef_4_2_pih3.mp4).
+Chef clip, side by side (DiR 4 | DiR 2 | DiR 1 | pi-H3 2-step): [`chef_4_2_pih3.mp4`](dir_r2_media/chef_4_2_pih3.mp4).
 
 - **2 iterations is a good clip.** Sharp and coherent, the same scene, people and composition as 4 iterations, a little simpler (fewer small objects, a less detailed chef). This is the paper's prefix property (Sec. 2.6). The LPIPS 0.38 between the 2- and 4-iteration clips (and the older 0.462 in ACCEL.md) measures that they are different valid clips, not that the 2-iteration one is damaged.
 - **1 iteration is a usable draft with artefacts:** a different face and wardrobe, a duplicated chef, softer and blurrier fire. Matches the paper's FID 3.85 at 1 NFE against 2.68 at 2.
