@@ -56,14 +56,19 @@ class TailLoRA:
 
     @contextlib.contextmanager
     def on(self, grad: bool = True):
-        for m in self.mods:
-            m.enabled = True
+        """Re-entrant (checkpoint recomputes re-enter it inside the outer pass)."""
+        self._depth = getattr(self, "_depth", 0) + 1
+        if self._depth == 1:
+            for m in self.mods:
+                m.enabled = True
         try:
             with torch.enable_grad() if grad else torch.no_grad():
                 yield
         finally:
-            for m in self.mods:
-                m.enabled = False
+            self._depth -= 1
+            if self._depth == 0:
+                for m in self.mods:
+                    m.enabled = False
 
     def state_dict(self):
         return {k: v for k, v in self.net.state_dict().items() if any(k.startswith(m.lora_name + ".") for m in self.mods)}

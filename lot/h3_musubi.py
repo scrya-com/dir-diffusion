@@ -310,8 +310,10 @@ def rerun_blocks(dit, tap: dict, temb: torch.Tensor, block_segments, rotation) -
     with tap["lora"]():
         for block in dit.blocks[tap["first"]:]:
             if tap.get("checkpoint") and torch.is_grad_enabled():  # training through the tail (alpha Stage B)
-                hidden = torch.utils.checkpoint.checkpoint(block, hidden, temb, block_segments, rotation,
-                                                           use_reentrant=False)
+                def run(h, blk=block):
+                    with tap["lora"]():                          # the LoRA must also be on in the recompute
+                        return blk(h, temb, block_segments, rotation)
+                hidden = torch.utils.checkpoint.checkpoint(run, hidden, use_reentrant=False)
             else:
                 hidden = block(hidden, temb, block_segments, rotation)
     return hidden
