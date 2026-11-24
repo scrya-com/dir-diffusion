@@ -116,9 +116,9 @@ class DiRDWD(nn.Module):
         return st
 
 
-def lpips_frames(lp, a, b, frames):
-    return torch.cat([lp(a[0, :, f].transpose(0, 1)[i:i + 8], b[0, :, f].transpose(0, 1)[i:i + 8]).flatten()
-                      for f in [frames] for i in range(0, len(frames), 8)]).mean()
+def lpips_frames(lp, a, b, frames, chunk=4):
+    return torch.cat([lp(a[0, :, f].transpose(0, 1)[i:i + chunk], b[0, :, f].transpose(0, 1)[i:i + chunk]).flatten()
+                      for f in [frames] for i in range(0, len(frames), chunk)]).mean()
 
 
 def main():
@@ -238,8 +238,11 @@ def main():
                 f"s/step={(time.time() - t0) / 25:.2f} mem={torch.cuda.max_memory_allocated() / 2**30:.1f}G")
             t0 = time.time()
         if step % args.eval_every == 0 or step == args.steps:
+            torch.save({"step": step, **model.trainable()}, args.out / "last.pt")   # before eval: an eval OOM loses nothing
+            del px, tgt, loss, l1, lpl
+            opt.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
             lpm = evaluate(step)
-            torch.save({"step": step, **model.trainable()}, args.out / "last.pt")
             if lpm < best:
                 best = lpm
                 torch.save({"step": step, "lpips": lpm, **model.trainable()}, args.out / "best.pt")
