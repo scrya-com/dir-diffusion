@@ -258,3 +258,24 @@ python3 lot/probe_dir_h3.py $P --decode pub2      # and pub4, turbo2
 - Published run: [`lot/runs/dir_turbo_clip`](../lot/runs/dir_turbo_clip/config.json) ([Hugging Face](https://huggingface.co/johndpope/dir-diffusion-h3)); its training log at `/media/2TB/lora-data/h3_lot/runs/dir_turbo_clip_iter/log.jsonl`.
 - `feat/accel`: `docs/ACCEL.md` (the 0.462 early-exit floor). `feat/pi-h3`: `docs/PIH3.md`, `docs/pih3_bench_raw.md`, `lot/pih3_h3.py`. `feat/dwd-pih3`: `docs/DWD_PIH3.md`.
 - Turbo releases: the `lightx2v/Minimax-h3-Turbo` file list has 4-step and 8-step LoRAs only, no 2-step.
+
+## Result: the published DiR at 1, 2 and 4 iterations, judged by eye (25 November)
+
+Same noise per prompt, 4 held-out prompts (isometric scenes and generated portraits), 768x512x39, VAE decode. Columns: **4 iterations | 2 iterations | 1 iteration | pi-H3 2-step** (pi-H3 has its own noise, so its framing differs).
+
+![DiR at 4, 2 and 1 iterations next to pi-H3 2-step](dir_r2_media/dir_1_2_4_vs_pih3.jpg)
+
+Chef clip, side by side (DiR 4 | DiR 2 | pi-H3 2-step): [`chef_4_2_pih3.mp4`](dir_r2_media/chef_4_2_pih3.mp4).
+
+- **2 iterations is a good clip.** Sharp and coherent, the same scene, people and composition as 4 iterations, a little simpler (fewer small objects, a less detailed chef). This is the paper's prefix property (Sec. 2.6). The LPIPS 0.38 between the 2- and 4-iteration clips (and the older 0.462 in ACCEL.md) measures that they are different valid clips, not that the 2-iteration one is damaged.
+- **1 iteration is a usable draft with artefacts:** a different face and wardrobe, a duplicated chef, softer and blurrier fire. Matches the paper's FID 3.85 at 1 NFE against 2.68 at 2.
+- **Skipping the middle iterations is worse than stopping early** (2 forwards, LPIPS against the 4-iteration clip): stop after 2 = 0.382, iteration 1 then 3 = 0.441, iteration 1 then 4 = 0.475 (`lot/probe_dir2.py`).
+
+| DiT time, 768x512x39, RTX 5090 | |
+|---|---|
+| DiR 4 iterations | 3.64 s |
+| **DiR 2 iterations** | **~1.82 s** |
+| DiR 1 iteration | 0.91 s (measured) |
+| pi-H3 2-step | 1.47 s |
+
+**What needs training before DiR's 2-iteration mode is a fast path:** the fast DWD decoder (Stage 1, `feat/dwd-pih3`, 0.07 s) was fitted to iteration-4 tokens; 2-iteration DiR runs with the VAE decode (1.8 s) until it is refitted on iteration-2 tokens (about 2 GPU-hours, estimated). A native 2-iteration training run (section 5) is optional: the published weights already give a good 2-iteration clip.
