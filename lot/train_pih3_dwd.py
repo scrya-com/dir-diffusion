@@ -33,6 +33,33 @@ SETS = ("iso", "atlas", "kc")
 DIR_RUN = Path(__file__).resolve().parents[2] / "dir-diffusion/lot/runs/dir_turbo_clip"
 
 
+class SolLoRA(nn.Module):
+    """A LoRA beside one frozen (int8) Sol linear: ``y = linear(x) + B(A(x))``, B zero-initialised."""
+
+    def __init__(self, linear, rank: int):
+        super().__init__()
+        w = linear.weight
+        out_f, in_f = w.shape
+        self.A = nn.Linear(in_f, rank, bias=False).cuda()
+        self.B = nn.Linear(rank, out_f, bias=False).cuda()
+        nn.init.normal_(self.A.weight, std=1.0 / rank)
+        nn.init.zeros_(self.B.weight)
+        orig = linear.forward
+
+        def forward(x, *a, **k):
+            return orig(x, *a, **k) + self.B(self.A(x.to(self.A.weight.dtype))).to(x.dtype)
+
+        linear.forward = forward
+
+
+def add_sol_lora(ref, rank: int) -> nn.ModuleList:
+    mods = nn.ModuleList()
+    for blk in ref.blocks:
+        for lin in (blk.attn.to_qkv, blk.attn.to_out, blk.ff.w1, blk.ff.w2):
+            mods.append(SolLoRA(lin, rank))
+    return mods
+
+
 class DiRDWD(nn.Module):
     """pi-H3's DWD head with a trainable norm and token expansion, plus an input-state branch."""
 
@@ -83,7 +110,10 @@ class DiRDWD(nn.Module):
         return refine_train(self.ref, x, geo, shape, checkpoint=checkpoint).transpose(1, 2)  # (1, 3, F, H, W)
 
     def trainable(self):
-        return {"norm": self.norm.state_dict(), "expand": self.expand.state_dict(), "s_proj": self.s_proj.state_dict()}
+        st = {"norm": self.norm.state_dict(), "expand": self.expand.state_dict(), "s_proj": self.s_proj.state_dict()}
+        if getattr(self, "lora", None) is not None:
+            st["sol_lora"] = self.lora.state_dict()
+        return st
 
 
 def lpips_frames(lp, a, b, frames):
@@ -103,6 +133,9 @@ def main():
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--adapter-steps", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--init", type=Path, default=None, help="a Stage 1 best.pt to start from")
+    p.add_argument("--sol-lora", type=int, default=0, help="Stage 2: LoRA rank on every linear of the 8 Sol blocks")
+    p.add_argument("--lr-lora", type=float, default=1e-4)
     args = p.parse_args()
 
     from setproctitle import setproctitle
@@ -133,9 +166,19 @@ def main():
     dit = load_dit(device=dev, swap=0)
     dir_head, net, _config = load_dir_run(str(DIR_RUN), dit)
     model = DiRDWD(dwd_sd, dit.final_layer.norm.eps)
+    model.lora = None
+    if args.init:
+        st = torch.load(args.init, map_location="cuda")
+        model.norm.load_state_dict(st["norm"]); model.expand.load_state_dict(st["expand"]); model.s_proj.load_state_dict(st["s_proj"])
+        log(f"DWDS1 init={args.init} (step {st.get('step')}, lpips {st.get('lpips')})")
+    groups = [{"params": list(model.norm.parameters()) + list(model.expand.parameters()), "lr": args.lr},
+              {"params": model.s_proj.parameters(), "lr": args.lr_s}]
+    if args.sol_lora:
+        model.lora = add_sol_lora(model.ref, args.sol_lora)
+        groups.append({"params": model.lora.parameters(), "lr": args.lr_lora})
+        log(f"DWDS1 sol_lora rank={args.sol_lora} params={sum(q.numel() for q in model.lora.parameters()) / 1e6:.1f}M")
     lp = lpips.LPIPS(net="vgg", verbose=False).cuda().eval().requires_grad_(False)
-    opt = torch.optim.AdamW([{"params": list(model.norm.parameters()) + list(model.expand.parameters()), "lr": args.lr},
-                             {"params": model.s_proj.parameters(), "lr": args.lr_s}], weight_decay=0.0)
+    opt = torch.optim.AdamW(groups, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / 100) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(s, args.steps) / args.steps))))
 
