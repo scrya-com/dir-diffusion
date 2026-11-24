@@ -269,6 +269,7 @@ def train(args):
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / 50) * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(s, args.steps) / args.steps))))
     evaluate(env, lora, path, head, eval_rows, out, 0, scenes, n=args.eval_n, log=log)
+    torch.cuda.empty_cache()                                             # the eval leaves the cache fragmented
     rng = random.Random(args.seed)
     gen = torch.Generator().manual_seed(args.seed)
     t0 = time.time()
@@ -297,6 +298,7 @@ def train(args):
         if step % args.eval_every == 0 or step == args.steps:
             torch.cuda.empty_cache()
             res = evaluate(env, lora, path, head, eval_rows, out, step, scenes, n=args.eval_n, log=log)
+            torch.cuda.empty_cache()
             soft = res.get(f"sigma:{EVAL_ALIGNED_SIGMA:.3f}", {}).get("soft_mae", 1.0)
             if step == args.stop_at and soft > args.stop_above:
                 log(f"STAGEB early stop: sigma0.6 soft_mae {soft} > {args.stop_above} at step {step}")
