@@ -45,7 +45,8 @@ def main():
     dev = torch.device("cuda")
     held = [q for d in ("iso", "atlas", "kc") for q in sorted((ROOT / f"collect_w1_{d}").glob("held_*.pt"))[:4]]
     dit = load_dit(device=dev, swap=args.swap)
-    gen_head, net, _ = load_dir_run(str(DIR_RUN), dit)
+    from dir_two_track_h3 import resolve_run
+    gen_head, net, _ = load_dir_run(str(resolve_run(DIR_RUN)), dit)
     stack = DwdStack(dit, V02["lora"], V02["head"], V02["refiner"], mode="two_pass")
     sd = load_file(str(adapter_path(2)))
     s1 = DiRDWD({k: v for k, v in sd.items() if k.startswith("dwd_")}, dit.final_layer.norm.eps)

@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 ROOT = Path("/media/2TB/lora-data/h3_lot/dwd")
 SETS = ("iso", "atlas", "kc")
-DIR_RUN = Path(__file__).resolve().parents[2] / "dir-diffusion/lot/runs/dir_turbo_clip"
+DIR_RUN = "johndpope/dir-diffusion-h3"  # the published DiR generator (a local run folder also works)
 
 
 class SolLoRA(nn.Module):
@@ -124,6 +124,8 @@ def lpips_frames(lp, a, b, frames, chunk=4):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--data", type=Path, nargs="+", default=[ROOT / f"collect_w1_{d}" for d in SETS],
+                   help="train_dwd_h3.py collect --light folders (with their targets mp4s)")
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--lr-s", type=float, default=2e-4)
@@ -134,6 +136,7 @@ def main():
     p.add_argument("--adapter-steps", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--init", type=Path, default=None, help="a Stage 1 best.pt to start from")
+    p.add_argument("--dir-run", default=DIR_RUN, help="DiR generator: a Hugging Face repo id or a local run folder")
     p.add_argument("--sol-lora", type=int, default=0, help="Stage 2: LoRA rank on every linear of the 8 Sol blocks")
     p.add_argument("--lr-lora", type=float, default=1e-4)
     args = p.parse_args()
@@ -156,15 +159,16 @@ def main():
         logf.write(msg + "\n")
         logf.flush()
 
-    train = [p for d in SETS for p in sorted((ROOT / f"collect_w1_{d}").glob("train_*.pt"))]
-    held = [p for d in SETS for p in sorted((ROOT / f"collect_w1_{d}").glob("held_*.pt"))[:4]]
+    train = [p for d in args.data for p in sorted(Path(d).glob("train_*.pt"))]
+    held = [p for d in args.data for p in sorted(Path(d).glob("held_*.pt"))[:4]]
     log(f"DWDS1 train={len(train)} held={len(held)} adapter={args.adapter_steps}-step")
     sd = load_file(str(adapter_path(args.adapter_steps)))
     dwd_sd = {k: v for k, v in sd.items() if k.startswith("dwd_")}
     del sd
     dev = torch.device("cuda")
     dit = load_dit(device=dev, swap=0)
-    dir_head, net, _config = load_dir_run(str(DIR_RUN), dit)
+    from dir_two_track_h3 import resolve_run
+    dir_head, net, _config = load_dir_run(str(resolve_run(args.dir_run)), dit)
     model = DiRDWD(dwd_sd, dit.final_layer.norm.eps)
     model.lora = None
     if args.init:
