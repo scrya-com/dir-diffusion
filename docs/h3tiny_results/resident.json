@@ -1,0 +1,24 @@
+{
+ "gpu": "NVIDIA RTX PRO 4000 Blackwell",
+ "swap": 16,
+ "rows": [
+  {
+   "size": "512x288x12",
+   "tokens": 1986,
+   "blocks": 30,
+   "ms_per_block": 13.631719266413711,
+   "peak_gb": 14.919489860534668,
+   "ms_per_block_half_skipped": 13.680147000316841,
+   "ms_per_skipped_block": 0.0484277339031299
+  },
+  {
+   "size": "768x512x12",
+   "tokens": 4866,
+   "blocks": 30,
+   "ms_per_block": 47.16496646675902,
+   "peak_gb": 15.412993907928467,
+   "ms_per_block_half_skipped": 48.778143399977125,
+   "ms_per_skipped_block": 1.613176933218104
+  }
+ ]
+}

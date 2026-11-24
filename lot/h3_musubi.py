@@ -22,6 +22,7 @@ rows are on the video shift (12). They carry no loss.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from dataclasses import replace
@@ -150,7 +151,70 @@ def load_dit(checkpoint=LOT_H3_CHECKPOINT, *, device="cuda", swap: int = 0, trai
     if train:
         dit.enable_gradient_checkpointing()
         dit.train()
+    drop_blocks(dit, dropped_blocks())
     return dit
+
+
+# Block dropping, ported from branch exp/h3-tiny-drop (commits 65bc0f3, 96c788c).
+#: H3-Tiny's depth plan (https://github.com/fuyi25/MiniMax-H3-Tiny): the same 8 blocks for the Ref2VA and FL2VA/T2VA
+#: transformers. Our int8 checkpoint already has their other stage (rank-8 AdaLN).
+H3_TINY_DROP = (6, 7, 8, 9, 10, 11, 13, 15)
+
+
+def dropped_blocks() -> tuple[int, ...]:
+    """``LOT_H3_DROP_BLOCKS``: ``h3tiny`` for H3-Tiny's plan, or block indices separated by spaces or commas."""
+    spec = os.environ.get("LOT_H3_DROP_BLOCKS", "").strip()
+    if not spec:
+        return ()
+    if spec == "h3tiny":
+        return H3_TINY_DROP
+    return tuple(sorted({int(x) for x in spec.replace(",", " ").split()}))
+
+
+def drop_blocks(dit, indices) -> None:
+    """Skip blocks ``indices`` (they return their input), keeping every index and name in place, so LoRA files,
+    block swap and the DWD tail (``dit.blocks[first:]``) are unchanged. The weights stay loaded: this measures
+    speed and quality, not memory."""
+    set_blocks_dropped(dit, indices, True)
+    if indices:
+        print(f"LOT_H3 kind=drop_blocks blocks={','.join(map(str, indices))} kept={len(dit.blocks) - len(indices)}",
+              flush=True)
+
+
+def _skip_block(_self, hidden, *_args, **_kwargs):
+    return hidden
+
+
+def set_blocks_dropped(dit, indices, dropped: bool) -> None:
+    """Skip (``dropped``) or run blocks ``indices``: the skip is an instance ``forward`` that returns its input;
+    deleting it brings back the class's own ``forward``."""
+    import types
+
+    for i in indices:
+        if not 0 <= i < len(dit.blocks):
+            raise ValueError(f"block {i} out of range 0..{len(dit.blocks) - 1}")
+        block = dit.blocks[i]
+        if dropped:
+            block.forward = types.MethodType(_skip_block, block)
+        elif "forward" in vars(block):
+            del block.forward
+
+
+def blocks_are_dropped(dit, indices) -> list[bool]:
+    return ["forward" in vars(dit.blocks[i]) for i in indices]
+
+
+@contextlib.contextmanager
+def blocks_dropped(dit, indices, dropped: bool = True):
+    """Skip (or, ``dropped=False``, run) blocks ``indices`` inside the block, then restore each block as it was.
+    One model copy serves as both the full model and the dropped-block model."""
+    before = blocks_are_dropped(dit, indices)
+    set_blocks_dropped(dit, indices, dropped)
+    try:
+        yield
+    finally:
+        for i, was in zip(indices, before):
+            set_blocks_dropped(dit, [i], was)
 
 
 def make_lora(dit, rank: int):
