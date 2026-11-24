@@ -64,12 +64,12 @@ def setup(steps: int = 2):
                 token_shape=token_shape, encode=encode)
 
 
-def sample_clip(env, row, gen, rng, scenes, train=True, kind=None, mode=None):
+def sample_clip(env, row, gen, rng, scenes, train=True, kind=None, mode=None, layers=False):
     from .data import load_rgba
     from .data_pih3 import make_clip, place
 
     still = place(load_rgba(DATA / "t2rgba" / row["image"], 768), (H, W), rng, train=train).cuda()
-    return make_clip(still, FRAMES, gen, scenes=scenes, kind=kind, mode=mode)
+    return make_clip(still, FRAMES, gen, scenes=scenes, kind=kind, mode=mode, layers=layers)
 
 
 @torch.no_grad()

@@ -95,7 +95,7 @@ def background(kind: str, frames: int, h: int, w: int, gen: torch.Generator, sce
 
 
 def make_clip(still: torch.Tensor, frames: int, gen: torch.Generator, *, scenes=None, kind: str | None = None,
-              mode: str | None = None):
+              mode: str | None = None, layers: bool = False):
     """``still`` (4, H, W) straight RGBA on the GPU, already placed on the canvas -> (RGB (3, T, H, W) composited
     in [0, 1], alpha (1, T, H, W), background kind, motion mode). Motion as ``data.make_clips``."""
     from .data import make_clips
@@ -111,7 +111,10 @@ def make_clip(still: torch.Tensor, frames: int, gen: torch.Generator, *, scenes=
             kind = "gradient"
     padded, alpha, premul = make_clips(still[None], frames, gen, modes=(mode,), probs=(1.0,), return_premul=True)
     padded, alpha, premul = padded[0], alpha[0], premul[0]
+    fg = torch.where(alpha > 1e-4, premul / alpha.clamp_min(1e-4), torch.zeros_like(premul)).clamp(0, 1)
     if kind == "padded":
-        return padded, alpha, kind, mode
+        res = (padded, alpha, kind, mode)
+        return res + ((fg, padded),) if layers else res                 # padding is the "background" there
     bg = background(kind, frames, h, w, gen, scenes, still.device)
-    return (premul + bg * (1 - alpha)).clamp(0, 1), alpha, kind, mode  # C = alpha F + (1 - alpha) B
+    res = ((premul + bg * (1 - alpha)).clamp(0, 1), alpha, kind, mode)  # C = alpha F + (1 - alpha) B
+    return res + ((fg, bg),) if layers else res                         # layers: straight F and B, for analysis
