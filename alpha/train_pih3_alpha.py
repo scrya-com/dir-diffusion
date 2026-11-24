@@ -50,11 +50,18 @@ def setup(steps: int = 2):
     from pih3_h3 import load_pih3, pih3_sigmas
     from train_dwd_h3 import load_text
 
+    import os
     model = load_pih3(steps, merge="comfy")
-    vae = load_vae(LOT_H3_VAE, decoder=False)
+    vae_dev = os.environ.get("ALPHA_VAE_DEVICE", "cuda")             # e.g. cuda:1: the encode peaks ~10 GB
+    vae = load_vae(LOT_H3_VAE, decoder=False, device=vae_dev)
     sigmas = [pih3_sigmas(steps)[-2], pih3_sigmas(steps, max_raw_t=1.0)[-2]]
+    def encode(clip):
+        """(3, T, H, W) in [0, 1] -> the latent on the DiT's card, encoded on ``ALPHA_VAE_DEVICE``."""
+        with torch.no_grad():
+            return vae.encode((clip * 2 - 1)[None].half().to(vae_dev)).float().to("cuda")
+
     return dict(model=model, vae=vae, sigmas=sigmas, forward_video=forward_video, load_text=load_text,
-                token_shape=token_shape)
+                token_shape=token_shape, encode=encode)
 
 
 def sample_clip(env, row, gen, rng, scenes, train=True, kind=None, mode=None):
@@ -68,7 +75,7 @@ def sample_clip(env, row, gen, rng, scenes, train=True, kind=None, mode=None):
 @torch.no_grad()
 def dit_tokens(env, clip, image, sigma, seed):
     """Encode, noise to ``sigma``, one frozen pi-H3 forward: (h, temb, token grid, latent)."""
-    z0 = env["vae"].encode((clip * 2 - 1)[None].half()).float()
+    z0 = env["encode"](clip)
     g = torch.Generator("cuda").manual_seed(seed)
     x = (1 - sigma) * z0 + sigma * torch.randn(z0.shape, device="cuda", generator=g)
     store: dict = {}

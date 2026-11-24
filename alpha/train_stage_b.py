@@ -114,7 +114,7 @@ class AlphaPath:
 def two_pass(env, lora: TailLoRA, clip, image, sigma, seed, grad=True):
     """Encode, noise, one pi-H3 forward (RGB pass) + the LoRA tail (alpha pass). Returns
     (rgb_hidden, temb, alpha_raw, token grid)."""
-    z0 = env["vae"].encode((clip * 2 - 1)[None].half()).float()
+    z0 = env["encode"](clip)
     g = torch.Generator("cuda").manual_seed(seed)
     x = (1 - sigma) * z0 + sigma * torch.randn(z0.shape, device="cuda", generator=g)
     text = env["load_text"](str(te_path(image))).cuda()
@@ -225,7 +225,7 @@ def train(args):
         log(f"STAGEB check step: {time.time() - t0:.1f}s peak={torch.cuda.max_memory_allocated() / 2**30:.1f}G "
             f"lora_grad={g_lora:.3e}")
         # inference timing at 768x512x39: one pi-H3 forward + fused decode (today) vs + the alpha tail and path
-        z0 = env["vae"].encode((clip * 2 - 1)[None].half()).float()
+        z0 = env["encode"](clip)
         x = 0.4 * z0 + 0.6 * torch.randn_like(z0)
         text = env["load_text"](str(te_path(row["image"]))).cuda()
 
