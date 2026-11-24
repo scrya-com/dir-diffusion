@@ -42,13 +42,13 @@ class TailLoRA:
     def __init__(self, dit, rank: int, k: int, device="cuda"):
         from h3_musubi import make_lora
         self.net = make_lora(dit, rank)
-        self.net.to(device, torch.float32)
         self.net.requires_grad_(False)
         self.first = len(dit.blocks) - k
         self.mods = [m for m in self.net.unet_loras if int(re.search(r"blocks_(\d+)_", m.lora_name).group(1)) >= self.first]
         for m in self.net.unet_loras:
-            m.enabled = False
+            m.enabled = False                       # the other blocks' modules stay off, and on the CPU
         for m in self.mods:
+            m.to(device, torch.float32)
             m.requires_grad_(True)
 
     def params(self):
