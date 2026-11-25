@@ -93,9 +93,16 @@ class AlphaDWDHead(nn.Module):
                 out.append(rest.reshape((n - 1) * PATCH_T, 1, h * PATCH, w * PATCH))
         return torch.cat(out)
 
-    def forward(self, chunks, rgb):
-        c = self.coarse(chunks)
-        return c + self.refine(torch.cat([rgb.float(), c], 1))
+    def forward(self, chunks, rgb, frames_per_chunk: int = 4):
+        """Alpha score (F, 1, H, W) on the CPU. The pixel stage runs a few frames at a time: one pass over every
+        frame at about 1 MP and 90 frames needs ~17 GB."""
+        c = self.coarse(chunks)                                   # (F, 1, H, W), small
+        out = []
+        for i in range(0, c.shape[0], frames_per_chunk):
+            cc = c[i:i + frames_per_chunk]
+            rr = rgb[i:i + frames_per_chunk].to(cc.device, torch.float32)
+            out.append((cc + self.refine(torch.cat([rr, cc], 1))).cpu())
+        return torch.cat(out)
 
 
 def score_to_alpha(score):
@@ -237,9 +244,10 @@ class PiH3Alpha:
                     _, lt, lh, lw, _ = args["layout"].signature
                     sh, sw = lh // 2 * 2, lw // 2 * 2
                     chunks = [c.view(-1, sh, sw, c.shape[-1]) for c in chunks]
-                    rgb_m = rgb.to(dev).float().permute(0, 3, 1, 2) * 2 - 1          # (F, 3, H, W) in [-1, 1]
-                    score = head(chunks, rgb_m)                                       # (F, 1, H, W)
-                    holder.alpha = score_to_alpha(score)[:, 0].float().cpu()          # (F, H, W)
+                    rgb_m = rgb.permute(0, 3, 1, 2).mul(2).sub(1)                    # (F, 3, H, W) in [-1, 1], stays where DWD put it
+                    del h
+                    score = head(chunks, rgb_m)                                       # (F, 1, H, W) on the CPU
+                    holder.alpha = score_to_alpha(score)[:, 0].float()                # (F, H, W)
             finally:
                 for hk in hooks:
                     hk.remove()
