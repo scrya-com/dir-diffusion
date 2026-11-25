@@ -11,6 +11,7 @@ Nodes:
 * ``pi-H3 Alpha Decode``: the alpha (MASK, F x H x W) of the sampling run that returned the LATENT.
 * ``pi-H3 Alpha Refine Sigmas``: SIGMAS [sigma, 0] for the refine-pass mode (re-noise the generated latent to sigma,
   one more step with the alpha model; at sigma ~0.6 pi-H3 redraws what it is shown, the regime the head trained in).
+* ``pi-H3 Alpha Solidify``: MASK -> solid matte for solid subjects (holes filled, opaque inside, soft edge).
 * ``Save RGBA Video``: IMAGE + MASK -> VP9-with-alpha WebM, ProRes 4444 .mov and/or a PNG sequence.
 
 Trained on the AlphaAnything RGBA set (CC BY-NC 4.0): research use only.
@@ -279,6 +280,10 @@ class PiH3AlphaDecode:
         if a is None:
             raise RuntimeError("No alpha for this latent: connect the output of a sampler whose model went through "
                                "'pi-H3 Alpha (Stage B)' (the latest 4 runs are kept)")
+        nan = float(torch.isnan(a.float()).float().mean())
+        if nan > 0:
+            print(f"[pih3-alpha] WARNING: decoded alpha is {nan:.1%} NaN ({tuple(a.shape)}); connect it to "
+                  "'pi-H3 Alpha Solidify' with a fallback_alpha, or use the last-step alpha", flush=True)
         return (a,)
 
 
@@ -339,15 +344,86 @@ class SaveRGBAVideo:
         return {"ui": {"text": [f"{f} RGBA frames -> {stem}.*"]}}
 
 
+class PiH3AlphaSolidify:
+    """Solid-subject matte: threshold, close small gaps, fill enclosed holes, drop specks (floor-shadow haze), fully
+    opaque inside, the model's soft alpha kept only in a thin band at the silhouette edge. For characters and props;
+    not for smoke or glass. ``fix_first``/``fix_last`` copy the neighbour frame's matte into frames given as a
+    first/last frame (conditions, not generated: their alpha is broken)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "alpha": ("MASK",),
+            "threshold": ("FLOAT", {"default": 0.3, "min": 0.05, "max": 0.95, "step": 0.05}),
+            "feather": ("INT", {"default": 3, "min": 0, "max": 16}),
+            "min_area": ("FLOAT", {"default": 0.002, "min": 0.0, "max": 0.1, "step": 0.001,
+                                   "tooltip": "drop opaque islands smaller than this fraction of the frame"}),
+            "fix_first": ("BOOLEAN", {"default": True}),
+            "fix_last": ("BOOLEAN", {"default": False}),
+        }, "optional": {
+            "fallback_alpha": ("MASK", {"tooltip": "used for frames where 'alpha' is NaN (e.g. the last-step alpha when "
+                                                   "the refine pass failed)"}),
+        }}
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "solidify"
+    CATEGORY = "pi-H3/alpha"
+    DESCRIPTION = "Solid matte for solid subjects (holes filled, interior opaque, soft edge)."
+
+    def solidify(self, alpha, threshold, feather, min_area, fix_first, fix_last, fallback_alpha=None):
+        from scipy import ndimage as nd
+        a_all = alpha.float().cpu().numpy()
+        bad = np.isnan(a_all).reshape(len(a_all), -1).mean(1) > 0.01
+        if bad.any():
+            fb = None
+            if fallback_alpha is not None:
+                fb = fallback_alpha.float()
+                if fb.shape[-2:] != alpha.shape[-2:]:
+                    fb = F.interpolate(fb[:, None], size=alpha.shape[-2:], mode="bilinear", align_corners=False)[:, 0]
+                fb = fb.cpu().numpy()
+            for t in np.flatnonzero(bad):
+                a_all[t] = fb[min(t, len(fb) - 1)] if fb is not None else 0.0
+            print(f"[pih3-alpha] WARNING: alpha had NaN in {int(bad.sum())}/{len(bad)} frames; "
+                  + ("used the fallback alpha there" if fb is not None else "no fallback_alpha connected: those frames are empty"),
+                  flush=True)
+        a_all = np.nan_to_num(a_all, nan=0.0).clip(0, 1)
+        out = np.empty_like(a_all)
+        for t, a in enumerate(a_all):
+            m = nd.binary_closing(a > threshold, structure=np.ones((5, 5)), iterations=1)
+            m = nd.binary_fill_holes(m)
+            lab, n = nd.label(m)
+            if n:
+                sizes = nd.sum(m, lab, range(1, n + 1))
+                keep = np.isin(lab, 1 + np.flatnonzero(sizes >= min_area * a.size))
+                m = keep if keep.any() else m
+            if feather > 0:
+                core = nd.binary_erosion(m, iterations=feather)
+                band = nd.binary_dilation(m, iterations=feather) & ~core
+                soft = np.clip((a - 0.1) / 0.5, 0, 1)
+                o = np.where(core, 1.0, 0.0)
+                o = np.where(band, np.maximum(soft, nd.gaussian_filter(m.astype(np.float32), feather / 2)), o)
+            else:
+                o = m.astype(np.float32)
+            out[t] = o
+        f = len(out)
+        if fix_first and f > 1:
+            out[0] = out[1]
+        if fix_last and f > 1:
+            out[-1] = out[-2]
+        return (torch.from_numpy(out),)
+
+
 NODE_CLASS_MAPPINGS = {
     "PiH3AlphaStageB": PiH3Alpha,
     "PiH3AlphaDecode": PiH3AlphaDecode,
     "PiH3AlphaRefineSigmas": PiH3AlphaRefineSigmas,
     "SaveRGBAVideo": SaveRGBAVideo,
+    "PiH3AlphaSolidify": PiH3AlphaSolidify,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "PiH3AlphaStageB": "pi-H3 Alpha (Stage B)",
     "PiH3AlphaDecode": "pi-H3 Alpha Decode",
     "PiH3AlphaRefineSigmas": "pi-H3 Alpha Refine Sigmas",
     "SaveRGBAVideo": "Save RGBA Video",
+    "PiH3AlphaSolidify": "pi-H3 Alpha Solidify",
 }
